@@ -161,22 +161,30 @@ READER_ABI = [
 GMX_V2_READER = "0xf60becbba223EEA9495Da3f606753867eC10d139"
 GMX_V2_DATASTORE = "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8"
 
-# Market symbols for better display
+# Market symbols for better display (all keys stored lowercase for safe lookup)
 MARKET_SYMBOLS = {
-    "0x47c031236e19d024b42f8AE6780E44A573170703": "BTC/USD",
-    "0x70d95587d40A2caf56bd97485aB3Eec10Bee6336": "ETH/USD",
-    "0x09400D9DB990D5ed3f35D7be61DfAEB900Af03C9": "SOL/USD",
-    "0x7f1fa204bb700853D36994DA19F830b6Ad18455C": "LINK/USD",
-    "0xC25cEf6061Cf5dE5eb761b50E4743c1F5D7E5407": "ARB/USD",
+    "0x47c031236e19d024b42f8ae6780e44a573170703": "BTC",
+    "0x70d95587d40a2caf56bd97485ab3eec10bee6336": "ETH",
+    "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": "SOL",
+    "0x7f1fa204bb700853d36994da19f830b6ad18455c": "LINK",
+    "0xc25cef6061cf5de5eb761b50e4743c1f5d7e5407": "ARB",
+    "0x6853ea96ff216fab11d2d930ce3c508556a4bdc4": "DOGE",
+    "0x7bbbf946883a5701350007320f525c5379b8178a": "AVAX",
 }
+
+def market_to_symbol(market_addr: str) -> str:
+    """Case-insensitive market address → symbol lookup."""
+    return MARKET_SYMBOLS.get(market_addr.lower(), market_addr[:10] + "...")
 
 # CoinGecko for current prices
 COINGECKO_IDS = {
-    "BTC/USD": "bitcoin",
-    "ETH/USD": "ethereum",
-    "SOL/USD": "solana",
-    "LINK/USD": "chainlink",
-    "ARB/USD": "arbitrum",
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "LINK": "chainlink",
+    "ARB": "arbitrum",
+    "DOGE": "dogecoin",
+    "AVAX": "avalanche-2",
 }
 
 # Helper functions (same pattern as open.py)
@@ -321,41 +329,54 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
         collateral_amount = collateral_raw / (10 ** col_dec)
         leverage = size_usd / collateral_amount if collateral_amount > 0 else 0
         
-        # Calculate entry price (trying common token decimals)
+        # Get symbol first so we can use it for token-decimal detection
+        symbol = market_to_symbol(market)
+        sym_key = symbol.upper().split("/")[0]
+        INDEX_DECIMALS_MAP = {"BTC": 8, "ETH": 18, "SOL": 9, "LINK": 18, "ARB": 18, "DOGE": 8, "AVAX": 18}
+
+        # Calculate entry price using known token decimals, fall back to heuristic
         if size_tokens_raw > 0:
-            entry_8 = size_usd / (size_tokens_raw / (10 ** 8))   # BTC-like
-            entry_18 = size_usd / (size_tokens_raw / (10 ** 18)) # ETH-like
-            
-            # Pick reasonable price
-            if 1 < entry_8 < 1_000_000:
-                entry_price = entry_8
-            elif 1 < entry_18 < 1_000_000:
-                entry_price = entry_18
+            if sym_key in INDEX_DECIMALS_MAP:
+                idx_dec = INDEX_DECIMALS_MAP[sym_key]
+                entry_price = size_usd / (size_tokens_raw / (10 ** idx_dec))
+                if not (0.001 < entry_price < 10_000_000):
+                    entry_price = 0  # sanity check
             else:
-                entry_price = entry_8  # fallback
+                # Heuristic: try 8-decimal first (BTC), then 18-decimal (ETH)
+                entry_8  = size_usd / (size_tokens_raw / (10 ** 8))
+                entry_18 = size_usd / (size_tokens_raw / (10 ** 18))
+                if 1 < entry_8 < 1_000_000:
+                    entry_price = entry_8
+                    idx_dec = 8
+                elif 1 < entry_18 < 1_000_000:
+                    entry_price = entry_18
+                    idx_dec = 18
+                else:
+                    entry_price = entry_8
+                    idx_dec = 8
         else:
             entry_price = 0
-        
-        # Get symbol and current price
-        symbol = MARKET_SYMBOLS.get(market, market[:10] + "...")
+            idx_dec = 18
+
+        size_tokens = size_tokens_raw / (10 ** idx_dec) if size_tokens_raw > 0 else 0
+
+        # Get current price from CoinGecko; fall back to entry_price
         current_price = fetch_current_price(symbol)
         if current_price == 0:
             current_price = entry_price  # fallback
-        
+
         # Calculate P&L
         if is_long:
             price_diff = current_price - entry_price
         else:
             price_diff = entry_price - current_price
-        
+
         if entry_price > 0:
             unrealized_pnl = (price_diff / entry_price) * collateral_amount * leverage
             pnl_percentage = (unrealized_pnl / collateral_amount) * 100
         else:
             unrealized_pnl = 0
             pnl_percentage = 0
-        
-        size_tokens = size_tokens_raw / (10 ** (8 if entry_price == entry_8 else 18))
         
         parsed_positions.append(GMXPosition(
             market=market,
@@ -479,16 +500,20 @@ def create_close_order(
             direction = "buying (SHORT close)"
 
         # GMX V2 price precision = 10^(30 - index_token_decimals)
-        # Detect index token decimals from the entry price heuristic:
-        #   BTC-like tokens (8 decimals) → price precision = 10^22
-        #   ETH-like tokens (18 decimals) → price precision = 10^12
-        # We determine this from the position's size_tokens vs entry_price
-        if position.entry_price > 1000:
-            # High entry price (BTC-like): 8-decimal token → 10^22 price precision
-            index_token_decimals = 8
+        # BTC = 8 decimals → precision = 10^22
+        # SOL = 9 decimals → precision = 10^21
+        # ETH/others = 18 decimals → precision = 10^12
+        # Detect from symbol name first, then fall back to price heuristic
+        sym_upper = position.symbol.upper().split("/")[0]
+        INDEX_DECIMALS_MAP = {"BTC": 8, "ETH": 18, "SOL": 9, "LINK": 18, "ARB": 18, "DOGE": 8, "AVAX": 18}
+        if sym_upper in INDEX_DECIMALS_MAP:
+            index_token_decimals = INDEX_DECIMALS_MAP[sym_upper]
+        elif position.entry_price > 10_000:
+            index_token_decimals = 8   # BTC-like
+        elif position.entry_price > 100:
+            index_token_decimals = 9   # SOL-like
         else:
-            # Lower entry price (ETH-like): 18-decimal token → 10^12 price precision
-            index_token_decimals = 18
+            index_token_decimals = 18  # ETH-like
 
         price_precision = 10 ** (30 - index_token_decimals)
         acceptable_price_scaled = int(acceptable_price * price_precision)
@@ -579,7 +604,7 @@ def create_close_order(
         
         tx_hash = sign_send(w3, acct, tx, dry_run)
         
-        if not dry_run and tx_hash != "dry_run":
+        if not dry_run and not tx_hash.startswith("dry_run"):
             receipt = wait_receipt(w3, tx_hash)
             if receipt.get("status") != 1:
                 raise RuntimeError(f"Close order transaction failed: {tx_hash}")

@@ -32,8 +32,8 @@ import time
 import json
 import logging
 import urllib.request
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import List, Dict, Any
 
 from web3 import Web3
 from eth_account import Account
@@ -88,6 +88,11 @@ EXCHANGE_ROUTER_ABI = [
         "outputs": [],
     },
     {
+        "name": "cancelOrder", "type": "function", "stateMutability": "payable",
+        "inputs": [{"name": "key", "type": "bytes32"}],
+        "outputs": [],
+    },
+    {
         "name": "createOrder", "type": "function", "stateMutability": "payable",
         "inputs": [
             {
@@ -133,6 +138,68 @@ EXCHANGE_ROUTER_ABI = [
 ]
 
 READER_ABI = [
+    {
+        "name": "getAccountOrders", "type": "function", "stateMutability": "view",
+        "inputs": [
+            {"name": "dataStore", "type": "address"},
+            {"name": "account", "type": "address"},
+            {"name": "start", "type": "uint256"},
+            {"name": "end", "type": "uint256"},
+        ],
+        "outputs": [
+            {
+                "name": "", "type": "tuple[]",
+                "components": [
+                    {"name": "orderKey", "type": "bytes32"},
+                    {
+                        "name": "order", "type": "tuple",
+                        "components": [
+                            {
+                                "name": "addresses", "type": "tuple",
+                                "components": [
+                                    {"name": "account", "type": "address"},
+                                    {"name": "receiver", "type": "address"},
+                                    {"name": "cancellationReceiver", "type": "address"},
+                                    {"name": "callbackContract", "type": "address"},
+                                    {"name": "uiFeeReceiver", "type": "address"},
+                                    {"name": "market", "type": "address"},
+                                    {"name": "initialCollateralToken", "type": "address"},
+                                    {"name": "swapPath", "type": "address[]"},
+                                ],
+                            },
+                            {
+                                "name": "numbers", "type": "tuple",
+                                "components": [
+                                    {"name": "orderType", "type": "uint8"},
+                                    {"name": "decreasePositionSwapType", "type": "uint8"},
+                                    {"name": "sizeDeltaUsd", "type": "uint256"},
+                                    {"name": "initialCollateralDeltaAmount", "type": "uint256"},
+                                    {"name": "triggerPrice", "type": "uint256"},
+                                    {"name": "acceptablePrice", "type": "uint256"},
+                                    {"name": "executionFee", "type": "uint256"},
+                                    {"name": "callbackGasLimit", "type": "uint256"},
+                                    {"name": "minOutputAmount", "type": "uint256"},
+                                    {"name": "updatedAtTime", "type": "uint256"},
+                                    {"name": "validFromTime", "type": "uint256"},
+                                    {"name": "srcChainId", "type": "uint256"},
+                                ],
+                            },
+                            {
+                                "name": "flags", "type": "tuple",
+                                "components": [
+                                    {"name": "isLong", "type": "bool"},
+                                    {"name": "shouldUnwrapNativeToken", "type": "bool"},
+                                    {"name": "isFrozen", "type": "bool"},
+                                    {"name": "autoCancel", "type": "bool"},
+                                ],
+                            },
+                            {"name": "_dataList", "type": "bytes32[]"},
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
     {
         "name": "getAccountPositions", "type": "function", "stateMutability": "view",
         "inputs": [
@@ -350,12 +417,21 @@ def parse_signal(text: str) -> Signal:
     stop_loss = float(sl_match.group(1).replace(",", ""))
 
     # ── Leverage ──
-    lev_match = re.search(r'(\d+)\s*[xX]', txt)
-    if not lev_match:
-        lev_match = re.search(
-            r'(?:LEV|LEVERAGE)\s*[:=@\-]?\s*(\d+)', txt, re.IGNORECASE
-        )
-    leverage = float(lev_match.group(1)) if lev_match else 2.0
+    # Handle range formats: "5x-10x", "5x-15x" → use midpoint
+    # Handle single value: "10x" → use exact value
+    # Both numbers must be small (≤3 digits) to avoid matching entry price ranges
+    lev_range_match = re.search(r'\b(\d{1,3})[xX]\s*[-–]\s*(\d{1,3})[xX]', txt, re.IGNORECASE)
+    if lev_range_match:
+        lev_low = float(lev_range_match.group(1))
+        lev_high = float(lev_range_match.group(2))
+        leverage = (lev_low + lev_high) / 2  # use midpoint of range
+    else:
+        lev_match = re.search(r'\b(\d{1,3})\s*[xX]\b', txt)
+        if not lev_match:
+            lev_match = re.search(
+                r'(?:LEV|LEVERAGE)\s*[:=@\-]?\s*(\d+)', txt, re.IGNORECASE
+            )
+        leverage = float(lev_match.group(1)) if lev_match else 2.0
 
     return Signal(
         symbol=symbol,
@@ -451,6 +527,399 @@ def sign_send(w3: Web3, acct: Account, tx: dict, dry_run: bool) -> str:
     return tx_hash
 
 
+def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int = 500000) -> list:
+    """Get active order keys via EventEmitter OrderCreated logs.
+
+    The GMX V2 EventEmitter emits OrderCreated with:
+      topic[2] = bytes32 order key
+      topic[3] = account address (padded to 32 bytes)
+
+    Validates each key with cancelOrder gas estimate to confirm it's still active.
+    Returns list of bytes objects (each 32 bytes).
+    """
+    EVENT_EMITTER = "0xC8ee91A54287DB53897056e12D9819156D3822Fb"
+    ORDER_CREATED_TOPIC = "0x468a25a7ba624ceea6e540ad6f49171b52495b648417ae91bca21676d8a24dc5"
+    EXCHANGE_ROUTER = os.getenv("GMX_V2_EXCHANGE_ROUTER", "").strip()
+
+    wallet = Web3.to_checksum_address(wallet_addr)
+    # topic[3] = account padded to 32 bytes (0x + 24 zeros + 40-char address)
+    wallet_topic = "0x" + "0" * 24 + wallet_addr.lower().lstrip("0x")
+
+    CANCEL_ABI = [{
+        "name": "cancelOrder", "type": "function", "stateMutability": "payable",
+        "inputs": [{"name": "key", "type": "bytes32"}],
+        "outputs": [],
+    }]
+    exc = w3.eth.contract(
+        address=Web3.to_checksum_address(EXCHANGE_ROUTER), abi=CANCEL_ABI
+    )
+
+    current = w3.eth.block_number
+    try:
+        logs = w3.eth.get_logs({
+            "address": EVENT_EMITTER,
+            "fromBlock": max(0, current - lookback_blocks),
+            "toBlock": current,
+            "topics": [ORDER_CREATED_TOPIC, None, None, wallet_topic],
+        })
+    except Exception as e:
+        log.warning(f"_get_order_keys_from_events: get_logs failed: {e}")
+        return []
+
+    # Deduplicate — topic[2] is the order key; keep latest block seen per key
+    seen_keys: dict = {}
+    for l in logs:
+        topics = l.get("topics", [])
+        if len(topics) >= 3:
+            key_bytes = bytes(topics[2])
+            blk = l["blockNumber"]
+            if key_bytes not in seen_keys or blk > seen_keys[key_bytes]:
+                seen_keys[key_bytes] = blk
+
+    log.debug(f"_get_order_keys_from_events: {len(seen_keys)} unique keys from {len(logs)} logs")
+
+    # Validate: only keep keys where cancelOrder gas estimate succeeds (order still active)
+    active_keys = []
+    for key_bytes in seen_keys:
+        try:
+            exc.functions.cancelOrder(key_bytes).estimate_gas({"from": wallet})
+            active_keys.append(key_bytes)
+        except Exception:
+            pass  # order already executed/cancelled
+
+    log.debug(f"_get_order_keys_from_events: {len(active_keys)} active (cancellable) keys")
+    return active_keys
+
+
+def _parse_orders_raw(w3: Web3, wallet_addr: str) -> list:
+    """Parse order metadata from getAccountOrders raw bytes.
+
+    getAccountOrders returns OrderInfo[] where:
+      struct OrderInfo { bytes32 orderKey; Order.Props order; }
+
+    Order.Props contains sub-structs: Addresses, Numbers, Flags.
+    The ABI encoding flattens these into a complex byte layout.
+
+    Confirmed struct word offsets per element (relative to element start es):
+      word[0]  = pointer / struct header
+      word[1]  = orderType  (uint8, stored as uint256)
+      word[3]  = sizeDeltaUsd
+      word[5]  = triggerPrice
+      word[13] = isLong (bool at es+416)
+      addresses sub-tuple at es+448:
+        +0   = account
+        +32  = receiver
+        +64  = cancellationReceiver
+        +96  = callbackContract
+        +128 = market  (addresses[4] from es+448 base)
+        +160 = initialCollateralToken
+
+    Instead of relying solely on fixed offsets for the market address,
+    we also search the element bytes for known market addresses as a
+    fallback to handle any ABI encoding variations.
+    """
+    reader_addr    = os.getenv("GMX_V2_READER", GMX_V2_READER)
+    datastore_addr = os.getenv("GMX_V2_DATASTORE", GMX_V2_DATASTORE)
+    wallet         = Web3.to_checksum_address(wallet_addr)
+    datastore      = Web3.to_checksum_address(datastore_addr)
+
+    # ABI-encode the call manually
+    fn_sig = Web3.keccak(text="getAccountOrders(address,address,uint256,uint256)")[:4]
+    def enc_addr(a):
+        return b"\x00" * 12 + bytes.fromhex(Web3.to_checksum_address(a)[2:])
+    def enc_uint(n):
+        return n.to_bytes(32, "big")
+
+    calldata = (fn_sig
+                + enc_addr(datastore)
+                + enc_addr(wallet)
+                + enc_uint(0)
+                + enc_uint(50))
+
+    try:
+        result_hex = w3.eth.call({"to": Web3.to_checksum_address(reader_addr), "data": calldata})
+    except Exception as e:
+        log.warning(f"_parse_orders_raw: eth_call failed: {e}")
+        return []
+
+    data = bytes(result_hex)
+    if len(data) < 64:
+        return []
+
+    # Top-level: offset to array, then array length
+    arr_rel_offset = int.from_bytes(data[0:32], "big")
+    count          = int.from_bytes(data[arr_rel_offset:arr_rel_offset + 32], "big")
+
+    MARKET_SYM = {
+        "0x47c031236e19d024b42f8ae6780e44a573170703": "BTC",
+        "0x70d95587d40a2caf56bd97485ab3eec10bee6336": "ETH",
+        "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": "SOL",
+        "0x7f1fa204bb700853d36994da19f830b6ad18455c": "LINK",
+        "0xc25cef6061cf5de5eb761b50e4743c1f5d7e5407": "ARB",
+        "0x6853ea96ff216fab11d2d930ce3c508556a4bdc4": "DOGE",
+        "0x7bbbf946883a5701350007320f525c5379b8178a": "AVAX",
+    }
+    # Pre-compute lowercased bytes for each known market to enable scanning
+    MARKET_BYTES = {}
+    for addr_hex in MARKET_SYM:
+        MARKET_BYTES[bytes.fromhex(addr_hex[2:])] = addr_hex
+
+    PRICE_PRECISION = {
+        "BTC":  10 ** (30 - 8),
+        "ETH":  10 ** (30 - 18),
+        "SOL":  10 ** (30 - 9),
+        "LINK": 10 ** (30 - 18),
+        "ARB":  10 ** (30 - 18),
+        "DOGE": 10 ** (30 - 8),
+        "AVAX": 10 ** (30 - 18),
+    }
+
+    orders = []
+    for i in range(count):
+        elem_ptr_pos = arr_rel_offset + 32 + i * 32
+        if elem_ptr_pos + 32 > len(data):
+            break
+        elem_rel_ptr = int.from_bytes(data[elem_ptr_pos:elem_ptr_pos + 32], "big")
+        es = arr_rel_offset + 32 + elem_rel_ptr  # element start
+
+        if es + 448 + 7 * 32 > len(data):
+            break
+
+        order_type  = int.from_bytes(data[es + 32:  es + 64],  "big")
+        size_raw    = int.from_bytes(data[es + 96:  es + 128], "big")
+        trigger_raw = int.from_bytes(data[es + 160: es + 192], "big")
+        is_long_val = int.from_bytes(data[es + 416: es + 448], "big")
+
+        # Find market address at known offsets first, then scan as fallback.
+        # The market address is in the Addresses sub-struct. Due to ABI
+        # encoding with dynamic arrays (swapPath[]), the exact offset can
+        # vary, so we check multiple likely positions.
+        market = None
+
+        # Try specific offsets where the market address is expected:
+        #   - es+448 + 128 = addresses[4] (original estimate)
+        #   - es+448 + 0/32/64/96/128/160 = addresses[0..5]
+        # We extract the 20-byte address from each 32-byte word and check
+        # against known markets.
+        CANDIDATE_OFFSETS = [
+            es + 448 + 128,   # addresses[4] = market (primary)
+            es + 448 + 160,   # addresses[5]
+            es + 448 + 96,    # addresses[3]
+            es + 448 + 64,    # addresses[2]
+            es + 448 + 0,     # addresses[0]
+            es + 448 + 32,    # addresses[1]
+            es + 448 + 192,   # addresses[6]
+            es + 480 + 128,   # shifted +32
+            es + 512 + 128,   # shifted +64
+        ]
+        for off in CANDIDATE_OFFSETS:
+            if off + 32 > len(data):
+                continue
+            addr_bytes = data[off + 12: off + 32]  # last 20 bytes of 32-byte word
+            if addr_bytes in MARKET_BYTES:
+                market = MARKET_BYTES[addr_bytes]
+                break
+
+        # Fallback: scan entire element for known market bytes
+        if not market:
+            elem_end = min(es + 800, len(data))
+            elem_bytes = data[es:elem_end]
+            # Collect ALL matches and pick the one that appears last
+            # (market is deeper in the struct than account/receiver)
+            last_match = None
+            last_idx = -1
+            for mkt_bytes, mkt_addr in MARKET_BYTES.items():
+                idx = elem_bytes.find(mkt_bytes)
+                if idx >= 0 and idx > last_idx:
+                    last_match = mkt_addr
+                    last_idx = idx
+            if last_match:
+                market = last_match
+
+        sym  = MARKET_SYM.get(market.lower() if market else "", "???")
+        prec = PRICE_PRECISION.get(sym, 10 ** 22)  # default to BTC precision as safest fallback
+        trigger_price = trigger_raw / prec if trigger_raw > 0 else 0.0
+
+        ORDER_TYPE_NAMES = {2: "MarketInc", 3: "LimitInc", 4: "MarketDec",
+                            5: "TP", 6: "SL"}
+        log.info(f"  order[{i}]: {sym} {ORDER_TYPE_NAMES.get(order_type, order_type)} "
+                 f"trigger=${trigger_price:,.2f} size=${size_raw / (10**30):,.2f} "
+                 f"market={market[:10] if market else '???'}...")
+
+        orders.append({
+            "market":        Web3.to_checksum_address(market) if market else "???",
+            "symbol":        sym,
+            "order_type":    order_type,
+            "is_long":       bool(is_long_val),
+            "size_usd":      size_raw / (10 ** 30),
+            "trigger_price": trigger_price,
+            "key_hex":       None,  # filled in by fetch_open_orders
+        })
+
+    log.info(f"_parse_orders_raw: decoded {len(orders)} orders")
+    return orders
+
+
+def fetch_open_orders(w3: Web3, wallet_addr: str) -> list:
+    """Fetch all open orders for the wallet and return a list of dicts with decoded fields.
+
+    Combines:
+      - _parse_orders_raw()  for order metadata (type, size, trigger price, market)
+      - _get_order_keys_from_events()  for bytes32 order keys via EventEmitter logs
+
+    Keys and metadata are merged by index position (both return orders in creation order).
+
+    Each dict contains:
+      market        — checksummed market address
+      symbol        — str (BTC/ETH/SOL/…)
+      order_type    — int (2=MarketIncrease, 3=LimitIncrease, 4=MarketDecrease,
+                           5=LimitDecrease, 6=StopLossDecrease)
+      is_long       — bool
+      size_usd      — float (sizeDeltaUsd / 10^30)
+      trigger_price — float in USD (0 for market orders)
+      key_hex       — hex string of the order key (or None if not found)
+    """
+    raw_orders  = _parse_orders_raw(w3, wallet_addr)
+    active_keys = _get_order_keys_from_events(w3, wallet_addr)
+
+    result = []
+    for i, o in enumerate(raw_orders):
+        key_bytes = active_keys[i] if i < len(active_keys) else None
+        result.append({**o, "key_hex": key_bytes.hex() if key_bytes else None})
+
+    return result
+
+
+def cancel_all_orders(
+    w3: Web3,
+    acct: Account,
+    exchange,
+    dry_run: bool,
+) -> int:
+    """Cancel ALL open orders for this wallet across every market.
+
+    Uses EventEmitter logs to find active order keys (topic[2]) — this bypasses
+    the broken getAccountOrders ABI which does not return bytes32 keys.
+
+    Cancels LimitIncrease (3), LimitDecrease (5), and StopLossDecrease (6).
+    MarketIncrease (2) and MarketDecrease (4) cannot be cancelled once submitted.
+
+    Returns the number of orders cancelled.
+    """
+    wallet = Web3.to_checksum_address(acct.address)
+
+    active_keys = _get_order_keys_from_events(w3, acct.address)
+    if not active_keys:
+        log.info("cancel_all_orders: no active orders found.")
+        return 0
+
+    cancelled = 0
+    for key_bytes in active_keys:
+        key_hex = key_bytes.hex()
+        log.info(f"Cancelling order key=0x{key_hex[:16]}...")
+
+        if dry_run:
+            log.info(f"  [DRY_RUN] Would cancel order 0x{key_hex[:16]}")
+            cancelled += 1
+            continue
+
+        try:
+            data = exchange.encode_abi("cancelOrder", [key_bytes])
+            tx = build_tx(w3, wallet, exchange.address, data, value=0)
+            txh = sign_send(w3, acct, tx, dry_run=False)
+            receipt = wait_receipt(w3, txh)
+            if receipt.get("status") == 1:
+                log.info(f"  Cancelled: {txh}")
+                cancelled += 1
+            else:
+                log.warning(f"  Cancel tx reverted: {txh}")
+        except Exception as e:
+            log.warning(f"  Failed to cancel order 0x{key_hex[:16]}: {e}")
+
+    log.info(f"cancel_all_orders: cancelled={cancelled} of {len(active_keys)} active orders.")
+    return cancelled
+
+
+def cancel_orders_for_market(
+    w3: Web3,
+    acct: Account,
+    exchange,
+    market_addr: str,
+    dry_run: bool,
+) -> int:
+    """Fetch all open orders for this wallet and cancel any that belong to market_addr.
+
+    Uses EventEmitter logs for keys + raw byte decode for market metadata.
+    Cancels LimitIncrease (3), LimitDecrease (5), and StopLossDecrease (6) orders.
+    MarketIncrease (2) and MarketDecrease (4) cannot be cancelled once submitted.
+
+    Returns the number of orders cancelled.
+    """
+    wallet        = Web3.to_checksum_address(acct.address)
+    target_lower  = market_addr.lower()
+
+    # Get active order keys + metadata merged by index
+    orders = fetch_open_orders(w3, acct.address)
+
+    # Resolve target symbol for logging
+    _SYM_LOOKUP = {
+        "0x47c031236e19d024b42f8ae6780e44a573170703": "BTC",
+        "0x70d95587d40a2caf56bd97485ab3eec10bee6336": "ETH",
+        "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": "SOL",
+        "0x7f1fa204bb700853d36994da19f830b6ad18455c": "LINK",
+    }
+    target_sym = _SYM_LOOKUP.get(target_lower, target_lower[:10])
+    log.info(f"cancel_orders_for_market: target={target_sym} ({target_lower[:10]}...), "
+             f"found {len(orders)} total orders")
+    for o in orders:
+        log.info(f"  order: {o['symbol']} type={o['order_type']} "
+                 f"market={o['market'][:10]}... trigger=${o['trigger_price']:,.2f}")
+
+    CANCELLABLE = {
+        ORDER_TYPE_LIMIT_INCREASE,
+        ORDER_TYPE_LIMIT_DECREASE,
+        ORDER_TYPE_STOP_LOSS_DECREASE,
+    }
+
+    cancelled = 0
+    for o in orders:
+        if o["market"].lower() != target_lower:
+            continue
+        if o["order_type"] not in CANCELLABLE:
+            continue
+        if not o["key_hex"]:
+            log.warning(f"  No key for order type={o['order_type']} market={target_market[:10]}...")
+            continue
+
+        key_bytes = bytes.fromhex(o["key_hex"])
+        log.info(f"Cancelling stale order type={o['order_type']} key=0x{o['key_hex'][:16]}...")
+
+        if dry_run:
+            log.info(f"  [DRY_RUN] Would cancel order 0x{o['key_hex'][:16]}")
+            cancelled += 1
+            continue
+
+        try:
+            data = exchange.encode_abi("cancelOrder", [key_bytes])
+            tx = build_tx(w3, wallet, exchange.address, data, value=0)
+            txh = sign_send(w3, acct, tx, dry_run=False)
+            receipt = wait_receipt(w3, txh)
+            if receipt.get("status") == 1:
+                log.info(f"  Cancelled: {txh}")
+                cancelled += 1
+            else:
+                log.warning(f"  Cancel tx reverted: {txh}")
+        except Exception as e:
+            log.warning(f"  Failed to cancel order 0x{o['key_hex'][:16]}: {e}")
+
+    if cancelled:
+        log.info(f"Cancelled {cancelled} order(s) for {target_sym}")
+    else:
+        log.info(f"No orders to cancel for {target_sym}")
+
+    return cancelled
+
+
 def fetch_current_price(symbol: str) -> float:
     """Fetch current price from CoinGecko free API."""
     coin_id = COINGECKO_IDS.get(symbol.upper())
@@ -463,7 +932,7 @@ def fetch_current_price(symbol: str) -> float:
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode())
     price = data[coin_id]["usd"]
-    log.info(f"Fetched live price for {symbol}: ${price:,.2f}")
+    log.debug(f"Fetched live price for {symbol}: ${price:,.2f}")
     return float(price)
 
 
@@ -895,7 +1364,7 @@ def create_sl_order(
         execution_fee=execution_fee,
         order_type=ORDER_TYPE_STOP_LOSS_DECREASE,
         is_long=is_long,
-        auto_cancel=True,  # cancel SL if position is fully closed by TPs
+        auto_cancel=False,  # SL must NOT auto-cancel — it is the safety net
     )
 
     # Multicall: sendWnt + createOrder
@@ -977,6 +1446,17 @@ def execute_signal(
 
     results = {"open": None, "tp": [], "sl": None, "order_type": "limit" if use_limit else "market"}
 
+    # ── Pre-step: Cancel any stale open orders for this market ──
+    # This prevents duplicate TP/SL orders if the previous position was closed
+    # by on-chain keepers (SL/TP hit) without the bot knowing.
+    log.info(f"\n{'='*60}")
+    log.info("PRE-STEP: Cancelling any stale orders for this market")
+    log.info(f"{'='*60}")
+    try:
+        cancel_orders_for_market(w3, acct, exchange, market, dry_run)
+    except Exception as e:
+        log.warning(f"Order cancellation failed (continuing anyway): {e}")
+
     # ── Step 1: Open position ──
     order_type_str = "LIMIT" if use_limit else "MARKET"
     log.info(f"{'='*60}")
@@ -1046,7 +1526,7 @@ def execute_signal(
 
     # ── Step 3: Place Stop Loss order (StopLossDecrease) ──
     log.info(f"\n{'='*60}")
-    log.info(f"STEP 3: Placing Stop Loss order")
+    log.info("STEP 3: Placing Stop Loss order")
     log.info(f"  SL: ${signal.stop_loss:,.2f} (100% close)")
     log.info(f"{'='*60}")
 
@@ -1065,7 +1545,7 @@ def execute_signal(
 
     # ── Summary ──
     log.info(f"\n{'='*60}")
-    log.info(f"EXECUTION SUMMARY")
+    log.info("EXECUTION SUMMARY")
     log.info(f"{'='*60}")
     log.info(f"  Open:  {results['open']}")
     for i, tp_r in enumerate(results["tp"]):
@@ -1115,7 +1595,7 @@ if __name__ == "__main__":
     if signal_text:
         # ── Parse signal mode ──
         signal = parse_signal(signal_text)
-        log.info(f"Parsed signal:")
+        log.info("Parsed signal:")
         log.info(f"  Symbol:   {signal.symbol} {signal.side}")
         log.info(f"  Entry:    ${signal.entry_low:,.2f} - ${signal.entry_high:,.2f}")
         for i, tp in enumerate(signal.take_profits):

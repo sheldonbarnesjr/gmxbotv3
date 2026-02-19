@@ -15,8 +15,6 @@ Features:
 """
 
 import os
-import re
-import json
 import time
 import uuid
 import asyncio
@@ -26,7 +24,6 @@ import statistics
 import traceback
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
-from collections import defaultdict
 
 try:
     from dotenv import load_dotenv
@@ -50,14 +47,23 @@ Signal = _open_mod.Signal
 TakeProfit = _open_mod.TakeProfit
 execute_signal = _open_mod.execute_signal
 create_limit_increase_order = _open_mod.create_limit_increase_order
+create_sl_order = _open_mod.create_sl_order
 fetch_current_price = _open_mod.fetch_current_price
+cancel_orders_for_market = _open_mod.cancel_orders_for_market
+cancel_all_orders = _open_mod.cancel_all_orders
+fetch_open_orders = _open_mod.fetch_open_orders
+scale_price = _open_mod.scale_price
 COINGECKO_IDS = _open_mod.COINGECKO_IDS
 INDEX_TOKEN_DECIMALS = _open_mod.INDEX_TOKEN_DECIMALS
 ERC20_ABI = _open_mod.ERC20_ABI
+EXCHANGE_ROUTER_ABI = _open_mod.EXCHANGE_ROUTER_ABI
+ORDER_TYPE_STOP_LOSS_DECREASE = _open_mod.ORDER_TYPE_STOP_LOSS_DECREASE
+ORDER_TYPE_LIMIT_DECREASE = _open_mod.ORDER_TYPE_LIMIT_DECREASE
 
 # From close.py — position fetching & closing
 from close import (
     fetch_positions as chain_fetch_positions,
+    fetch_current_price as close_fetch_current_price,
     GMXPosition,
     create_close_order,
 )
@@ -83,8 +89,39 @@ RPC_URL = os.getenv("ARBITRUM_RPC_URL") or os.getenv("RPC_URL", "https://arb1.ar
 # GMX V2 addresses
 GMX_V2_EXCHANGE_ROUTER = os.getenv("GMX_V2_EXCHANGE_ROUTER", "").strip()
 GMX_V2_ORDER_VAULT = os.getenv("GMX_V2_ORDER_VAULT", "").strip()
-GMX_V2_MARKET = os.getenv("GMX_V2_MARKET", "").strip()
+GMX_V2_MARKET = os.getenv("GMX_V2_MARKET", "").strip()  # default / BTC market
 GMX_V2_COLLATERAL_TOKEN = os.getenv("GMX_V2_COLLATERAL_TOKEN", "").strip()
+
+# Per-symbol GMX V2 market addresses on Arbitrum
+# Each key can be overridden via env var GMX_V2_MARKET_BTC / _ETH / _SOL / etc.
+GMX_V2_MARKETS = {
+    "BTC":  os.getenv("GMX_V2_MARKET_BTC",  os.getenv("GMX_V2_MARKET", "0x47c031236e19d024b42f8ae6780e44a573170703")).strip(),
+    "ETH":  os.getenv("GMX_V2_MARKET_ETH",  "0x70d95587d40A2caf56bd97485aB3Eec10Bee6336").strip(),
+    "SOL":  os.getenv("GMX_V2_MARKET_SOL",  "0x09400D9DB990D5ed3f35D7be61DfAEB900Af03C9").strip(),
+    "LINK": os.getenv("GMX_V2_MARKET_LINK", "0x7f1fa204bb700853D36994DA19F830b6Ad18455C").strip(),
+}
+
+# Allowed trading pairs
+ALLOWED_SYMBOLS = {"BTC", "ETH", "SOL", "LINK"}
+
+# Chainlink price feeds on Arbitrum (reliable on-chain fallback for CoinGecko)
+CHAINLINK_FEEDS = {
+    "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
+    "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
+    "SOL":  "0x24ceA4b8ce57cdA5058b924B9B9f8c3Ef2d5d5a4",
+    "LINK": "0x86E53CF1B870786351Da77A57575e79CB55812CB",
+}
+CHAINLINK_ABI = [
+    {"name": "latestRoundData", "type": "function", "stateMutability": "view",
+     "inputs": [],
+     "outputs": [{"name": "roundId", "type": "uint80"},
+                 {"name": "answer", "type": "int256"},
+                 {"name": "startedAt", "type": "uint256"},
+                 {"name": "updatedAt", "type": "uint256"},
+                 {"name": "answeredInRound", "type": "uint80"}]},
+    {"name": "decimals", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "uint8"}]},
+]
 
 # Trading
 MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "10"))
@@ -94,9 +131,6 @@ PORTFOLIO_PCT = float(os.getenv("PORTFOLIO_PCT", "0.25"))  # 25% of portfolio pe
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "30"))
 EXECUTION_FEE_WEI = int(os.getenv("GMX_V2_EXECUTION_FEE_WEI", str(Web3.to_wei(0.0002, "ether"))))
 
-# Risk
-SKIP_HIGH_RISK = os.getenv("SKIP_HIGH_RISK", "true").lower() == "true"
-HIGH_RISK_KEYWORDS = ["yolo", "degen", "moonshot", "lambo", "ape", "fomo"]
 MAX_PRICE_DEVIATION = float(os.getenv("MAX_PRICE_DEVIATION", "0.05"))
 
 # Safety
@@ -119,14 +153,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATA STRUCTURES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@dataclass
-class RiskProfile:
-    level: str = "normal"
-    leverage_multiplier: float = 1.0
-    allocation_multiplier: float = 1.0
-    expires_at: Optional[float] = None
-    reason: str = ""
 
 @dataclass
 class TakeProfitLevel:
@@ -158,6 +184,12 @@ class Position:
     tp_tx_hashes: List[str] = field(default_factory=list)
     sl_tx_hash: Optional[str] = None
     exit_reason: Optional[str] = None
+
+    # On-chain tracking for TP-hit → move SL
+    market_addr: Optional[str] = None
+    sl_moved_to_entry: bool = False
+    tp_hits_count: int = 0  # how many TPs have been hit so far
+    last_known_tp_count: int = 0  # track how many TP orders remain on-chain
 
     @property
     def short_id(self) -> str:
@@ -218,7 +250,6 @@ class GMXBot:
 
         # State
         self.positions: Dict[str, Position] = {}
-        self.risk_profiles: Dict[str, RiskProfile] = {}
         self.price_cache: Dict[str, PriceData] = {}
         self.trade_history: List[TradeRecord] = []
 
@@ -240,6 +271,7 @@ class GMXBot:
 
         self.price_update_task: Optional[asyncio.Task] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
+        self.tp_monitor_task: Optional[asyncio.Task] = None
         self.setup_logging()
 
     def setup_logging(self):
@@ -263,25 +295,46 @@ class GMXBot:
 
         self.price_update_task = asyncio.create_task(self.price_update_loop())
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        self.tp_monitor_task = asyncio.create_task(self.tp_monitor_loop())
 
         self.logger.info("GMX Bot started successfully")
 
         # Send startup notification to admin
         await self.send_startup_notification()
 
+        shutdown_reason = "Telegram disconnected"
         try:
             await self.client.run_until_disconnected()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             self.logger.info("Bot stopped by user")
+            shutdown_reason = "Manual stop"
+        except Exception as e:
+            self.logger.error(f"Fatal error in bot: {e}")
+            shutdown_reason = f"Fatal error: {e}"
         finally:
-            await self.shutdown()
+            await self.shutdown(shutdown_reason)
 
-    async def shutdown(self):
+    async def shutdown(self, reason: str = "Bot stopped"):
         self.logger.info("Shutting down GMX Bot...")
+
+        # Cancel background tasks first
         if self.price_update_task:
             self.price_update_task.cancel()
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
+        if self.tp_monitor_task:
+            self.tp_monitor_task.cancel()
+
+        # Reconnect if needed so the offline message can be sent
+        try:
+            if self.client:
+                if not self.client.is_connected():
+                    await self.client.connect()
+                await self.client.send_message(NOTIFY_CHAT, "🔴 Bot Offline")
+                await self.client.disconnect()
+        except Exception as e:
+            self.logger.error(f"Failed to send offline notification: {e}")
+
         self.logger.info("Bot shutdown complete")
 
     async def init_telegram(self):
@@ -353,27 +406,39 @@ class GMXBot:
             eth_formatted = eth_bal / 10**18
 
             portfolio = await asyncio.to_thread(self.get_portfolio_value)
-            trade_size = portfolio * PORTFOLIO_PCT
+            collateral_per_trade = portfolio * PORTFOLIO_PCT
 
-            # Count on-chain positions
+            # Fetch on-chain positions for count + deployed capital
             try:
                 positions = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, self.account.address
                 )
                 pos_count = len(positions) if positions else 0
+                deployed = sum(p.collateral_amount for p in positions) if positions else 0.0
             except Exception:
                 pos_count = 0
+                deployed = 0.0
+
+            # ETH balance in USD (use cached price or fetch)
+            eth_price_usd = await self.get_current_price("ETH") or 0.0
+            eth_usd_value = (eth_formatted * eth_price_usd) if eth_price_usd else 0.0
+            eth_usd_str = f"${eth_usd_value:,.2f}" if eth_price_usd else "N/A"
+
+            deployed_str = f"${deployed:,.2f}" if deployed > 0 else "$0.00"
+            total = portfolio + eth_usd_value + deployed
 
             wallet = f"{self.account.address[:8]}...{self.account.address[-6:]}"
 
             msg = (
-                f"**Bot Online**\n\n"
+                f"🟢 **Bot Online**\n\n"
                 f"Wallet: {wallet}\n"
                 f"Network: {NETWORK.upper()}\n"
                 f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}\n\n"
                 f"Portfolio: ${portfolio:,.2f} USDC\n"
-                f"Trade size: ${trade_size:,.2f} ({PORTFOLIO_PCT:.0%})\n"
-                f"ETH: {eth_formatted:.6f}\n"
+                f"ETH: {eth_usd_str}\n"
+                f"Deployed: {deployed_str}\n"
+                f"Total: ${total:,.2f}\n"
+                f"Collateral/trade: ${collateral_per_trade:,.2f} ({PORTFOLIO_PCT:.0%})\n"
                 f"Open positions: {pos_count}\n\n"
                 f"Max leverage: {MAX_LEVERAGE:.0f}x\n"
                 f"Require TP/SL: {REQUIRE_TP}/{REQUIRE_SL}\n"
@@ -405,9 +470,9 @@ class GMXBot:
                 self.logger.debug(f"Could not parse signal: {e}")
                 return
 
-            # Check symbol is supported
-            if signal.symbol not in COINGECKO_IDS:
-                self.logger.debug(f"Unsupported symbol: {signal.symbol}")
+            # Only trade BTC, ETH, SOL
+            if signal.symbol not in ALLOWED_SYMBOLS:
+                self.logger.debug(f"Ignored signal for {signal.symbol} — not in allowed pairs (BTC/ETH/SOL)")
                 return
 
             self.logger.info(f"Signal parsed: {signal.symbol} {signal.side}")
@@ -416,35 +481,27 @@ class GMXBot:
             if not await self.validate_signal(signal):
                 return
 
-            # Risk assessment
-            risk = self.assess_risk(signal, text)
-            if risk == "risky" and SKIP_HIGH_RISK:
-                self.logger.warning(f"Skipping high-risk signal for {signal.symbol}")
-                await self.notify(f"Skipped high-risk {signal.symbol} {signal.side} signal")
-                return
-
-            # Determine position size = 25% of portfolio (USDC balance)
+            # Determine collateral = 25% of portfolio (USDC balance)
+            # Position size = collateral × leverage
             portfolio = await asyncio.to_thread(self.get_portfolio_value)
-            size_usd = portfolio * PORTFOLIO_PCT
-            risk_profile = self.get_risk_profile(signal.symbol)
-            size_usd *= risk_profile.allocation_multiplier
-            size_usd = max(MIN_POSITION_USD, min(size_usd, MAX_POSITION_USD))
 
             if portfolio <= 0:
                 await self.notify(f"Rejected {signal.symbol}: portfolio balance is $0")
                 return
-            if size_usd < MIN_POSITION_USD:
+
+            # Cap leverage at MAX_LEVERAGE first so collateral calculation is correct
+            signal.leverage = min(signal.leverage, MAX_LEVERAGE)
+
+            collateral_usd = portfolio * PORTFOLIO_PCT
+            size_usd = collateral_usd * signal.leverage
+            size_usd = max(MIN_POSITION_USD, min(size_usd, MAX_POSITION_USD))
+
+            if collateral_usd < MIN_POSITION_USD / signal.leverage:
                 await self.notify(
-                    f"Rejected {signal.symbol}: trade size ${size_usd:.2f} "
-                    f"(25% of ${portfolio:.2f}) below minimum ${MIN_POSITION_USD:.0f}"
+                    f"Rejected {signal.symbol}: collateral ${collateral_usd:.2f} "
+                    f"(25% of ${portfolio:.2f}) too small for min position ${MIN_POSITION_USD:.0f}"
                 )
                 return
-
-            # Cap leverage
-            leverage = min(signal.leverage, MAX_LEVERAGE)
-            leverage *= risk_profile.leverage_multiplier
-            leverage = min(leverage, MAX_LEVERAGE)
-            signal.leverage = leverage
 
             # Notify that we're executing
             tp_list = ", ".join(f"${tp.price:,.0f} ({tp.close_pct:.0%})" for tp in signal.take_profits)
@@ -453,7 +510,8 @@ class GMXBot:
                 f"Entry: ${signal.entry_low:,.0f}-${signal.entry_high:,.0f}\n"
                 f"TP: {tp_list}\n"
                 f"SL: ${signal.stop_loss:,.0f}\n"
-                f"Size: ${size_usd:.0f} ({PORTFOLIO_PCT:.0%} of ${portfolio:.0f}) @ {leverage:.0f}x\n"
+                f"Collateral: ${collateral_usd:.0f} ({PORTFOLIO_PCT:.0%} of ${portfolio:.0f})\n"
+                f"Size: ${size_usd:.0f} @ {signal.leverage:.0f}x\n"
                 f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}"
             )
 
@@ -463,6 +521,8 @@ class GMXBot:
                 self.positions[position.id] = position
                 self.health_stats["trades_executed"] += 1
                 await self.notify_position_opened(position, order_type)
+                # Top up ETH for gas if balance is low
+                await self.topup_eth_if_needed()
 
         except Exception as e:
             self.logger.error(f"Error processing signal: {e}\n{traceback.format_exc()}")
@@ -483,12 +543,15 @@ class GMXBot:
             await self.notify(f"Rejected {signal.symbol} {signal.side}: no take profit")
             return False
 
-        # Check for existing position in same symbol
+        # Check for existing position in same symbol — override it
         for pos in self.positions.values():
             if pos.symbol == signal.symbol and pos.is_open:
-                self.logger.info(f"Already have open {signal.symbol} position")
-                await self.notify(f"Rejected {signal.symbol} {signal.side}: already have open position")
-                return False
+                self.logger.info(f"Overriding existing {signal.symbol} position with new signal")
+                closed = await self._close_existing_position(pos, signal)
+                if not closed:
+                    await self.notify(f"Rejected {signal.symbol} {signal.side}: failed to close existing position")
+                    return False
+                break
 
         # Price deviation check
         # Within 10%: allowed (limit order if outside entry range, market if inside)
@@ -536,23 +599,6 @@ class GMXBot:
 
         return True
 
-    def assess_risk(self, signal: Signal, raw_text: str) -> str:
-        """Assess signal risk level."""
-        score = 0
-        text_lower = raw_text.lower()
-        score += sum(2 for w in HIGH_RISK_KEYWORDS if w in text_lower)
-        if signal.leverage > 20:
-            score += 2
-        elif signal.leverage > 10:
-            score += 1
-        if signal.stop_loss:
-            sl_dist = abs(signal.stop_loss - signal.entry_mid) / signal.entry_mid
-            if sl_dist < 0.02:
-                score += 2
-            elif sl_dist < 0.05:
-                score += 1
-        return "risky" if score >= 4 else "normal" if score >= 2 else "safe"
-
     # ──────────────────────────────────────────────────────────────────────
     # OPEN — Real on-chain execution via open.py
     # ──────────────────────────────────────────────────────────────────────
@@ -567,6 +613,15 @@ class GMXBot:
                 f"${size_usd:.0f} @ {signal.leverage:.0f}x"
             )
 
+            # Resolve the correct GMX V2 market address for this symbol
+            market_addr = GMX_V2_MARKETS.get(signal.symbol, GMX_V2_MARKET)
+            if not market_addr:
+                raise ValueError(
+                    f"No GMX V2 market address configured for {signal.symbol}. "
+                    f"Set GMX_V2_MARKET_{signal.symbol} in your .env"
+                )
+            self.logger.info(f"Using market address for {signal.symbol}: {market_addr}")
+
             # Run synchronous web3 calls in a thread
             results = await asyncio.to_thread(
                 execute_signal,
@@ -575,7 +630,7 @@ class GMXBot:
                 signal,
                 GMX_V2_EXCHANGE_ROUTER,
                 GMX_V2_ORDER_VAULT,
-                GMX_V2_MARKET,
+                market_addr,
                 GMX_V2_COLLATERAL_TOKEN,
                 size_usd,
                 EXECUTION_FEE_WEI,
@@ -602,6 +657,8 @@ class GMXBot:
                 tx_hash=results.get("open"),
                 tp_tx_hashes=[r.get("tx", "") for r in results.get("tp", []) if r.get("tx")],
                 sl_tx_hash=results.get("sl"),
+                market_addr=market_addr,
+                last_known_tp_count=0,  # 0 = not yet verified on-chain; first poll will set actual count
             )
 
             self.logger.info(
@@ -618,6 +675,26 @@ class GMXBot:
     # ──────────────────────────────────────────────────────────────────────
     # CLOSE — Real on-chain execution via close.py
     # ──────────────────────────────────────────────────────────────────────
+    async def wait_for_position_closed(self, market: str, is_long: bool, timeout: int = 120) -> bool:
+        """Poll chain until the position for (market, is_long) disappears or timeout (seconds).
+        Returns True if position is gone, False if it still exists after timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+            try:
+                positions = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, self.account.address
+                )
+                still_open = any(
+                    p.market.lower() == market.lower() and p.is_long == is_long
+                    for p in positions
+                )
+                if not still_open:
+                    return True
+            except Exception as e:
+                self.logger.warning(f"Error polling position status: {e}")
+        return False
+
     async def execute_close(self, gmx_pos: GMXPosition, percentage: float = 1.0) -> Optional[str]:
         """Execute a close order on-chain via close.py's create_close_order."""
         try:
@@ -634,6 +711,146 @@ class GMXBot:
         except Exception as e:
             self.logger.error(f"Error executing close: {e}")
             return None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ETH gas top-up
+    # ──────────────────────────────────────────────────────────────────────
+    def _send_tx(self, to_addr: str, data: bytes, value: int) -> str:
+        """Synchronous helper: build, sign, and send a transaction. Returns tx hash."""
+        tx = _open_mod.build_tx(self.w3, self.account.address, to_addr, data, value)
+        return _open_mod.sign_send(self.w3, self.account, tx, dry_run=False)
+
+    async def topup_eth_if_needed(self):
+        """After a trade, check ETH balance. If < $2 worth, swap $5 of USDC → ETH
+        via Uniswap V3 on Arbitrum to ensure gas fees are always covered."""
+        # Uniswap V3 SwapRouter02 on Arbitrum
+        UNISWAP_ROUTER = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+        WETH_ARBITRUM   = Web3.to_checksum_address("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
+        USDC_ARBITRUM   = Web3.to_checksum_address("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
+        POOL_FEE        = 500  # 0.05% USDC/WETH pool
+
+        UNISWAP_ABI = [
+            {
+                "name": "multicall",
+                "type": "function",
+                "stateMutability": "payable",
+                "inputs": [{"name": "data", "type": "bytes[]"}],
+                "outputs": [{"name": "", "type": "bytes[]"}],
+            },
+            {
+                "name": "exactInputSingle",
+                "type": "function",
+                "stateMutability": "payable",
+                "inputs": [{
+                    "name": "params", "type": "tuple",
+                    "components": [
+                        {"name": "tokenIn",           "type": "address"},
+                        {"name": "tokenOut",          "type": "address"},
+                        {"name": "fee",               "type": "uint24"},
+                        {"name": "recipient",         "type": "address"},
+                        {"name": "amountIn",          "type": "uint256"},
+                        {"name": "amountOutMinimum",  "type": "uint256"},
+                        {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                    ],
+                }],
+                "outputs": [{"name": "amountOut", "type": "uint256"}],
+            },
+            {
+                "name": "unwrapWETH9",
+                "type": "function",
+                "stateMutability": "payable",
+                "inputs": [
+                    {"name": "amountMinimum", "type": "uint256"},
+                    {"name": "recipient",     "type": "address"},
+                ],
+                "outputs": [],
+            },
+        ]
+
+        try:
+            wallet = self.account.address
+
+            # Check current ETH balance
+            eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+            eth_amount = eth_bal / 10**18
+
+            eth_price = await self.get_current_price("ETH")
+            if not eth_price:
+                try:
+                    eth_price = await asyncio.to_thread(close_fetch_current_price, "ETH")
+                except Exception:
+                    eth_price = 0.0
+            if not eth_price:
+                self.logger.warning("ETH top-up: could not get ETH price, skipping")
+                return
+
+            eth_usd_value = eth_amount * eth_price
+            if eth_usd_value >= 2.0:
+                self.logger.debug(f"ETH balance ${eth_usd_value:.2f} — no top-up needed")
+                return
+
+            topup_usd = 5.0
+            self.logger.info(f"ETH balance ${eth_usd_value:.2f} < $2 — topping up with ${topup_usd} of USDC")
+
+            if DRY_RUN:
+                self.logger.info("[DRY_RUN] Would swap $5 USDC → ETH for gas top-up")
+                await self.notify(f"[DRY RUN] ETH balance low (${eth_usd_value:.2f}) — would swap $5 USDC → ETH")
+                return
+
+            # Check USDC balance
+            usdc_token = self.w3.eth.contract(address=USDC_ARBITRUM, abi=ERC20_ABI)
+            usdc_decimals = await asyncio.to_thread(lambda: usdc_token.functions.decimals().call())
+            usdc_bal_raw  = await asyncio.to_thread(lambda: usdc_token.functions.balanceOf(wallet).call())
+            usdc_bal      = usdc_bal_raw / (10 ** usdc_decimals)
+
+            if usdc_bal < topup_usd:
+                self.logger.warning(f"ETH top-up: insufficient USDC (${usdc_bal:.2f} < ${topup_usd})")
+                await self.notify(f"ETH balance low (${eth_usd_value:.2f}) but not enough USDC to top up (${usdc_bal:.2f})")
+                return
+
+            usdc_amount_in = int(topup_usd * (10 ** usdc_decimals))
+
+            # Approve Uniswap router for USDC if needed
+            allowance = await asyncio.to_thread(
+                lambda: usdc_token.functions.allowance(wallet, UNISWAP_ROUTER).call()
+            )
+            if allowance < usdc_amount_in:
+                approve_data = usdc_token.encode_abi("approve", [UNISWAP_ROUTER, 2**256 - 1])
+                approve_txh = await asyncio.to_thread(
+                    self._send_tx, USDC_ARBITRUM, approve_data, 0
+                )
+                await asyncio.to_thread(_open_mod.wait_receipt, self.w3, approve_txh)
+                self.logger.info(f"USDC approved for Uniswap: {approve_txh}")
+
+            # Build exactInputSingle: USDC → WETH, recipient = router (for unwrap)
+            router = self.w3.eth.contract(address=UNISWAP_ROUTER, abi=UNISWAP_ABI)
+            swap_params = (
+                USDC_ARBITRUM,   # tokenIn
+                WETH_ARBITRUM,   # tokenOut
+                POOL_FEE,        # fee
+                UNISWAP_ROUTER,  # recipient = router so we can unwrap
+                usdc_amount_in,  # amountIn
+                0,               # amountOutMinimum (0 = no slippage guard, acceptable for small top-up)
+                0,               # sqrtPriceLimitX96
+            )
+            swap_data   = router.encode_abi("exactInputSingle", [swap_params])
+            unwrap_data = router.encode_abi("unwrapWETH9", [0, Web3.to_checksum_address(wallet)])
+            call_data   = router.encode_abi("multicall", [[swap_data, unwrap_data]])
+
+            txh = await asyncio.to_thread(self._send_tx, UNISWAP_ROUTER, call_data, 0)
+            receipt = await asyncio.to_thread(_open_mod.wait_receipt, self.w3, txh)
+
+            if receipt.get("status") == 1:
+                new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+                new_eth_usd = (new_eth_bal / 10**18) * eth_price
+                self.logger.info(f"ETH top-up complete. New ETH balance: ${new_eth_usd:.2f}")
+                await self.notify(f"ETH top-up: swapped $5 USDC → ETH (new balance ~${new_eth_usd:.2f})\nTX: {txh}")
+            else:
+                self.logger.error(f"ETH top-up tx reverted: {txh}")
+                await self.notify(f"ETH top-up failed (tx reverted): {txh}")
+
+        except Exception as e:
+            self.logger.error(f"ETH top-up error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Price feeds — real CoinGecko
@@ -677,13 +894,37 @@ class GMXBot:
         return None
 
     async def fetch_price(self, symbol: str) -> Optional[float]:
-        """Fetch real price from CoinGecko via open.py's fetch_current_price."""
+        """Fetch price from CoinGecko, fallback to Chainlink on-chain feed."""
+        # Try CoinGecko first
         try:
             price = await asyncio.to_thread(fetch_current_price, symbol)
-            return price
+            if price and price > 0:
+                return price
         except Exception as e:
-            self.logger.debug(f"Price fetch failed for {symbol}: {e}")
-            return None
+            self.logger.debug(f"CoinGecko price fetch failed for {symbol}: {e}")
+
+        # Fallback: Chainlink on-chain price feed (no rate limits)
+        feed_addr = CHAINLINK_FEEDS.get(symbol.upper())
+        if feed_addr:
+            try:
+                feed = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(feed_addr),
+                    abi=CHAINLINK_ABI,
+                )
+                result = await asyncio.to_thread(
+                    feed.functions.latestRoundData().call
+                )
+                decimals = await asyncio.to_thread(
+                    feed.functions.decimals().call
+                )
+                price = result[1] / (10 ** decimals)
+                if price > 0:
+                    self.logger.debug(f"Chainlink price for {symbol}: ${price:,.2f}")
+                    return price
+            except Exception as e:
+                self.logger.debug(f"Chainlink price fetch failed for {symbol}: {e}")
+
+        return None
 
     # ──────────────────────────────────────────────────────────────────────
     # Heartbeat
@@ -701,15 +942,431 @@ class GMXBot:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def perform_health_check(self):
-        issues = []
-        for symbol, pd in self.price_cache.items():
-            if not pd.is_fresh and pd.age_seconds > HALT_ON_PRICE_STALE:
-                issues.append(f"{symbol}({pd.age_seconds:.0f}s stale)")
-        if issues and not self.is_halted:
-            await self.halt_trading(f"Stale prices: {', '.join(issues)}")
-        if not issues and self.is_halted and self.halt_time:
-            if time.time() - self.halt_time > AUTO_RESUME_AFTER:
-                await self.resume_trading("Auto-resume: prices recovered")
+        # Prices are only fetched on-demand when a signal arrives, so a stale
+        # price cache is normal and should never halt trading.
+        pass
+
+    # ──────────────────────────────────────────────────────────────────────
+    # TP-hit monitoring — move SL to entry when any TP fires
+    # ──────────────────────────────────────────────────────────────────────
+    async def tp_monitor_loop(self):
+        """Poll on-chain every 30s. Detects:
+          - TP hits (order count decreased) → move SL to entry
+          - Position closed (SL hit / liquidation / all TPs filled) → report PnL
+        """
+        while True:
+            try:
+                await asyncio.sleep(30)
+                await self.check_position_closed()
+                await self.check_tp_hits()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"TP monitor error: {e}")
+                await asyncio.sleep(30)
+
+    async def check_position_closed(self):
+        """Detect when a tracked open position disappears from chain
+        (SL hit, liquidation, or all TPs filled) and report PnL."""
+        open_positions = [p for p in self.positions.values()
+                          if p.is_open and p.market_addr]
+        if not open_positions:
+            return
+
+        try:
+            chain_positions = await asyncio.to_thread(
+                chain_fetch_positions, self.w3, self.account.address
+            )
+        except Exception as e:
+            self.logger.debug(f"check_position_closed: fetch failed: {e}")
+            return
+
+        # Build set of (market, is_long) tuples that exist on-chain
+        chain_keys = {
+            (cp.market.lower(), cp.is_long) for cp in chain_positions
+        }
+
+        for pos in open_positions:
+            key = (pos.market_addr.lower(), pos.side == "LONG")
+            if key not in chain_keys:
+                # Position is gone from chain — it was closed by keepers
+                # (SL hit, liquidation, or final TP filled the entire position)
+
+                # Determine exit reason
+                if pos.sl_moved_to_entry:
+                    exit_reason = "SL (breakeven)"
+                elif pos.last_known_tp_count > 0:
+                    exit_reason = "SL/TP/liquidation"
+                else:
+                    exit_reason = "SL/liquidation"
+
+                # Get last known price for PnL estimate
+                current_price = await self.get_current_price(pos.symbol)
+                if current_price:
+                    pos.current_price = current_price
+                    if pos.side == "LONG":
+                        change = current_price - pos.entry_price
+                    else:
+                        change = pos.entry_price - current_price
+                    pos.unrealized_pnl = (change / pos.entry_price) * pos.size_usd * pos.leverage
+
+                pnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+                price_str = f"${current_price:,.2f}" if current_price else "N/A"
+
+                self.logger.info(
+                    f"Position closed on-chain: {pos.symbol} {pos.side} "
+                    f"PnL={pnl_sign}${pos.unrealized_pnl:,.2f} reason={exit_reason}"
+                )
+
+                await self.notify(
+                    f"Position Closed: {pos.symbol} {pos.side}\n"
+                    f"Entry: ${pos.entry_price:,.2f}  |  Exit: {price_str}\n"
+                    f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f} ({pnl_sign}{pos.pnl_percentage:.1f}%)"
+                )
+
+                # Mark position as closed
+                pos.is_open = False
+                pos.closed_at = time.time()
+                pos.exit_reason = exit_reason
+
+                # Cancel any remaining SL/TP orders for this market
+                try:
+                    exchange = self.w3.eth.contract(
+                        address=Web3.to_checksum_address(GMX_V2_EXCHANGE_ROUTER),
+                        abi=EXCHANGE_ROUTER_ABI,
+                    )
+                    n_cancelled = await asyncio.to_thread(
+                        cancel_orders_for_market,
+                        self.w3,
+                        self.account,
+                        exchange,
+                        pos.market_addr,
+                        DRY_RUN,
+                    )
+                    if n_cancelled:
+                        self.logger.info(
+                            f"Cancelled {n_cancelled} orphaned order(s) for {pos.symbol}"
+                        )
+                        await self.notify(
+                            f"Cancelled {n_cancelled} remaining order(s) for {pos.symbol}"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Failed to cancel orphaned orders for {pos.symbol}: {e}")
+
+                # Top up ETH for gas if balance is low
+                await self.topup_eth_if_needed()
+
+    async def check_tp_hits(self):
+        """For each open position, count on-chain TP orders.
+        If fewer than before → a TP was hit → move SL to entry.
+
+        Key safeguards:
+          - last_known_tp_count starts at 0 (unverified). The first poll
+            that sees TPs on-chain sets the baseline — no action taken.
+          - Before declaring a TP hit, we verify the position still exists
+            on-chain. If it doesn't, the orders vanished because keepers
+            auto-cancelled them (position rejected / already closed).
+          - If ALL TPs vanish at once (count drops to 0 from >1), that's
+            almost certainly keeper auto-cancellation, not multiple TP hits.
+            We only act when count drops by 1 at a time.
+        """
+        open_positions = [p for p in self.positions.values()
+                          if p.is_open and p.market_addr]
+        if not open_positions:
+            return
+
+        try:
+            orders = await asyncio.to_thread(
+                fetch_open_orders, self.w3, self.account.address
+            )
+        except Exception as e:
+            self.logger.debug(f"check_tp_hits: fetch_open_orders failed: {e}")
+            return
+
+        for pos in open_positions:
+            market_lower = pos.market_addr.lower()
+            is_long = pos.side == "LONG"
+
+            # Count TP orders (type 5 = LimitDecrease) for this position's market
+            tp_orders = [
+                o for o in orders
+                if o["market"].lower() == market_lower
+                and o["order_type"] == ORDER_TYPE_LIMIT_DECREASE
+            ]
+            current_tp_count = len(tp_orders)
+
+            if pos.last_known_tp_count == 0:
+                # First poll — set baseline from actual on-chain count.
+                # No action taken, just record what's really there.
+                if current_tp_count > 0:
+                    pos.last_known_tp_count = current_tp_count
+                    self.logger.info(
+                        f"TP baseline set: {pos.symbol} {pos.side} has "
+                        f"{current_tp_count} TP order(s) on-chain"
+                    )
+                continue  # never act on the first poll
+
+            if current_tp_count < pos.last_known_tp_count:
+                hit_count = pos.last_known_tp_count - current_tp_count
+
+                # Safety: if ALL TPs vanished at once, verify position exists.
+                # Keepers auto-cancel all orders when a position is rejected or
+                # doesn't exist. A real TP execution removes 1 order at a time.
+                if current_tp_count == 0 and hit_count > 1:
+                    self.logger.info(
+                        f"All {hit_count} TPs vanished for {pos.symbol} {pos.side} — "
+                        f"verifying position still exists on-chain..."
+                    )
+                    try:
+                        chain_positions = await asyncio.to_thread(
+                            chain_fetch_positions, self.w3, self.account.address
+                        )
+                        chain_pos = next(
+                            (cp for cp in chain_positions
+                             if cp.market.lower() == market_lower and cp.is_long == is_long),
+                            None,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"check_tp_hits: position check failed: {e}")
+                        chain_pos = None
+
+                    if not chain_pos:
+                        # Position doesn't exist — orders were auto-cancelled by keepers
+                        self.logger.warning(
+                            f"Position {pos.symbol} {pos.side} not found on-chain. "
+                            f"TPs were auto-cancelled (position rejected or already closed). "
+                            f"NOT treating as TP hit."
+                        )
+                        pos.last_known_tp_count = 0
+                        continue
+
+                # Verify price actually reached TP level before declaring a hit.
+                # If TP orders were manually cancelled (via /close), the price
+                # won't be near the TP level → skip, just update baseline.
+                current_price = await self.get_current_price(pos.symbol)
+                if not current_price:
+                    try:
+                        cps = await asyncio.to_thread(
+                            chain_fetch_positions, self.w3, self.account.address
+                        )
+                        cp = next((c for c in cps if c.market.lower() == market_lower), None)
+                        current_price = cp.current_price if cp else None
+                    except Exception:
+                        pass
+
+                if current_price:
+                    # Determine which TP should have been hit based on sorted TPs
+                    sorted_tps = sorted(pos.take_profits, key=lambda t: t.price,
+                                        reverse=(pos.side == "SHORT"))
+                    # The TP that was supposedly hit is the next one in sequence
+                    next_tp_idx = pos.tp_hits_count  # 0-based index of next TP to be hit
+                    if next_tp_idx < len(sorted_tps):
+                        expected_tp_price = sorted_tps[next_tp_idx].price
+                        # For LONG: price must be >= TP price (within 2% tolerance)
+                        # For SHORT: price must be <= TP price (within 2% tolerance)
+                        tolerance = expected_tp_price * 0.02
+                        if is_long and current_price < expected_tp_price - tolerance:
+                            self.logger.warning(
+                                f"TP count dropped for {pos.symbol} {pos.side} but price "
+                                f"${current_price:,.2f} hasn't reached TP ${expected_tp_price:,.2f}. "
+                                f"Orders likely cancelled manually. Updating baseline only."
+                            )
+                            pos.last_known_tp_count = current_tp_count
+                            continue
+                        elif not is_long and current_price > expected_tp_price + tolerance:
+                            self.logger.warning(
+                                f"TP count dropped for {pos.symbol} {pos.side} but price "
+                                f"${current_price:,.2f} hasn't reached TP ${expected_tp_price:,.2f}. "
+                                f"Orders likely cancelled manually. Updating baseline only."
+                            )
+                            pos.last_known_tp_count = current_tp_count
+                            continue
+
+                # Genuine TP hit — position exists + price confirmed
+                pos.tp_hits_count += hit_count
+                self.logger.info(
+                    f"TP HIT detected: {pos.symbol} {pos.side} — "
+                    f"{hit_count} TP(s) executed (was {pos.last_known_tp_count}, now {current_tp_count}), "
+                    f"total hits: {pos.tp_hits_count}"
+                )
+
+                # Fetch current PnL from chain for the notification
+                pnl_line = ""
+                try:
+                    chain_positions = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, self.account.address
+                    )
+                    chain_pos = next(
+                        (cp for cp in chain_positions
+                         if cp.market.lower() == market_lower and cp.is_long == is_long),
+                        None,
+                    )
+                    if chain_pos:
+                        pnl_sign = "+" if chain_pos.unrealized_pnl >= 0 else ""
+                        pnl_line = (
+                            f"Current PnL: {pnl_sign}${chain_pos.unrealized_pnl:,.2f} "
+                            f"({pnl_sign}{chain_pos.pnl_percentage:.1f}%)\n"
+                            f"Remaining size: ${chain_pos.size_usd:,.2f}\n"
+                        )
+                except Exception:
+                    pass
+
+                # Determine new SL target based on how many TPs have been hit:
+                #   TP1 hit (tp_hits_count=1) → SL moves to entry
+                #   TP2 hit (tp_hits_count=2) → SL moves to TP1 price
+                #   TP3 hit (tp_hits_count=3) → SL moves to TP2 price
+                sorted_tps = sorted(pos.take_profits, key=lambda t: t.price,
+                                    reverse=(pos.side == "SHORT"))
+                if pos.tp_hits_count <= 1:
+                    new_sl_target = pos.entry_price
+                    sl_label = "Entry"
+                elif pos.tp_hits_count == 2 and len(sorted_tps) >= 1:
+                    new_sl_target = sorted_tps[0].price  # TP1 price
+                    sl_label = "TP1"
+                elif pos.tp_hits_count >= 3 and len(sorted_tps) >= 2:
+                    new_sl_target = sorted_tps[1].price  # TP2 price
+                    sl_label = "TP2"
+                else:
+                    new_sl_target = pos.entry_price
+                    sl_label = "Entry"
+
+                await self.notify(
+                    f"TP{pos.tp_hits_count} Hit: {pos.symbol} {pos.side}\n"
+                    f"{pnl_line}"
+                    f"SL → {sl_label} ${new_sl_target:,.2f}"
+                )
+                await self.move_sl(pos, orders, new_sl_target, sl_label)
+                pos.last_known_tp_count = current_tp_count
+
+    async def move_sl(self, pos: "Position", orders: list,
+                      new_sl_price: float, sl_label: str = "entry"):
+        """Cancel ALL existing SL orders for this market, then place a new one.
+
+        Progressive trailing:
+          TP1 hit → SL to entry (breakeven)
+          TP2 hit → SL to TP1 price
+          TP3 hit → SL to TP2 price
+        """
+        try:
+            market_lower = pos.market_addr.lower()
+            is_long = pos.side == "LONG"
+
+            exchange = self.w3.eth.contract(
+                address=Web3.to_checksum_address(GMX_V2_EXCHANGE_ROUTER),
+                abi=EXCHANGE_ROUTER_ABI,
+            )
+
+            # Re-fetch fresh orders to ensure we have current state
+            try:
+                fresh_orders = await asyncio.to_thread(
+                    fetch_open_orders, self.w3, self.account.address
+                )
+            except Exception as e:
+                self.logger.warning(f"move_sl: could not re-fetch orders, using passed list: {e}")
+                fresh_orders = orders
+
+            # Find ALL SL orders for this market (cancel every one)
+            sl_orders = [
+                o for o in fresh_orders
+                if o["market"].lower() == market_lower
+                and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+            ]
+
+            self.logger.info(
+                f"move_sl: found {len(sl_orders)} SL order(s) to cancel for {pos.symbol}"
+            )
+
+            # Cancel old SL order(s)
+            cancelled_count = 0
+            for sl in sl_orders:
+                if not sl.get("key_hex"):
+                    self.logger.warning(f"  SL order has no key_hex, skipping")
+                    continue
+                key_bytes = bytes.fromhex(sl["key_hex"])
+                self.logger.info(f"Cancelling old SL 0x{sl['key_hex'][:16]}...")
+                try:
+                    def _cancel_sl(kb=key_bytes):
+                        data = exchange.encode_abi("cancelOrder", [kb])
+                        tx = _open_mod.build_tx(
+                            self.w3, self.account.address, exchange.address, data, value=0
+                        )
+                        txh = _open_mod.sign_send(self.w3, self.account, tx, dry_run=DRY_RUN)
+                        if not DRY_RUN and not txh.startswith("dry_run"):
+                            _open_mod.wait_receipt(self.w3, txh)
+                        return txh
+                    txh = await asyncio.to_thread(_cancel_sl)
+                    self.logger.info(f"Old SL cancelled: {txh}")
+                    cancelled_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed to cancel old SL: {e}")
+
+            if sl_orders and cancelled_count == 0:
+                self.logger.error(
+                    f"Could not cancel any of {len(sl_orders)} old SL orders! "
+                    f"Aborting new SL placement to avoid duplicates."
+                )
+                await self.notify(
+                    f"Failed to cancel old SL for {pos.symbol}. "
+                    f"New SL NOT placed to avoid duplicates."
+                )
+                return
+
+            # Fetch remaining position size from chain for the new SL
+            try:
+                chain_positions = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, self.account.address
+                )
+                chain_pos = next(
+                    (cp for cp in chain_positions
+                     if cp.market.lower() == market_lower and cp.is_long == is_long),
+                    None,
+                )
+                if not chain_pos:
+                    self.logger.warning("Position no longer exists on-chain, skipping SL placement")
+                    pos.sl_moved_to_entry = True
+                    return
+                remaining_size_usd = chain_pos.size_usd
+            except Exception as e:
+                self.logger.warning(f"Could not fetch remaining size, using original: {e}")
+                remaining_size_usd = pos.size_usd
+
+            self.logger.info(
+                f"Placing new SL at {sl_label} ${new_sl_price:,.2f} "
+                f"for ${remaining_size_usd:,.2f} size"
+            )
+
+            order_vault = Web3.to_checksum_address(GMX_V2_ORDER_VAULT)
+            collateral_token = Web3.to_checksum_address(GMX_V2_COLLATERAL_TOKEN)
+
+            txh = await asyncio.to_thread(
+                create_sl_order,
+                self.w3,
+                self.account,
+                exchange,
+                self.account.address,
+                pos.market_addr,
+                collateral_token,
+                order_vault,
+                new_sl_price,
+                remaining_size_usd,
+                pos.symbol,
+                is_long,
+                SLIPPAGE_BPS,
+                EXECUTION_FEE_WEI,
+                DRY_RUN,
+            )
+
+            pos.stop_loss = new_sl_price
+            pos.sl_moved_to_entry = True
+
+            self.logger.info(
+                f"SL moved to {sl_label} ${new_sl_price:,.2f} for {pos.symbol} {pos.side} "
+                f"size=${remaining_size_usd:,.2f} tx={txh}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"move_sl failed: {e}\n{traceback.format_exc()}")
+            await self.notify(f"Failed to move SL for {pos.symbol}: {e}")
 
     async def halt_trading(self, reason: str):
         self.is_halted = True
@@ -724,33 +1381,6 @@ class GMXBot:
         self.halt_time = None
         self.logger.info(f"Trading resumed: {reason}")
         await self.notify(f"TRADING RESUMED\n{reason}")
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Risk
-    # ──────────────────────────────────────────────────────────────────────
-    def get_risk_profile(self, symbol: str) -> RiskProfile:
-        if symbol in self.risk_profiles:
-            p = self.risk_profiles[symbol]
-            if p.expires_at and time.time() > p.expires_at:
-                del self.risk_profiles[symbol]
-                return RiskProfile()
-            return p
-        return RiskProfile()
-
-    def set_risk_profile(self, symbol: str, level: str, hours: Optional[int] = None, reason: str = ""):
-        multipliers = {
-            "safe": (0.5, 0.5),
-            "normal": (1.0, 1.0),
-            "risky": (1.5, 1.5),
-        }
-        lm, am = multipliers.get(level, (1.0, 1.0))
-        self.risk_profiles[symbol] = RiskProfile(
-            level=level,
-            leverage_multiplier=lm,
-            allocation_multiplier=am,
-            expires_at=(time.time() + hours * 3600) if hours else None,
-            reason=reason,
-        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Analytics
@@ -796,12 +1426,6 @@ class GMXBot:
                 await self.cmd_close(chat_id, arg)
             elif cmd == "/confirm":
                 await self.handle_close_confirmation(chat_id, "YES")
-            elif cmd == "/cancel":
-                if chat_id in self.pending_closes:
-                    del self.pending_closes[chat_id]
-                    await self.send_message(chat_id, "Close cancelled.")
-                else:
-                    await self.send_message(chat_id, "Nothing to cancel.")
             elif cmd == "/halt":
                 reason = " ".join(parts[1:]) if len(parts) > 1 else "Manual halt"
                 await self.halt_trading(reason)
@@ -816,8 +1440,8 @@ class GMXBot:
                 await self.cmd_health(chat_id)
             elif cmd == "/balance":
                 await self.cmd_balance(chat_id)
-            elif cmd == "/adjrisk":
-                await self.cmd_adjust_risk(chat_id, parts[1:])
+            elif cmd == "/pnl":
+                await self.cmd_pnl(chat_id)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -830,17 +1454,16 @@ class GMXBot:
 
 /status — Bot status & mode
 /positions — Show on-chain positions
-/close — Interactive close (fetches from chain)
-/close all — Close all positions
-/close 1 — Close position #1
+/close — Show positions + open orders
+/close all — Close all positions + cancel all orders
+/close BTC — Close by symbol
 /confirm — Confirm pending close
-/cancel — Cancel pending close
 /balance — Wallet ETH & token balance
 /halt [reason] — Halt trading
 /resume [reason] — Resume trading
 /winrate [SYMBOL] [N] — Win rate stats
+/pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
 /health — System health
-/adjrisk SYMBOL safe|normal|risky [hours]
 /help — This message"""
         await self.send_message(chat_id, msg)
 
@@ -866,110 +1489,207 @@ class GMXBot:
         await self.send_message(chat_id, msg)
 
     async def cmd_positions(self, chat_id: int):
-        """Show on-chain positions fetched from GMX Reader contract."""
-        await self.send_message(chat_id, "Fetching on-chain positions...")
+        """Show on-chain positions with their associated limit/SL/TP orders."""
+        await self.send_message(chat_id, "Fetching positions and orders...")
 
         try:
-            positions = await asyncio.to_thread(
-                chain_fetch_positions, self.w3, self.account.address
+            positions, orders = await asyncio.gather(
+                asyncio.to_thread(chain_fetch_positions, self.w3, self.account.address),
+                asyncio.to_thread(fetch_open_orders, self.w3, self.account.address),
             )
         except Exception as e:
-            await self.send_message(chat_id, f"Error fetching positions: {e}")
+            await self.send_message(chat_id, f"Error fetching data: {e}")
             return
 
-        if not positions:
-            await self.send_message(chat_id, "No open positions on-chain.")
+        if not positions and not orders:
+            await self.send_message(chat_id, "No open positions or orders on-chain.")
             return
 
-        msg = f"**On-Chain Positions ({len(positions)})**\n\n"
-        for i, pos in enumerate(positions, 1):
-            side = "LONG" if pos.is_long else "SHORT"
-            pnl_icon = "+" if pos.unrealized_pnl >= 0 else ""
-            msg += (
-                f"**#{i} {pos.symbol} {side}**\n"
-                f"  Size: ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
-                f"  Entry: ${pos.entry_price:,.2f}\n"
-                f"  Current: ${pos.current_price:,.2f}\n"
-                f"  PnL: {pnl_icon}${pos.unrealized_pnl:.2f} ({pnl_icon}{pos.pnl_percentage:.1f}%)\n\n"
-            )
+        msg = ""
+        open_pos_markets = {p.market.lower() for p in positions}
 
-        total_pnl = sum(p.unrealized_pnl for p in positions)
-        total_size = sum(p.size_usd for p in positions)
-        msg += f"Total Size: ${total_size:,.2f}\nTotal PnL: ${total_pnl:+.2f}"
+        # ── Open Positions ──────────────────────────────────────────────
+        if positions:
+            msg += f"**Positions ({len(positions)})**\n"
+            for i, pos in enumerate(positions, 1):
+                side = "LONG" if pos.is_long else "SHORT"
+                pnl_icon = "+" if pos.unrealized_pnl >= 0 else ""
+
+                # Orders tied to this position (same market)
+                pos_orders = [
+                    o for o in orders
+                    if o["market"].lower() == pos.market.lower()
+                ]
+                tp_orders    = sorted([o for o in pos_orders if o["order_type"] == 5],
+                                      key=lambda o: o["trigger_price"])
+                sl_orders    = [o for o in pos_orders if o["order_type"] == 6]
+                limit_orders = [o for o in pos_orders if o["order_type"] in (2, 3)]
+
+                msg += (
+                    f"\n**#{i} {pos.symbol} {side}**\n"
+                    f"  Size:    ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
+                    f"  Entry:   ${pos.entry_price:,.2f}\n"
+                    f"  Current: ${pos.current_price:,.2f}\n"
+                    f"  PnL:     {pnl_icon}${pos.unrealized_pnl:.2f} ({pnl_icon}{pos.pnl_percentage:.1f}%)\n"
+                )
+
+                if sl_orders or tp_orders:
+                    msg += "  SL & TP:\n"
+                    for o in sl_orders:
+                        tp_price = o["trigger_price"]
+                        if tp_price and pos.entry_price:
+                            if pos.is_long:
+                                proj = ((tp_price - pos.entry_price) / pos.entry_price) * pos.size_usd
+                            else:
+                                proj = ((pos.entry_price - tp_price) / pos.entry_price) * pos.size_usd
+                            proj_sign = "+" if proj >= 0 else ""
+                            msg += f"    SL  @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected)\n"
+                        else:
+                            msg += f"    SL  @ ${tp_price:,.2f}\n"
+                    for j, o in enumerate(tp_orders, 1):
+                        tp_price = o["trigger_price"]
+                        if tp_price and pos.entry_price:
+                            if pos.is_long:
+                                proj = ((tp_price - pos.entry_price) / pos.entry_price) * pos.size_usd
+                            else:
+                                proj = ((pos.entry_price - tp_price) / pos.entry_price) * pos.size_usd
+                            proj_sign = "+" if proj >= 0 else ""
+                            msg += f"    TP{j} @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected)\n"
+                        else:
+                            msg += f"    TP{j} @ ${tp_price:,.2f}\n"
+
+                if limit_orders:
+                    msg += "  Limit Orders:\n"
+                    for o in limit_orders:
+                        price_str = f"${o['trigger_price']:,.2f}" if o["trigger_price"] else "market"
+                        msg += f"    Limit @ {price_str}  (${o['size_usd']:,.2f})\n"
+
+            total_pnl  = sum(p.unrealized_pnl for p in positions)
+            total_size = sum(p.size_usd for p in positions)
+            msg += f"\nTotal Size: ${total_size:,.2f}  |  Total PnL: ${total_pnl:+.2f}\n"
+
+        # ── Pending Limit Entry Orders (not yet filled — no open position) ──
+        pending_entries = [
+            o for o in orders
+            if o["order_type"] in (2, 3)
+            and o["market"].lower() not in open_pos_markets
+        ]
+        if pending_entries:
+            msg += f"\n**Limit Orders ({len(pending_entries)})** _(pending entry)_\n"
+            for o in pending_entries:
+                side = "LONG" if o["is_long"] else "SHORT"
+                price_str = f"${o['trigger_price']:,.2f}" if o["trigger_price"] else "market"
+                msg += f"  {o['symbol']} {side} @ {price_str}  (${o['size_usd']:,.2f})\n"
+
         await self.send_message(chat_id, msg)
 
     async def cmd_close(self, chat_id: int, arg: Optional[str]):
         """Interactive close flow via Telegram.
 
-        /close       — list positions, ask which to close
-        /close all   — close all positions (with confirm)
-        /close 1     — close position #1 (with confirm)
-        /close BTC   — close BTC position (with confirm)
+        /close             — list positions + open orders, ask which to close
+        /close all         — close all positions AND cancel all open orders
+        /close BTC         — close BTC position (with confirm)
         """
-        # Fetch on-chain positions
-        await self.send_message(chat_id, "Fetching positions...")
+        # Fetch on-chain positions AND open orders
+        await self.send_message(chat_id, "Fetching positions and orders...")
         try:
-            positions = await asyncio.to_thread(
-                chain_fetch_positions, self.w3, self.account.address
+            positions, orders = await asyncio.gather(
+                asyncio.to_thread(chain_fetch_positions, self.w3, self.account.address),
+                asyncio.to_thread(fetch_open_orders, self.w3, self.account.address),
             )
         except Exception as e:
-            await self.send_message(chat_id, f"Error fetching positions: {e}")
+            await self.send_message(chat_id, f"Error fetching data: {e}")
             return
 
-        if not positions:
-            await self.send_message(chat_id, "No open positions to close.")
+        if not positions and not orders:
+            await self.send_message(chat_id, "No open positions or orders to close.")
             return
 
         if arg is None:
-            # Show positions and ask which to close
-            msg = "**Select position to close:**\n\n"
-            for i, pos in enumerate(positions, 1):
-                side = "LONG" if pos.is_long else "SHORT"
-                msg += (
-                    f"**#{i}** {pos.symbol} {side} — "
-                    f"${pos.size_usd:,.2f} @ {pos.leverage:.1f}x — "
-                    f"PnL: ${pos.unrealized_pnl:+.2f}\n"
-                )
-            msg += (
-                f"\nReply with:\n"
-                f"  /close 1 — close position #1\n"
-                f"  /close all — close all positions\n"
-                f"  /close BTC — close by symbol"
-            )
+            # Show positions with grouped orders (like /positions), ask which to close
+            msg = ""
+            open_pos_markets = {p.market.lower() for p in positions} if positions else set()
+
+            if positions:
+                msg += f"**Positions ({len(positions)})**\n"
+                for i, pos in enumerate(positions, 1):
+                    side = "LONG" if pos.is_long else "SHORT"
+
+                    # Orders tied to this position (same market)
+                    pos_orders = [
+                        o for o in orders
+                        if o["market"].lower() == pos.market.lower()
+                    ]
+                    tp_orders = sorted([o for o in pos_orders if o["order_type"] == 5],
+                                       key=lambda o: o["trigger_price"])
+                    sl_orders = [o for o in pos_orders if o["order_type"] == 6]
+
+                    msg += (
+                        f"\n**#{i} {pos.symbol} {side}**\n"
+                        f"  Size: ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
+                        f"  PnL:  ${pos.unrealized_pnl:+.2f}\n"
+                    )
+
+                    if sl_orders or tp_orders:
+                        for o in sl_orders:
+                            msg += f"    SL  @ ${o['trigger_price']:,.2f}\n"
+                        for j, o in enumerate(tp_orders, 1):
+                            msg += f"    TP{j} @ ${o['trigger_price']:,.2f}\n"
+
+            # Orphaned orders (not tied to any open position)
+            orphaned = [
+                o for o in orders
+                if o["market"].lower() not in open_pos_markets
+            ] if orders else []
+            if orphaned:
+                order_type_names = {2: "MarketIncrease", 3: "LimitIncrease", 4: "MarketDecrease",
+                                    5: "TP", 6: "SL"}
+                msg += f"\n**Orphaned Orders ({len(orphaned)}):**\n"
+                for o in orphaned:
+                    label = order_type_names.get(o["order_type"], f"Type{o['order_type']}")
+                    msg += f"  {o['symbol']} {label} @ ${o['trigger_price']:,.2f}\n"
+
+            msg += "\nReply with:\n"
+            if positions:
+                msg += "  /close BTC — close by symbol\n"
+            msg += "  /close all — close all positions + cancel all orders"
+
             await self.send_message(chat_id, msg)
             return
 
         # Determine which positions to close
         arg_upper = arg.upper()
         to_close: List[GMXPosition] = []
+        also_cancel_orders = False
 
         if arg_upper == "ALL":
-            to_close = positions
-        elif arg.isdigit():
-            idx = int(arg) - 1
-            if 0 <= idx < len(positions):
-                to_close = [positions[idx]]
-            else:
-                await self.send_message(chat_id, f"Invalid position #{arg}. Range: 1-{len(positions)}")
-                return
+            to_close = positions if positions else []
+            also_cancel_orders = True  # also cancel all open orders
         else:
             # Match by symbol
-            for pos in positions:
-                if arg_upper in pos.symbol.upper():
-                    to_close.append(pos)
+            if positions:
+                for pos in positions:
+                    if arg_upper in pos.symbol.upper():
+                        to_close.append(pos)
             if not to_close:
                 await self.send_message(chat_id, f"No position found matching '{arg}'")
                 return
 
         # Show confirmation
         msg = "**Confirm close:**\n\n"
-        for pos in to_close:
-            side = "LONG" if pos.is_long else "SHORT"
-            msg += f"  {pos.symbol} {side} — ${pos.size_usd:,.2f} — PnL: ${pos.unrealized_pnl:+.2f}\n"
-        msg += f"\nSend /confirm to execute or /cancel to abort."
+        if to_close:
+            for pos in to_close:
+                side = "LONG" if pos.is_long else "SHORT"
+                msg += f"  {pos.symbol} {side} — ${pos.size_usd:,.2f} — PnL: ${pos.unrealized_pnl:+.2f}\n"
+        if also_cancel_orders and orders:
+            msg += f"\n  + Cancel {len(orders)} open order(s) (SL/TP/Limit)\n"
+        elif also_cancel_orders and not to_close:
+            msg += f"  Cancel {len(orders)} open order(s) (SL/TP/Limit)\n"
+        msg += "\nSend /confirm to execute or /cancel to abort."
 
         self.pending_closes[chat_id] = {
             "positions": to_close,
+            "also_cancel_orders": also_cancel_orders,
             "created_at": time.time(),
         }
         await self.send_message(chat_id, msg)
@@ -992,25 +1712,111 @@ class GMXBot:
         if text_upper in ("YES", "Y", "CONFIRM"):
             del self.pending_closes[chat_id]
             positions_to_close = pending["positions"]
+            also_cancel_orders = pending.get("also_cancel_orders", False)
 
-            await self.send_message(chat_id, f"Closing {len(positions_to_close)} position(s)...")
+            # ── Build initial status message ─────────────────────────────
+            if also_cancel_orders and not positions_to_close:
+                # /close all with only orphaned orders
+                await self.send_message(chat_id, "Closing all open orders...")
+            elif also_cancel_orders and positions_to_close:
+                # /close all with positions + orders
+                await self.send_message(chat_id, "Closing all open positions & orders...")
+            elif positions_to_close:
+                # /close 1 or /close btc — single position + its SL/TP
+                labels = []
+                for pos in positions_to_close:
+                    side = "LONG" if pos.is_long else "SHORT"
+                    labels.append(f"{pos.symbol} {side}")
+                await self.send_message(chat_id, f"Closing {', '.join(labels)} & SL/TP...")
 
-            for pos in positions_to_close:
-                side = "LONG" if pos.is_long else "SHORT"
-                await self.send_message(chat_id, f"Closing {pos.symbol} {side}...")
+            # ── Close positions ────────────────────────────────────────────
+            close_failed = False
+            if positions_to_close:
+                for pos in positions_to_close:
+                    side = "LONG" if pos.is_long else "SHORT"
+                    tx_hash = await self.execute_close(pos, 1.0)
+                    if tx_hash:
+                        arb_url = f"https://arbiscan.io/tx/{tx_hash}" if not tx_hash.startswith("dry_run") else "DRY RUN"
+                        pnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+                        await self.send_message(
+                            chat_id,
+                            f"{pos.symbol} {side}\n"
+                            f"Entry: ${pos.entry_price:,.2f}  |  Current: ${pos.current_price:,.2f}\n"
+                            f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f} ({pnl_sign}{pos.pnl_percentage:.1f}%)\n"
+                            f"TX: {tx_hash}\n{arb_url}"
+                        )
 
-                tx_hash = await self.execute_close(pos, 1.0)
-                if tx_hash:
-                    await self.send_message(
-                        chat_id,
-                        f"Closed {pos.symbol} {side}\n"
-                        f"TX: {tx_hash}\n"
-                        f"{'https://arbiscan.io/tx/' + tx_hash if not tx_hash.startswith('dry_run') else 'DRY RUN'}"
+                        # Record trade for /winrate and /pnl stats
+                        self._record_trade(pos, exit_reason="manual")
+
+                        # Wait for the position to actually disappear on-chain before
+                        # cancelling SL/TP orders. If we cancel too early (while the
+                        # market decrease is still pending), GMX may reject the cancel
+                        # because the position still technically exists.
+                        if not tx_hash.startswith("dry_run"):
+                            closed = await self.wait_for_position_closed(pos.market, pos.is_long, timeout=120)
+                            if not closed:
+                                await self.send_message(
+                                    chat_id,
+                                    f"Warning: {pos.symbol} {side} did not close "
+                                    f"within 2 minutes. Order cancellation may fail."
+                                )
+                    else:
+                        close_failed = True
+                        await self.send_message(chat_id, f"FAILED to close {pos.symbol} {side}")
+
+            # ── Cancel open orders ─────────────────────────────────────────
+            n_cancelled = 0
+            try:
+                exchange = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(GMX_V2_EXCHANGE_ROUTER),
+                    abi=EXCHANGE_ROUTER_ABI,
+                )
+                if also_cancel_orders:
+                    # /close all — cancel every open order
+                    n_cancelled = await asyncio.to_thread(
+                        cancel_all_orders,
+                        self.w3,
+                        self.account,
+                        exchange,
+                        DRY_RUN,
                     )
-                else:
-                    await self.send_message(chat_id, f"FAILED to close {pos.symbol} {side}")
+                elif positions_to_close:
+                    # /close 1 or /close btc — only cancel orders for those markets
+                    for pos in positions_to_close:
+                        n_cancelled += await asyncio.to_thread(
+                            cancel_orders_for_market,
+                            self.w3,
+                            self.account,
+                            exchange,
+                            pos.market,
+                            DRY_RUN,
+                        )
+            except Exception as e:
+                self.logger.error(f"Failed to cancel orders: {e}")
+                await self.send_message(chat_id, f"Warning: could not cancel orders: {e}")
 
-            await self.send_message(chat_id, "Close flow complete.")
+            # ── Final success message ─────────────────────────────────────
+            if close_failed:
+                return  # already reported failure above
+
+            if also_cancel_orders and not positions_to_close:
+                await self.send_message(chat_id,
+                    f"Successfully cancelled {n_cancelled} open order(s).")
+            elif also_cancel_orders and positions_to_close:
+                await self.send_message(chat_id,
+                    "Successfully closed all positions & orders.")
+            elif positions_to_close:
+                labels = []
+                for pos in positions_to_close:
+                    side = "LONG" if pos.is_long else "SHORT"
+                    labels.append(f"{pos.symbol} {side}")
+                await self.send_message(chat_id,
+                    f"Successfully closed {', '.join(labels)} & SL/TP.")
+
+            # Top up ETH for gas if balance is low after closing
+            if positions_to_close:
+                await self.topup_eth_if_needed()
 
         elif text_upper in ("NO", "N", "CANCEL"):
             del self.pending_closes[chat_id]
@@ -1025,17 +1831,34 @@ class GMXBot:
             eth_formatted = eth_bal / 10**18
 
             portfolio = await asyncio.to_thread(self.get_portfolio_value)
-            trade_size = portfolio * PORTFOLIO_PCT
+            collateral_per_trade = portfolio * PORTFOLIO_PCT
+
+            # Fetch ETH price for USD conversion (use cached price or fetch)
+            eth_price = await self.get_current_price("ETH") or 0.0
+            eth_usd = eth_formatted * eth_price if eth_price > 0 else 0.0
+            eth_usd_str = f"${eth_usd:,.2f}" if eth_price > 0 else "N/A"
+
+            # Fetch capital deployed in active trades
+            try:
+                positions = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, self.account.address
+                )
+                deployed = sum(p.collateral_amount for p in positions)
+            except Exception:
+                deployed = 0.0
+
+            deployed_str = f"${deployed:,.2f}" if deployed > 0 else "$0.00"
+
+            total = portfolio + eth_usd + deployed
 
             msg = (
                 f"**Wallet Balance**\n\n"
                 f"Address: {self.account.address[:10]}...{self.account.address[-6:]}\n"
                 f"USDC: ${portfolio:,.2f}\n"
-                f"ETH: {eth_formatted:.6f}\n\n"
-                f"**Trade Sizing**\n"
-                f"Per trade: ${trade_size:,.2f} ({PORTFOLIO_PCT:.0%} of portfolio)\n"
-                f"Min: ${MIN_POSITION_USD:.0f} | Max: ${MAX_POSITION_USD:.0f}\n"
-                f"Execution fee: {EXECUTION_FEE_WEI / 10**18:.6f} ETH/order"
+                f"ETH: {eth_usd_str}\n"
+                f"Deployed: {deployed_str}\n"
+                f"Total: ${total:,.2f}\n"
+                f"Collateral/trade: ${collateral_per_trade:,.2f} ({PORTFOLIO_PCT:.0%} of portfolio)"
             )
             await self.send_message(chat_id, msg)
         except Exception as e:
@@ -1044,17 +1867,20 @@ class GMXBot:
     async def cmd_winrate(self, chat_id: int, symbol: Optional[str], n: Optional[int]):
         stats = self.calculate_win_rate(symbol, n)
         if "error" in stats:
-            await self.send_message(chat_id, stats["error"])
+            label = f" for {symbol}" if symbol else ""
+            await self.send_message(chat_id, f"No closed trades recorded{label} yet.\n\nTrades are recorded when you use /close to manually close a position.")
             return
         title = "Win Rate"
         if symbol:
             title += f" — {symbol}"
         if n:
             title += f" (last {n})"
+        pf = stats['profit_factor']
+        pf_str = "∞" if pf == float("inf") else f"{pf:.2f}"
         msg = (
             f"**{title}**\n\n"
             f"Win Rate: {stats['win_rate']:.1f}% ({stats['wins']}/{stats['total']})\n"
-            f"Profit Factor: {stats['profit_factor']:.2f}\n"
+            f"Profit Factor: {pf_str}\n"
             f"Net PnL: ${stats['net_pnl']:.2f}\n"
             f"Avg Win: ${stats['avg_win']:.2f}\n"
             f"Avg Loss: ${stats['avg_loss']:.2f}"
@@ -1076,34 +1902,120 @@ class GMXBot:
         )
         await self.send_message(chat_id, msg)
 
-    async def cmd_adjust_risk(self, chat_id: int, args: List[str]):
-        if len(args) < 2:
-            if self.risk_profiles:
-                msg = "**Risk Profiles:**\n"
-                for sym, p in self.risk_profiles.items():
-                    msg += f"  {sym}: {p.level}\n"
-                await self.send_message(chat_id, msg)
-            else:
-                await self.send_message(chat_id, "No custom risk profiles set.\nUsage: /adjrisk BTC safe [hours]")
-            return
+    async def cmd_pnl(self, chat_id: int):
+        """Show PnL breakdown (today / 30d / all time) for BTC, SOL, ETH only."""
+        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        now = time.time()
+        today_cutoff = now - 86400          # last 24 hours
+        month_cutoff = now - 30 * 86400     # last 30 days
 
-        symbol = args[0].upper()
-        level = args[1].lower()
-        if level not in ("safe", "normal", "risky", "clear"):
-            await self.send_message(chat_id, "Level must be: safe, normal, risky, or clear")
-            return
-        if level == "clear":
-            self.risk_profiles.pop(symbol, None)
-            await self.send_message(chat_id, f"Cleared risk for {symbol}")
-            return
-        hours = int(args[2]) if len(args) > 2 else None
-        self.set_risk_profile(symbol, level, hours)
-        dur = f" for {hours}h" if hours else ""
-        await self.send_message(chat_id, f"Set {symbol} risk to {level}{dur}")
+        def pnl_stats(trades):
+            if not trades:
+                return {"pnl": 0.0, "trades": 0, "wins": 0}
+            pnl = sum(t.pnl_usd for t in trades)
+            wins = sum(1 for t in trades if t.pnl_usd > 0)
+            return {"pnl": pnl, "trades": len(trades), "wins": wins}
+
+        def format_section(label: str, symbol_stats: dict) -> str:
+            lines = [f"**{label}**"]
+            total = 0.0
+            for sym in ("BTC", "ETH", "SOL"):
+                s = symbol_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
+                sign = "+" if s["pnl"] >= 0 else ""
+                wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
+                lines.append(f"  {sym}: {sign}${s['pnl']:,.2f}  ({wr})")
+                total += s["pnl"]
+            sign = "+" if total >= 0 else ""
+            lines.append(f"  Total: {sign}${total:,.2f}")
+            return "\n".join(lines)
+
+        # Build realized stats per period per symbol from trade_history
+        relevant = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
+
+        today_stats = {
+            sym: pnl_stats([t for t in relevant if t.symbol == sym and t.closed_at >= today_cutoff])
+            for sym in PNL_SYMBOLS
+        }
+        month_stats = {
+            sym: pnl_stats([t for t in relevant if t.symbol == sym and t.closed_at >= month_cutoff])
+            for sym in PNL_SYMBOLS
+        }
+        alltime_stats = {
+            sym: pnl_stats([t for t in relevant if t.symbol == sym])
+            for sym in PNL_SYMBOLS
+        }
+
+        # Fetch live on-chain positions for unrealized PnL
+        open_pnl: dict = {sym: 0.0 for sym in PNL_SYMBOLS}
+        try:
+            chain_positions = await asyncio.to_thread(
+                chain_fetch_positions, self.w3, self.account.address
+            )
+            for cp in chain_positions:
+                sym = cp.symbol.upper().split("/")[0]
+                if sym in PNL_SYMBOLS:
+                    open_pnl[sym] = open_pnl.get(sym, 0.0) + cp.unrealized_pnl
+        except Exception as e:
+            self.logger.warning(f"/pnl: could not fetch chain positions for unrealized PnL: {e}")
+
+        open_lines = ["**Open (Unrealized)**"]
+        open_total = 0.0
+        for sym in ("BTC", "ETH", "SOL"):
+            pnl = open_pnl.get(sym, 0.0)
+            sign = "+" if pnl >= 0 else ""
+            open_lines.append(f"  {sym}: {sign}${pnl:,.2f}")
+            open_total += pnl
+        sign = "+" if open_total >= 0 else ""
+        open_lines.append(f"  Total: {sign}${open_total:,.2f}")
+
+        if not relevant:
+            closed_section = "No closed trades recorded yet.\nTrades are saved when you use /close."
+        else:
+            closed_section = (
+                format_section("Today (24h)", today_stats) + "\n\n"
+                + format_section("30 Days", month_stats) + "\n\n"
+                + format_section("All Time", alltime_stats)
+            )
+
+        msg = (
+            "**PnL Summary — BTC / ETH / SOL**\n\n"
+            + closed_section + "\n\n"
+            + "\n".join(open_lines)
+        )
+        await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────
+    def _record_trade(self, gmx_pos: "GMXPosition", exit_reason: str = "manual"):
+        """Record a closed trade into trade_history for /winrate and /pnl stats."""
+        closed_at = time.time()
+        pnl_usd = gmx_pos.unrealized_pnl          # best estimate at close time
+        pnl_pct = (pnl_usd / gmx_pos.collateral_amount * 100) if gmx_pos.collateral_amount else 0.0
+        # opened_at: use entry_price timestamp proxy — we don't store open time for
+        # GMXPosition, so use closed_at - 1h as a fallback (display only, not critical)
+        opened_at = closed_at - 3600
+        record = TradeRecord(
+            id=str(uuid.uuid4()),
+            symbol=gmx_pos.symbol,
+            side="LONG" if gmx_pos.is_long else "SHORT",
+            entry_price=gmx_pos.entry_price,
+            exit_price=gmx_pos.current_price,
+            size_usd=gmx_pos.size_usd,
+            leverage=gmx_pos.leverage,
+            duration_hours=(closed_at - opened_at) / 3600,
+            pnl_usd=pnl_usd,
+            pnl_percentage=pnl_pct,
+            exit_reason=exit_reason,
+            opened_at=opened_at,
+            closed_at=closed_at,
+        )
+        self.trade_history.append(record)
+        self.logger.info(
+            f"Recorded trade: {gmx_pos.symbol} {'LONG' if gmx_pos.is_long else 'SHORT'} "
+            f"PnL=${pnl_usd:+.2f} ({pnl_pct:+.1f}%)"
+        )
+
     def get_health_report(self) -> Dict[str, Any]:
         uptime = time.time() - self.health_stats["uptime_start"]
         open_pos = sum(1 for p in self.positions.values() if p.is_open)
@@ -1137,6 +2049,7 @@ class GMXBot:
         for i, tp in enumerate(position.take_profits):
             tp_lines += f"  TP{i+1}: ${tp.price:,.0f} ({tp.percentage:.0%})\n"
         order_label = "LIMIT ORDER" if order_type == "limit" else "MARKET ORDER"
+
         msg = (
             f"**Position Opened ({order_label})**\n\n"
             f"{position.symbol} {position.side}\n"
@@ -1147,7 +2060,7 @@ class GMXBot:
             f"TX: {position.tx_hash}"
         )
         if order_type == "limit":
-            msg += "\n\n⏳ Limit order placed — waiting for price to reach entry."
+            msg += "\n\nLimit order placed — waiting for price to reach entry."
         await self.notify(msg)
 
 
@@ -1179,7 +2092,17 @@ async def main():
         return
 
     bot = GMXBot()
-    await bot.start()
+    try:
+        await bot.start()
+    except Exception as e:
+        # Attempt a last-resort offline notification if start() itself raises
+        # before shutdown() was called inside start()
+        try:
+            if bot.client and bot.client.is_connected():
+                await bot.notify("🔴 Bot Offline")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
