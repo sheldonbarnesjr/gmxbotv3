@@ -66,6 +66,9 @@ ERC20_ABI = [
     {"name": "approve", "type": "function", "stateMutability": "nonpayable",
      "inputs": [{"name": "s", "type": "address"}, {"name": "a", "type": "uint256"}],
      "outputs": [{"type": "bool"}]},
+    {"name": "transfer", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+     "outputs": [{"type": "bool"}]},
 ]
 
 EXCHANGE_ROUTER_ABI = [
@@ -397,15 +400,48 @@ def parse_signal(text: str) -> Signal:
             pct = float(pct_str) / 100.0 if pct_str else None
             take_profits.append(TakeProfit(price=price, close_pct=pct or 0))
 
-    # If percentages not specified, distribute evenly
+    # Assign close percentages if not specified in the signal.
+    # Each TP's close_pct is a fraction of the ORIGINAL position size.
+    # All close_pct values must sum to 1.0 (100%) so the full position
+    # is closed across all TPs.
+    #
+    # Default distributions (when signal doesn't specify %):
+    #   2 TPs: 33%, 67%           — small early lock-in, let the rest ride
+    #   3 TPs: 20%, 50%, 30%      — light trim, bulk at TP2, remainder at TP3
+    #   4 TPs: 15%, 30%, 30%, 25% — scale out gradually
+    #   5 TPs: 10%, 20%, 30%, 25%, 15% — pyramid out, heaviest at TP3
+    #
+    # The last TP always absorbs any rounding remainder so the total
+    # is exactly 1.0 — no dust position left behind.
+    DEFAULT_TP_DISTRIBUTIONS = {
+        2: [0.33, 0.67],
+        3: [0.20, 0.50, 0.30],
+        4: [0.15, 0.30, 0.30, 0.25],
+        5: [0.10, 0.20, 0.30, 0.25, 0.15],
+    }
+
     if take_profits:
+        all_unspecified = all(tp.close_pct == 0 for tp in take_profits)
         specified = sum(tp.close_pct for tp in take_profits)
         unspecified = [tp for tp in take_profits if tp.close_pct == 0]
-        if unspecified:
+
+        if all_unspecified and len(take_profits) in DEFAULT_TP_DISTRIBUTIONS:
+            # All TPs missing % → use smart default distribution
+            dist = DEFAULT_TP_DISTRIBUTIONS[len(take_profits)]
+            for tp, pct in zip(take_profits, dist):
+                tp.close_pct = pct
+        elif unspecified:
+            # Some explicit, some missing → split remaining evenly
             remaining = max(0, 1.0 - specified)
             each = remaining / len(unspecified) if unspecified else 0
             for tp in unspecified:
                 tp.close_pct = each
+
+        # Ensure total sums to exactly 1.0 — push any rounding
+        # remainder onto the last TP so the position fully closes.
+        total_pct = sum(tp.close_pct for tp in take_profits)
+        if take_profits and abs(total_pct - 1.0) > 0.001:
+            take_profits[-1].close_pct += 1.0 - total_pct
 
     # ── Stop Loss ──
     sl_match = re.search(
@@ -888,7 +924,7 @@ def cancel_orders_for_market(
         if o["order_type"] not in CANCELLABLE:
             continue
         if not o["key_hex"]:
-            log.warning(f"  No key for order type={o['order_type']} market={target_market[:10]}...")
+            log.warning(f"  No key for order type={o['order_type']} market={market_addr[:10]}...")
             continue
 
         key_bytes = bytes.fromhex(o["key_hex"])
@@ -920,20 +956,68 @@ def cancel_orders_for_market(
     return cancelled
 
 
-def fetch_current_price(symbol: str) -> float:
-    """Fetch current price from CoinGecko free API."""
+def fetch_current_price(symbol: str, w3=None) -> float:
+    """Fetch current price from CoinGecko free API, with retry + Chainlink fallback."""
+    import time as _time
+
+    # ── Try CoinGecko (with 1 retry after short wait) ──
     coin_id = COINGECKO_IDS.get(symbol.upper())
     if not coin_id:
         raise ValueError(f"Unknown symbol '{symbol}'. Supported: "
                          f"{', '.join(COINGECKO_IDS.keys())}")
-    url = (f"https://api.coingecko.com/api/v3/simple/price"
-           f"?ids={coin_id}&vs_currencies=usd")
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode())
-    price = data[coin_id]["usd"]
-    log.debug(f"Fetched live price for {symbol}: ${price:,.2f}")
-    return float(price)
+
+    for attempt in range(2):
+        try:
+            url = (f"https://api.coingecko.com/api/v3/simple/price"
+                   f"?ids={coin_id}&vs_currencies=usd")
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            price = data[coin_id]["usd"]
+            log.debug(f"Fetched live price for {symbol}: ${price:,.2f}")
+            return float(price)
+        except Exception as e:
+            if attempt == 0:
+                log.debug(f"CoinGecko attempt {attempt+1} failed ({e}), retrying in 3s...")
+                _time.sleep(3)
+            else:
+                log.warning(f"CoinGecko failed after 2 attempts: {e}")
+
+    # ── Fallback: Chainlink on-chain price feed ──
+    CHAINLINK_FEEDS = {
+        "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
+        "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
+        "SOL":  "0x24ceA4b8ce57cdA5058b924B9B9987992450590c",
+        "LINK": "0x86E53CF1B870786351Da77A57575e79CB55812CB",
+    }
+    CHAINLINK_ABI = [
+        {"name": "latestRoundData", "type": "function", "stateMutability": "view",
+         "inputs": [],
+         "outputs": [{"name": "roundId", "type": "uint80"},
+                     {"name": "answer", "type": "int256"},
+                     {"name": "startedAt", "type": "uint256"},
+                     {"name": "updatedAt", "type": "uint256"},
+                     {"name": "answeredInRound", "type": "uint80"}]},
+        {"name": "decimals", "type": "function", "stateMutability": "view",
+         "inputs": [], "outputs": [{"type": "uint8"}]},
+    ]
+
+    feed_addr = CHAINLINK_FEEDS.get(symbol.upper())
+    if feed_addr and w3:
+        try:
+            feed = w3.eth.contract(
+                address=Web3.to_checksum_address(feed_addr), abi=CHAINLINK_ABI
+            )
+            result = feed.functions.latestRoundData().call()
+            decimals = feed.functions.decimals().call()
+            price = result[1] / (10 ** decimals)
+            if price > 0:
+                log.info(f"Chainlink fallback price for {symbol}: ${price:,.2f}")
+                return float(price)
+        except Exception as e:
+            log.error(f"Chainlink fallback also failed for {symbol}: {e}")
+
+    raise RuntimeError(f"Could not fetch price for {symbol} from CoinGecko or Chainlink")
 
 
 def fetch_positions(w3: Web3, wallet: str) -> list:
@@ -1416,7 +1500,7 @@ def execute_signal(
     collateral_usd = size_usd / signal.leverage
 
     # Fetch current price for entry validation
-    current_price = fetch_current_price(signal.symbol)
+    current_price = fetch_current_price(signal.symbol, w3=w3)
     entry_price = signal.entry_mid
 
     # Decide: MarketIncrease (immediate) vs LimitIncrease (wait for price)

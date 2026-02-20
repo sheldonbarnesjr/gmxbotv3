@@ -1,0 +1,7 @@
+
+pip3 install python-dotenv telethon web3 eth-account
+
+setup venv
+
+python3 -m venv .venv
+source .venv/bin/activate

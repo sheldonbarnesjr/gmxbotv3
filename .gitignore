@@ -1,0 +1,18 @@
+# Environment
+.env
+.venv/
+__pycache__/
+
+# Telegram session
+*.session
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.pyc
+
+# Claude
+.claude/
