@@ -15,6 +15,7 @@ Features:
 """
 
 import os
+import re
 import time
 import uuid
 import asyncio
@@ -22,6 +23,8 @@ import logging
 import importlib
 import statistics
 import traceback
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
@@ -277,6 +280,9 @@ class GMXBot:
         self.price_update_task: Optional[asyncio.Task] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.tp_monitor_task: Optional[asyncio.Task] = None
+        self.daily_summary_task: Optional[asyncio.Task] = None
+        self.rebalance_task: Optional[asyncio.Task] = None
+        self.resolved_channels: Dict[int, str] = {}  # channel_id -> channel_name
         self.setup_logging()
 
     def setup_logging(self):
@@ -304,6 +310,8 @@ class GMXBot:
         self.price_update_task = asyncio.create_task(self.price_update_loop())
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         self.tp_monitor_task = asyncio.create_task(self.tp_monitor_loop())
+        self.daily_summary_task = asyncio.create_task(self.daily_summary_loop())
+        self.rebalance_task = asyncio.create_task(self.rebalance_loop())
 
         self.logger.info("GMX Bot started successfully")
 
@@ -332,6 +340,10 @@ class GMXBot:
             self.heartbeat_task.cancel()
         if self.tp_monitor_task:
             self.tp_monitor_task.cancel()
+        if self.daily_summary_task:
+            self.daily_summary_task.cancel()
+        if self.rebalance_task:
+            self.rebalance_task.cancel()
 
         # Reconnect if needed so the offline message can be sent
         try:
@@ -352,8 +364,29 @@ class GMXBot:
         self.client = TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH)
         await self.client.start()
 
+        # Pre-resolve channel entities so Telethon caches them before
+        # registering event handlers (avoids "Cannot find any entity" error).
+        resolved_channels = []
+        for ch in TELEGRAM_CHANNELS:
+            try:
+                # Try as integer ID first (e.g. "-1001363986630")
+                try:
+                    ch_id = int(ch)
+                except ValueError:
+                    ch_id = ch
+                entity = await self.client.get_entity(ch_id)
+                name = getattr(entity, "title", None) or getattr(entity, "username", str(ch_id))
+                resolved_channels.append(ch_id)
+                self.resolved_channels[ch_id] = name
+                self.logger.info(f"Connected to {name} ({ch}) successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to resolve channel {ch}: {e}")
+
+        if not resolved_channels:
+            raise ValueError("Could not resolve any Telegram channels — check TELEGRAM_CHANNELS in .env")
+
         # Signal handler — messages from monitored channels
-        @self.client.on(events.NewMessage(chats=TELEGRAM_CHANNELS))
+        @self.client.on(events.NewMessage(chats=resolved_channels))
         async def handle_signal(event):
             await self.process_signal(event.message.text)
 
@@ -379,7 +412,7 @@ class GMXBot:
                 return
             await self.handle_close_confirmation(event.chat_id, text)
 
-        self.logger.info(f"Telegram initialized, monitoring {len(TELEGRAM_CHANNELS)} channel(s)")
+        self.logger.info(f"Telegram initialized, monitoring {len(resolved_channels)} channel(s)")
 
     def init_web3(self):
         self.w3 = Web3(Web3.HTTPProvider(RPC_URL))
@@ -583,6 +616,35 @@ class GMXBot:
             # Don't notify on rebalance failure — it's not critical
             # The bot will try again after the next trade
 
+    async def rebalance_loop(self):
+        """Check wallet balance every hour and auto-rebalance if needed."""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 1 hour
+                if not self.account2:
+                    continue
+
+                w1_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
+                w2_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
+                diff = abs(w1_usdc - w2_usdc)
+
+                if diff > 1.0:
+                    self.logger.info(
+                        f"Hourly rebalance check: W1=${w1_usdc:.2f}, W2=${w2_usdc:.2f}, "
+                        f"diff=${diff:.2f} — rebalancing"
+                    )
+                    await self._rebalance_wallets()
+                else:
+                    self.logger.debug(
+                        f"Hourly rebalance check: balanced "
+                        f"(W1=${w1_usdc:.2f}, W2=${w2_usdc:.2f}, diff=${diff:.2f})"
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Rebalance loop error: {e}")
+                await asyncio.sleep(3600)
+
     async def send_startup_notification(self):
         """Send status update to admin when bot comes online."""
         try:
@@ -646,10 +708,41 @@ class GMXBot:
             if not text or len(text) < 10:
                 return
 
-            # Skip alert messages (e.g. "target reached" notifications)
-            if "target reached" in text.lower():
-                self.logger.debug("Ignored 'target reached' alert")
-                return
+            # Skip update / status messages (e.g. TP hit, SL triggered, etc.)
+            # These are channel updates about existing positions, NOT new signals.
+            _UPDATE_PATTERNS = [
+                # Target / TP hit announcements
+                r"target\s*\d*\s*(?:was\s+)?(?:hit|reached|smashed|done|nailed|achieved|✅)",
+                r"tp\s*\d*\s*(?:was\s+)?(?:hit|reached|smashed|done|nailed|achieved|✅)",
+                r"(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|final|last|all)\s*targets?\s*(?:was\s+)?(?:hit|reached|smashed|done)",
+                r"all\s*(?:tp|targets?)\s*(?:hit|reached|done|smashed)",
+                # Stop loss / stopped out
+                r"stopped?\s*(?:out|loss)",
+                r"sl\s*(?:was\s+)?(?:hit|triggered|reached|filled)",
+                r"stop\s*loss\s*(?:was\s+)?(?:hit|triggered|reached|filled)",
+                # SL moved / breakeven updates
+                r"sl\s*(?:moved?|set|adjusted)\s*(?:to|at)",
+                r"(?:move|moved|set|adjust)\s*(?:sl|stop\s*loss)\s*(?:to|at)",
+                r"breakeven",
+                r"break\s*even",
+                # Position closed / profit taken
+                r"closed?\s*(?:in|at|with|for)\s*(?:profit|loss|[\+\-])",
+                r"position\s*(?:closed?|exited)",
+                r"trade\s*(?:closed?|exited|done|finished)",
+                r"(?:profit|loss)\s*(?:taken|booked|secured|locked)",
+                # Running in profit / loss updates
+                r"running\s*(?:in\s*)?(?:profit|loss|\+|\-)",
+                # PnL result lines (e.g. "+350 pips", "PnL: +5.2%")
+                r"pnl\s*[:=]",
+                r"[\+\-]\s*\d+(?:\.\d+)?\s*(?:pips?|%|usd|usdt)",
+                # Explicit "update" language
+                r"(?:signal|trade)\s*update",
+            ]
+            lower = text.lower()
+            for pat in _UPDATE_PATTERNS:
+                if re.search(pat, lower):
+                    self.logger.debug(f"Ignored update message (matched '{pat}'): {text[:80]}")
+                    return
 
             # Try to parse with open.py's robust parser
             try:
@@ -711,6 +804,30 @@ class GMXBot:
                 f"Size: ${size_usd:.0f} @ {signal.leverage:.0f}x\n"
                 f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}"
             )
+
+            # Check that the selected wallet has enough USDC for the collateral.
+            # If not, rebalance first and re-check.
+            wallet_usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+            required_collateral = size_usd / signal.leverage if signal.leverage else size_usd
+            if wallet_usdc < required_collateral:
+                self.logger.warning(
+                    f"W{wallet_id} has ${wallet_usdc:.2f} USDC but needs "
+                    f"${required_collateral:.2f} collateral — rebalancing first"
+                )
+                await self.notify(
+                    f"⚠️ W{wallet_id} low: ${wallet_usdc:.2f} USDC "
+                    f"(need ${required_collateral:.2f}) — auto-rebalancing..."
+                )
+                await self._rebalance_wallets()
+
+                # Re-check after rebalance
+                wallet_usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+                if wallet_usdc < required_collateral:
+                    await self.notify(
+                        f"Rejected {signal.symbol} {signal.side}: W{wallet_id} still only "
+                        f"${wallet_usdc:.2f} USDC after rebalance (need ${required_collateral:.2f})"
+                    )
+                    return
 
             # Execute on-chain with the selected wallet
             position, order_type = await self.execute_open(signal, size_usd, acct)
@@ -1280,6 +1397,152 @@ class GMXBot:
         pass
 
     # ──────────────────────────────────────────────────────────────────────
+    # Daily summary — 10 PM ET every day
+    # ──────────────────────────────────────────────────────────────────────
+    async def daily_summary_loop(self):
+        """Sleep until 10 PM ET, send summary, repeat daily."""
+        ET = ZoneInfo("America/New_York")
+        while True:
+            try:
+                now = datetime.now(ET)
+                # Next 10 PM ET
+                target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
+                wait_seconds = (target - now).total_seconds()
+                self.logger.info(
+                    f"Daily summary scheduled for {target.strftime('%Y-%m-%d %I:%M %p %Z')} "
+                    f"({wait_seconds / 3600:.1f}h from now)"
+                )
+                await asyncio.sleep(wait_seconds)
+                await self.send_daily_summary()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Daily summary error: {e}")
+                await asyncio.sleep(3600)  # retry in 1h on failure
+
+    async def send_daily_summary(self):
+        """Build and send the end-of-day summary to admin."""
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_cutoff = today_start.timestamp()
+
+        PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
+
+        # ── Today's closed trades ──
+        todays_trades = [
+            t for t in self.trade_history
+            if t.closed_at >= today_cutoff and t.symbol in PNL_SYMBOLS
+        ]
+        all_trades = [
+            t for t in self.trade_history
+            if t.symbol in PNL_SYMBOLS
+        ]
+
+        # Daily PnL
+        daily_pnl = sum(t.pnl_usd for t in todays_trades)
+        daily_wins = sum(1 for t in todays_trades if t.pnl_usd > 0)
+        daily_losses = sum(1 for t in todays_trades if t.pnl_usd < 0)
+        daily_count = len(todays_trades)
+
+        # Lifetime PnL
+        lifetime_pnl = sum(t.pnl_usd for t in all_trades)
+        lifetime_wins = sum(1 for t in all_trades if t.pnl_usd > 0)
+        lifetime_losses = sum(1 for t in all_trades if t.pnl_usd < 0)
+        lifetime_count = len(all_trades)
+        lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
+
+        # Daily win rate
+        daily_winrate = (daily_wins / daily_count * 100) if daily_count else 0.0
+
+        # Per-symbol daily breakdown
+        symbol_lines = []
+        for sym in ("BTC", "ETH", "SOL"):
+            sym_trades = [t for t in todays_trades if t.symbol == sym]
+            if sym_trades:
+                sym_pnl = sum(t.pnl_usd for t in sym_trades)
+                sym_sign = "+" if sym_pnl >= 0 else ""
+                sym_w = sum(1 for t in sym_trades if t.pnl_usd > 0)
+                symbol_lines.append(
+                    f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}/{len(sym_trades)} wins)"
+                )
+
+        # Account balances
+        balance_lines = []
+        total_usdc = 0.0
+        total_deployed = 0.0
+        try:
+            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
+            for i, acct in enumerate(all_wallets, 1):
+                usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+                total_usdc += usdc
+                try:
+                    positions = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    deployed = sum(p.collateral_amount for p in positions) if positions else 0.0
+                except Exception:
+                    deployed = 0.0
+                total_deployed += deployed
+                addr = f"{acct.address[:8]}...{acct.address[-6:]}"
+                balance_lines.append(f"  W{i} ({addr}): ${usdc:,.2f} USDC")
+        except Exception as e:
+            self.logger.warning(f"Daily summary: balance fetch failed: {e}")
+            balance_lines.append("  (could not fetch balances)")
+
+        # Open positions unrealized PnL
+        open_pnl = 0.0
+        open_count = 0
+        try:
+            for acct in [self.account] + ([self.account2] if self.account2 else []):
+                cps = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, acct.address
+                )
+                for cp in cps:
+                    open_pnl += cp.unrealized_pnl
+                    open_count += 1
+        except Exception:
+            pass
+
+        # Build message
+        d_sign = "+" if daily_pnl >= 0 else ""
+        l_sign = "+" if lifetime_pnl >= 0 else ""
+        o_sign = "+" if open_pnl >= 0 else ""
+
+        msg = (
+            f"📊 Daily Summary — {now.strftime('%b %d, %Y')}\n\n"
+            f"Today ({daily_count} trades):\n"
+            f"  PnL: {d_sign}${daily_pnl:,.2f}\n"
+            f"  Win Rate: {daily_winrate:.0f}% ({daily_wins}W / {daily_losses}L)\n"
+        )
+        if symbol_lines:
+            msg += "\n".join(symbol_lines) + "\n"
+
+        msg += (
+            f"\nLifetime ({lifetime_count} trades):\n"
+            f"  PnL: {l_sign}${lifetime_pnl:,.2f}\n"
+            f"  Win Rate: {lifetime_winrate:.0f}% ({lifetime_wins}W / {lifetime_losses}L)\n"
+        )
+
+        if open_count:
+            msg += (
+                f"\nOpen Positions ({open_count}):\n"
+                f"  Unrealized: {o_sign}${open_pnl:,.2f}\n"
+            )
+
+        msg += (
+            f"\nAccount Balance:\n"
+            + "\n".join(balance_lines) + "\n"
+            f"  Total USDC: ${total_usdc:,.2f}\n"
+            f"  Deployed: ${total_deployed:,.2f}"
+        )
+
+        await self.notify(msg)
+        self.logger.info(f"Daily summary sent: daily PnL={d_sign}${daily_pnl:,.2f}")
+
+    # ──────────────────────────────────────────────────────────────────────
     # TP-hit monitoring — move SL to entry when any TP fires
     # ──────────────────────────────────────────────────────────────────────
     async def tp_monitor_loop(self):
@@ -1356,11 +1619,22 @@ class GMXBot:
                     f"PnL={pnl_sign}${pos.unrealized_pnl:,.2f} reason={exit_reason}"
                 )
 
+                # Determine emoji based on outcome
+                if pos.unrealized_pnl > 0:
+                    outcome_emoji = "🟢"
+                elif pos.unrealized_pnl == 0:
+                    outcome_emoji = "⚪"
+                else:
+                    outcome_emoji = "🔴"
+
                 await self.notify(
-                    f"Position Closed: {pos.symbol} {pos.side}\n"
+                    f"{outcome_emoji} {pos.symbol} {pos.side} — {exit_reason}\n"
                     f"Entry: ${pos.entry_price:,.2f}  |  Exit: {price_str}\n"
                     f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f} ({pnl_sign}{pos.pnl_percentage:.1f}%)"
                 )
+
+                # Record trade for /winrate and /pnl stats
+                self._record_trade(pos, exit_reason=exit_reason)
 
                 # Mark position as closed
                 pos.is_open = False
@@ -1580,9 +1854,9 @@ class GMXBot:
                     sl_label = f"TP{len(sorted_tps)}" if sorted_tps else "Entry"
 
                 await self.notify(
-                    f"TP{pos.tp_hits_count} Hit: {pos.symbol} {pos.side}\n"
+                    f"🎯 TP{pos.tp_hits_count} Hit: {pos.symbol} {pos.side}\n"
                     f"{pnl_line}"
-                    f"SL → {sl_label} ${new_sl_target:,.2f}"
+                    f"SL moved → {sl_label} (${new_sl_target:,.2f})"
                 )
                 await self.move_sl(pos, orders, new_sl_target, sl_label)
                 pos.last_known_tp_count = current_tp_count
@@ -1791,6 +2065,14 @@ class GMXBot:
                 await self.cmd_balance(chat_id)
             elif cmd == "/pnl":
                 await self.cmd_pnl(chat_id)
+            elif cmd == "/reset":
+                await self.cmd_reset(chat_id)
+            elif cmd == "/summary":
+                await self.send_daily_summary()
+            elif cmd in ("/balance-wallets", "/rebalance"):
+                await self.cmd_balance_wallets(chat_id)
+            elif cmd == "/lastmsg":
+                await self.cmd_lastmsg(chat_id)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -1812,6 +2094,10 @@ class GMXBot:
 /resume [reason] — Resume trading
 /winrate [SYMBOL] [N] — Win rate stats
 /pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
+/summary — Send daily summary now
+/reset — Clear all trade history & PnL stats
+/balance-wallets — Manually rebalance USDC between wallets
+/lastmsg — Print last message from monitored channel(s)
 /health — System health
 /help — This message"""
         await self.send_message(chat_id, msg)
@@ -2273,6 +2559,84 @@ class GMXBot:
         )
         await self.send_message(chat_id, msg)
 
+    async def cmd_reset(self, chat_id: int):
+        """Clear all trade history and PnL stats."""
+        count = len(self.trade_history)
+        self.trade_history.clear()
+        self.health_stats["trades_executed"] = 0
+        self.health_stats["signals_processed"] = 0
+        self.logger.info(f"Trade history reset: cleared {count} trade(s)")
+        await self.send_message(
+            chat_id,
+            f"Trade history cleared ({count} trade records removed).\n"
+            f"PnL and win rate stats have been reset to zero."
+        )
+
+    async def cmd_balance_wallets(self, chat_id: int):
+        """Manually trigger wallet rebalance and report results."""
+        if not self.account2:
+            await self.send_message(chat_id, "Single wallet mode — nothing to rebalance.")
+            return
+
+        # Show current state
+        w1_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
+        w2_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
+        diff = abs(w1_usdc - w2_usdc)
+
+        await self.send_message(
+            chat_id,
+            f"Before:\n  W1: ${w1_usdc:,.2f}\n  W2: ${w2_usdc:,.2f}\n  Diff: ${diff:,.2f}\n\n"
+            f"Rebalancing..."
+        )
+
+        await self._rebalance_wallets()
+
+        # Show after state
+        new_w1 = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
+        new_w2 = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
+        new_diff = abs(new_w1 - new_w2)
+
+        if new_diff < diff:
+            await self.send_message(
+                chat_id,
+                f"After:\n  W1: ${new_w1:,.2f}\n  W2: ${new_w2:,.2f}\n  Diff: ${new_diff:,.2f}\n\n"
+                f"✅ Wallets rebalanced"
+            )
+        elif diff < 1.0:
+            await self.send_message(
+                chat_id,
+                f"Wallets already balanced (diff ${diff:,.2f} < $1.00)"
+            )
+        else:
+            await self.send_message(
+                chat_id,
+                f"After:\n  W1: ${new_w1:,.2f}\n  W2: ${new_w2:,.2f}\n\n"
+                f"⚠️ Rebalance may have failed — check logs"
+            )
+
+    async def cmd_lastmsg(self, chat_id: int):
+        """Fetch and display the last message from each monitored channel."""
+        if not self.resolved_channels:
+            await self.send_message(chat_id, "No channels resolved.")
+            return
+
+        for ch_id, ch_name in self.resolved_channels.items():
+            try:
+                msgs = await self.client.get_messages(ch_id, limit=1)
+                if msgs and msgs[0]:
+                    m = msgs[0]
+                    preview = (m.text or "(no text)")[:200]
+                    await self.send_message(
+                        chat_id,
+                        f"📡 **{ch_name}**\n"
+                        f"ID: {m.id} | {m.date.strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                        f"{preview}"
+                    )
+                else:
+                    await self.send_message(chat_id, f"📡 **{ch_name}** — no messages found")
+            except Exception as e:
+                await self.send_message(chat_id, f"📡 **{ch_name}** — error: {e}")
+
     async def cmd_health(self, chat_id: int):
         h = self.get_health_report()
         msg = (
@@ -2376,22 +2740,47 @@ class GMXBot:
     # ──────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────
-    def _record_trade(self, gmx_pos: "GMXPosition", exit_reason: str = "manual"):
-        """Record a closed trade into trade_history for /winrate and /pnl stats."""
+    def _record_trade(self, pos_obj, exit_reason: str = "manual"):
+        """Record a closed trade into trade_history for /winrate and /pnl stats.
+
+        Accepts either a GMXPosition (from close.py) or an internal Position.
+        """
         closed_at = time.time()
-        pnl_usd = gmx_pos.unrealized_pnl          # best estimate at close time
-        pnl_pct = (pnl_usd / gmx_pos.collateral_amount * 100) if gmx_pos.collateral_amount else 0.0
-        # opened_at: use entry_price timestamp proxy — we don't store open time for
-        # GMXPosition, so use closed_at - 1h as a fallback (display only, not critical)
-        opened_at = closed_at - 3600
+
+        # ── Normalise fields across GMXPosition vs internal Position ──
+        if hasattr(pos_obj, "is_long"):
+            # GMXPosition (from close.py)
+            symbol = pos_obj.symbol
+            side = "LONG" if pos_obj.is_long else "SHORT"
+            entry_price = pos_obj.entry_price
+            exit_price = pos_obj.current_price
+            size_usd = pos_obj.size_usd
+            leverage = pos_obj.leverage
+            pnl_usd = pos_obj.unrealized_pnl
+            collateral = getattr(pos_obj, "collateral_amount", 0.0)
+            opened_at = closed_at - 3600  # GMXPosition has no open timestamp
+        else:
+            # Internal Position dataclass
+            symbol = pos_obj.symbol
+            side = pos_obj.side
+            entry_price = pos_obj.entry_price
+            exit_price = pos_obj.current_price
+            size_usd = pos_obj.size_usd
+            leverage = pos_obj.leverage
+            pnl_usd = pos_obj.unrealized_pnl
+            collateral = size_usd / leverage if leverage else 0.0
+            opened_at = getattr(pos_obj, "opened_at", closed_at - 3600)
+
+        pnl_pct = (pnl_usd / collateral * 100) if collateral else 0.0
+
         record = TradeRecord(
             id=str(uuid.uuid4()),
-            symbol=gmx_pos.symbol,
-            side="LONG" if gmx_pos.is_long else "SHORT",
-            entry_price=gmx_pos.entry_price,
-            exit_price=gmx_pos.current_price,
-            size_usd=gmx_pos.size_usd,
-            leverage=gmx_pos.leverage,
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            size_usd=size_usd,
+            leverage=leverage,
             duration_hours=(closed_at - opened_at) / 3600,
             pnl_usd=pnl_usd,
             pnl_percentage=pnl_pct,
@@ -2401,7 +2790,7 @@ class GMXBot:
         )
         self.trade_history.append(record)
         self.logger.info(
-            f"Recorded trade: {gmx_pos.symbol} {'LONG' if gmx_pos.is_long else 'SHORT'} "
+            f"Recorded trade: {symbol} {side} "
             f"PnL=${pnl_usd:+.2f} ({pnl_pct:+.1f}%)"
         )
 
