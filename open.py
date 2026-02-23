@@ -33,7 +33,7 @@ import json
 import logging
 import urllib.request
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from web3 import Web3
 from eth_account import Account
@@ -637,6 +637,187 @@ def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int
 
     log.debug(f"_get_order_keys_from_events: {len(active_keys)} active (cancellable) keys")
     return active_keys
+
+
+# ── GMX V2 EventLog2 ABI for PositionDecrease event parsing ──────────────
+# The EventEmitter emits EventLog2 for PositionDecrease events.
+# We decode the nested EventLogData struct to extract execution price.
+
+_EVENT_LOG2_ABI = [{
+    "anonymous": False,
+    "inputs": [
+        {"indexed": False, "name": "msgSender", "type": "address"},
+        {"indexed": False, "name": "eventName", "type": "string"},
+        {"indexed": True, "name": "eventNameHash", "type": "string"},
+        {"indexed": True, "name": "topic1", "type": "bytes32"},
+        {"indexed": True, "name": "topic2", "type": "bytes32"},
+        {
+            "components": [
+                {"name": "addressItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "address"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "address[]"}]}
+                ]},
+                {"name": "uintItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "uint256"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "uint256[]"}]}
+                ]},
+                {"name": "intItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "int256"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "int256[]"}]}
+                ]},
+                {"name": "boolItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bool"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bool[]"}]}
+                ]},
+                {"name": "bytes32Items", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bytes32"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bytes32[]"}]}
+                ]},
+                {"name": "bytesItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bytes"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "bytes[]"}]}
+                ]},
+                {"name": "stringItems", "type": "tuple", "components": [
+                    {"name": "items", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "string"}]},
+                    {"name": "arrayItems", "type": "tuple[]", "components": [
+                        {"name": "key", "type": "string"}, {"name": "value", "type": "string[]"}]}
+                ]},
+            ],
+            "indexed": False,
+            "name": "eventData",
+            "type": "tuple"
+        }
+    ],
+    "name": "EventLog2",
+    "type": "event"
+}]
+
+# Topic hashes
+_EVENT_LOG2_TOPIC = "0x468a25a7ba624ceea6e540ad6f49171b52495b648417ae91bca21676d8a24dc5"
+_POSITION_DECREASE_TOPIC = "0x84b670ed7b7ee8ccb350963a7dea39493daff6e7a43ab021a0e4ac2d652d359e"
+
+# GMX V2 uses 1e30 precision for USD prices in events
+_GMX_PRICE_PRECISION = 10 ** 30
+
+
+def fetch_execution_price(
+    w3: Web3,
+    wallet_addr: str,
+    market_addr: str,
+    is_long: bool,
+    lookback_blocks: int = 300,
+) -> Optional[float]:
+    """Fetch the actual execution price from GMX V2 PositionDecrease events.
+
+    Queries the EventEmitter for recent PositionDecrease EventLog2 events
+    matching the wallet + market, then extracts 'executionPrice' from the
+    decoded event data.
+
+    Args:
+        w3: Web3 instance
+        wallet_addr: The wallet address that owned the position
+        market_addr: The GMX market address for the position
+        is_long: Whether the position was LONG (used to pick the right event
+                 if multiple decrease events exist)
+        lookback_blocks: Number of blocks to search back (default 300 ≈ 5 min on Arb)
+
+    Returns:
+        The execution price as a float (USD), or None if not found.
+    """
+    emitter_addr = Web3.to_checksum_address(EVENT_EMITTER)
+
+    # Pad addresses to 32 bytes for topic matching
+    wallet_topic = "0x" + "0" * 24 + wallet_addr.lower().replace("0x", "")
+    market_topic = "0x" + "0" * 24 + market_addr.lower().replace("0x", "")
+
+    current = w3.eth.block_number
+
+    try:
+        raw_logs = w3.eth.get_logs({
+            "address": emitter_addr,
+            "fromBlock": max(0, current - lookback_blocks),
+            "toBlock": current,
+            "topics": [
+                _EVENT_LOG2_TOPIC,            # EventLog2 selector
+                _POSITION_DECREASE_TOPIC,     # keccak256("PositionDecrease")
+                wallet_topic,                 # topic1 = account
+                market_topic,                 # topic2 = market
+            ],
+        })
+    except Exception as e:
+        log.warning(f"fetch_execution_price: get_logs failed: {e}")
+        return None
+
+    if not raw_logs:
+        log.debug(f"fetch_execution_price: no PositionDecrease events found "
+                  f"in last {lookback_blocks} blocks for {wallet_addr[:10]}…")
+        return None
+
+    # Decode using web3 contract events API
+    emitter = w3.eth.contract(address=emitter_addr, abi=_EVENT_LOG2_ABI)
+
+    best_price = None
+    best_block = 0
+
+    for raw_log in reversed(raw_logs):  # most recent first
+        try:
+            decoded = emitter.events.EventLog2().process_log(raw_log)
+            args = decoded["args"]
+
+            # Extract uint items — executionPrice is stored here
+            uint_items = args["eventData"][1]  # uintItems is index 1
+            items = uint_items[0]  # .items (not .arrayItems)
+
+            exec_price_raw = None
+            size_delta_usd = None
+            is_long_event = None
+
+            for key, value in items:
+                if key == "executionPrice":
+                    exec_price_raw = value
+                elif key == "sizeDeltaUsd":
+                    size_delta_usd = value
+
+            # Check bool items for isLong to match our position side
+            bool_items = args["eventData"][3]  # boolItems is index 3
+            for key, value in bool_items[0]:  # .items
+                if key == "isLong":
+                    is_long_event = value
+
+            # Only use events matching our position direction
+            if is_long_event is not None and is_long_event != is_long:
+                continue
+
+            if exec_price_raw and exec_price_raw > 0:
+                blk = raw_log.get("blockNumber", 0)
+                if blk >= best_block:
+                    best_price = exec_price_raw / _GMX_PRICE_PRECISION
+                    best_block = blk
+
+        except Exception as e:
+            log.debug(f"fetch_execution_price: failed to decode log: {e}")
+            continue
+
+    if best_price:
+        log.info(f"fetch_execution_price: found execution price ${best_price:,.2f} "
+                 f"at block {best_block}")
+    else:
+        log.debug("fetch_execution_price: could not extract executionPrice from events")
+
+    return best_price
 
 
 def _parse_orders_raw(w3: Web3, wallet_addr: str) -> list:

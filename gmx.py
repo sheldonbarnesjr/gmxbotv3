@@ -58,6 +58,7 @@ cancel_orders_for_market = _open_mod.cancel_orders_for_market
 cancel_all_orders = _open_mod.cancel_all_orders
 fetch_open_orders = _open_mod.fetch_open_orders
 scale_price = _open_mod.scale_price
+fetch_execution_price = _open_mod.fetch_execution_price
 COINGECKO_IDS = _open_mod.COINGECKO_IDS
 INDEX_TOKEN_DECIMALS = _open_mod.INDEX_TOKEN_DECIMALS
 ERC20_ABI = _open_mod.ERC20_ABI
@@ -110,7 +111,7 @@ GMX_V2_MARKETS = {
 # Allowed trading pairs
 ALLOWED_SYMBOLS = {"BTC", "ETH", "SOL", "LINK"}
 
-# Chainlink price feeds on Arbitrum (reliable on-chain fallback for CoinGecko)
+# Chainlink price feeds on Arbitrum (fallback when GMX Reader prices unavailable)
 CHAINLINK_FEEDS = {
     "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
     "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
@@ -145,7 +146,7 @@ REQUIRE_TP = os.getenv("REQUIRE_TP", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # Price monitoring
-PRICE_MAX_AGE_S = int(os.getenv("PRICE_MAX_AGE_S", "30"))
+PRICE_MAX_AGE_S = int(os.getenv("PRICE_MAX_AGE_S", "15"))  # tighter cache: 15s max staleness
 PRICE_UPDATE_INTERVAL = float(os.getenv("PRICE_UPDATE_INTERVAL", "10.0"))
 
 # Heartbeat
@@ -197,10 +198,13 @@ class Position:
     # On-chain tracking for TP-hit → move SL
     market_addr: Optional[str] = None
     sl_moved_to_entry: bool = False
+    sl_move_label: Optional[str] = None  # e.g. "Entry", "TP1", "TP2" — where the SL was moved to
+    sl_move_failed: bool = False  # True if a move_sl attempt failed — SL may be at wrong price
     tp_hits_count: int = 0  # how many TPs have been hit so far
     last_known_tp_count: int = 0  # track how many TP orders remain on-chain
     pending_fill: bool = False  # True if placed as limit order and not yet filled on-chain
     pending_fill_since: Optional[float] = None  # timestamp when limit order was placed
+    current_sl_key: Optional[str] = None  # hex key of the SL order we placed (to avoid cancelling it accidentally)
 
     @property
     def short_id(self) -> str:
@@ -212,10 +216,17 @@ class Position:
         return (end_time - self.opened_at) / 3600
 
     @property
+    def collateral_usd(self) -> float:
+        """Collateral = size / leverage."""
+        return self.size_usd / self.leverage if self.leverage else 0.0
+
+    @property
     def pnl_percentage(self) -> float:
-        if self.size_usd == 0:
+        """PnL as percentage of collateral (what was actually deposited)."""
+        col = self.collateral_usd
+        if col == 0:
             return 0.0
-        return (self.unrealized_pnl / self.size_usd) * 100
+        return (self.unrealized_pnl / col) * 100
 
 @dataclass
 class PriceData:
@@ -1362,8 +1373,175 @@ class GMXBot:
         except Exception as e:
             self.logger.error(f"{label} ETH top-up error: {e}")
 
+    async def cmd_topup(self, chat_id: int, arg: Optional[str] = None):
+        """Manual ETH top-up command.
+
+        Usage:
+            /topup          — show ETH balances for all wallets
+            /topup all      — top up all wallets with $5 USDC → ETH each
+            /topup 1        — top up wallet 1 only
+            /topup 2        — top up wallet 2 only
+            /topup 1 10     — top up wallet 1 with $10 worth of USDC → ETH
+            /topup all 15   — top up all wallets with $15 each
+        """
+        # Uniswap constants (same as topup_eth_if_needed)
+        UNISWAP_ROUTER = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+        WETH_ARBITRUM   = Web3.to_checksum_address("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
+        USDC_ARBITRUM   = Web3.to_checksum_address("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
+        POOL_FEE        = 500
+
+        UNISWAP_ABI = [
+            {
+                "name": "multicall", "type": "function", "stateMutability": "payable",
+                "inputs": [{"name": "data", "type": "bytes[]"}],
+                "outputs": [{"name": "", "type": "bytes[]"}],
+            },
+            {
+                "name": "exactInputSingle", "type": "function", "stateMutability": "payable",
+                "inputs": [{"name": "params", "type": "tuple", "components": [
+                    {"name": "tokenIn",           "type": "address"},
+                    {"name": "tokenOut",          "type": "address"},
+                    {"name": "fee",               "type": "uint24"},
+                    {"name": "recipient",         "type": "address"},
+                    {"name": "amountIn",          "type": "uint256"},
+                    {"name": "amountOutMinimum",  "type": "uint256"},
+                    {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                ]}],
+                "outputs": [{"name": "amountOut", "type": "uint256"}],
+            },
+            {
+                "name": "unwrapWETH9", "type": "function", "stateMutability": "payable",
+                "inputs": [
+                    {"name": "amountMinimum", "type": "uint256"},
+                    {"name": "recipient",     "type": "address"},
+                ],
+                "outputs": [],
+            },
+        ]
+
+        all_wallets = [(1, self.account)] + ([(2, self.account2)] if self.account2 else [])
+
+        # Get ETH price for display
+        eth_price = await self.get_current_price("ETH")
+        if not eth_price:
+            try:
+                eth_price = await asyncio.to_thread(close_fetch_current_price, "ETH", self.w3)
+            except Exception:
+                eth_price = 0.0
+
+        # ── No args: just show balances ──
+        if not arg:
+            lines = ["**ETH Balances (Gas)**\n"]
+            for wid, acct in all_wallets:
+                try:
+                    eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, acct.address)
+                    eth_amount = eth_bal / 10**18
+                    eth_usd = eth_amount * eth_price if eth_price else 0
+                    lines.append(
+                        f"W{wid}: {eth_amount:.6f} ETH (~${eth_usd:.2f})"
+                    )
+                except Exception as e:
+                    lines.append(f"W{wid}: error fetching balance ({e})")
+            lines.append(
+                f"\nUsage: /topup <1|2|all> [amount_usd]\n"
+                f"Default: $5 USDC → ETH"
+            )
+            await self.send_message(chat_id, "\n".join(lines))
+            return
+
+        # ── Parse args ──
+        parts = arg.strip().split()
+        target = parts[0].lower()
+        topup_usd = 5.0  # default
+
+        if len(parts) >= 2:
+            try:
+                topup_usd = float(parts[1].replace("$", ""))
+            except ValueError:
+                await self.send_message(chat_id, f"Invalid amount: {parts[1]}\nUsage: /topup <1|2|all> [amount_usd]")
+                return
+
+        if topup_usd < 1 or topup_usd > 100:
+            await self.send_message(chat_id, "Amount must be between $1 and $100")
+            return
+
+        # Determine which wallets to top up
+        if target == "all":
+            targets = all_wallets
+        elif target in ("1", "w1"):
+            targets = [(1, self.account)]
+        elif target in ("2", "w2"):
+            if not self.account2:
+                await self.send_message(chat_id, "Wallet 2 not configured")
+                return
+            targets = [(2, self.account2)]
+        else:
+            await self.send_message(chat_id, f"Unknown target: {target}\nUsage: /topup <1|2|all> [amount_usd]")
+            return
+
+        if DRY_RUN:
+            wallet_names = ", ".join(f"W{wid}" for wid, _ in targets)
+            await self.send_message(chat_id, f"[DRY RUN] Would swap ${topup_usd:.0f} USDC → ETH for {wallet_names}")
+            return
+
+        # ── Execute top-ups ──
+        results = []
+        for wid, acct in targets:
+            label = f"W{wid}"
+            try:
+                wallet = acct.address
+
+                # Check USDC balance
+                usdc_token = self.w3.eth.contract(address=USDC_ARBITRUM, abi=ERC20_ABI)
+                usdc_decimals = await asyncio.to_thread(lambda: usdc_token.functions.decimals().call())
+                usdc_bal_raw = await asyncio.to_thread(lambda: usdc_token.functions.balanceOf(wallet).call())
+                usdc_bal = usdc_bal_raw / (10 ** usdc_decimals)
+
+                if usdc_bal < topup_usd:
+                    results.append(f"{label}: insufficient USDC (${usdc_bal:.2f} < ${topup_usd:.0f})")
+                    continue
+
+                usdc_amount_in = int(topup_usd * (10 ** usdc_decimals))
+
+                # Approve if needed
+                allowance = await asyncio.to_thread(
+                    lambda: usdc_token.functions.allowance(wallet, UNISWAP_ROUTER).call()
+                )
+                if allowance < usdc_amount_in:
+                    approve_data = usdc_token.encode_abi("approve", [UNISWAP_ROUTER, 2**256 - 1])
+                    approve_txh = await asyncio.to_thread(
+                        self._send_tx, USDC_ARBITRUM, approve_data, 0, acct
+                    )
+                    await asyncio.to_thread(_open_mod.wait_receipt, self.w3, approve_txh)
+
+                # Swap USDC → ETH via Uniswap
+                router = self.w3.eth.contract(address=UNISWAP_ROUTER, abi=UNISWAP_ABI)
+                swap_params = (
+                    USDC_ARBITRUM, WETH_ARBITRUM, POOL_FEE,
+                    UNISWAP_ROUTER,  # recipient = router for unwrap
+                    usdc_amount_in, 0, 0,
+                )
+                swap_data   = router.encode_abi("exactInputSingle", [swap_params])
+                unwrap_data = router.encode_abi("unwrapWETH9", [0, Web3.to_checksum_address(wallet)])
+                call_data   = router.encode_abi("multicall", [[swap_data, unwrap_data]])
+
+                txh = await asyncio.to_thread(self._send_tx, UNISWAP_ROUTER, call_data, 0, acct)
+                receipt = await asyncio.to_thread(_open_mod.wait_receipt, self.w3, txh)
+
+                if receipt.get("status") == 1:
+                    new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+                    new_eth_usd = (new_eth_bal / 10**18) * (eth_price or 0)
+                    results.append(f"{label}: swapped ${topup_usd:.0f} USDC → ETH (balance: ${new_eth_usd:.2f})")
+                else:
+                    results.append(f"{label}: swap TX reverted ({txh[:18]}...)")
+
+            except Exception as e:
+                results.append(f"{label}: error — {e}")
+
+        await self.send_message(chat_id, "**ETH Top-Up**\n\n" + "\n".join(results))
+
     # ──────────────────────────────────────────────────────────────────────
-    # Price feeds — real CoinGecko
+    # Price feeds — GMX Reader + Chainlink fallback
     # ──────────────────────────────────────────────────────────────────────
     async def price_update_loop(self):
         while True:
@@ -1378,13 +1556,40 @@ class GMXBot:
 
     async def update_all_prices(self):
         active_symbols = {pos.symbol for pos in self.positions.values() if pos.is_open}
+
+        # ── Primary: fetch prices from GMX chain positions (Reader contract) ──
+        # This gives us the same prices GMX uses for its own PnL/SL/TP calculations.
+        chain_prices = {}  # symbol -> current_price from GMX Reader
+        open_positions = [p for p in self.positions.values() if p.is_open and p.market_addr]
+        if open_positions:
+            wallet_ids = {p.wallet_id for p in open_positions}
+            for wid in wallet_ids:
+                try:
+                    acct = self._get_account(wid)
+                    chain_pos_list = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    for cp in chain_pos_list:
+                        sym = cp.symbol.upper().split("/")[0]
+                        if cp.current_price and cp.current_price > 0:
+                            chain_prices[sym] = cp.current_price
+                except Exception as e:
+                    self.logger.debug(f"GMX Reader price fetch failed for W{wid}: {e}")
+
+        # ── Fallback: Chainlink for any symbols not covered by chain positions ──
         for symbol in active_symbols:
-            price = await self.fetch_price(symbol)
-            if price:
+            if symbol not in chain_prices:
+                price = await self.fetch_price(symbol)
+                if price:
+                    chain_prices[symbol] = price
+
+        # Update cache with whatever prices we got
+        for symbol, price in chain_prices.items():
+            if price and price > 0:
                 self.price_cache[symbol] = PriceData(symbol=symbol, price=price)
                 self.health_stats["price_updates"] += 1
 
-        # Update P&L for all open positions
+        # Update P&L for all open positions using GMX-sourced prices
         for pos in self.positions.values():
             if pos.is_open and pos.symbol in self.price_cache:
                 pos.current_price = self.price_cache[pos.symbol].price
@@ -1392,7 +1597,8 @@ class GMXBot:
                     change = pos.current_price - pos.entry_price
                 else:
                     change = pos.entry_price - pos.current_price
-                pos.unrealized_pnl = (change / pos.entry_price) * pos.size_usd * pos.leverage
+                # size_usd already includes leverage — don't multiply again
+                pos.unrealized_pnl = (change / pos.entry_price) * pos.size_usd
 
     async def get_current_price(self, symbol: str) -> Optional[float]:
         if symbol in self.price_cache and self.price_cache[symbol].is_fresh:
@@ -1737,30 +1943,202 @@ class GMXBot:
 
                 # CONFIRMED: position is gone from chain
 
-                # Determine exit reason
-                if pos.sl_moved_to_entry:
-                    exit_reason = "SL (breakeven)"
+                # ── SAFETY CHECK: verify no active orders remain for this market ──
+                # If SL/TP orders still exist, the position may still be partially open
+                # (GMX hasn't executed them yet). This catches edge cases where the
+                # position appears gone momentarily during keeper execution.
+                try:
+                    acct = self._get_account(pos.wallet_id)
+                    remaining_orders = await asyncio.to_thread(
+                        fetch_open_orders, self.w3, acct.address
+                    )
+                    market_orders = [
+                        o for o in remaining_orders
+                        if o["market"].lower() == pos.market_addr.lower()
+                        and o["order_type"] in (
+                            ORDER_TYPE_LIMIT_DECREASE,       # TP
+                            ORDER_TYPE_STOP_LOSS_DECREASE,   # SL
+                        )
+                    ]
+                    if market_orders:
+                        self.logger.info(
+                            f"Position {pos.symbol} {pos.side} appears gone but "
+                            f"{len(market_orders)} SL/TP orders still exist on-chain. "
+                            f"Waiting for next cycle (orders will be auto-cancelled if truly closed)."
+                        )
+                        # Don't declare closed yet — if position is truly closed,
+                        # keepers will cancel remaining orders and next cycle will
+                        # find both position AND orders gone → proper close detection.
+                        continue
+                except Exception as e:
+                    self.logger.debug(f"Could not check remaining orders: {e}")
+                    # If we can't check, proceed with close detection (don't block indefinitely)
+
+                # ── FETCH ACTUAL EXECUTION PRICE from on-chain events ──
+                # Try to get the real fill price from GMX PositionDecrease events
+                # instead of relying on current Chainlink price (which can drift)
+                execution_price = None
+                try:
+                    acct = self._get_account(pos.wallet_id)
+                    execution_price = await asyncio.to_thread(
+                        fetch_execution_price,
+                        self.w3,
+                        acct.address,
+                        pos.market_addr,
+                        pos.side == "LONG",
+                        300,  # ~5 min lookback on Arbitrum
+                    )
+                    if execution_price:
+                        self.logger.info(
+                            f"Got actual execution price for {pos.symbol} {pos.side}: "
+                            f"${execution_price:,.2f}"
+                        )
+                except Exception as e:
+                    self.logger.debug(f"Could not fetch execution price from events: {e}")
+
+                # Fall back to Chainlink price if event parsing failed
+                current_price = execution_price
+                if not current_price:
+                    current_price = await self.fetch_price(pos.symbol)
+                if not current_price:
+                    current_price = await self.get_current_price(pos.symbol)
+
+                # ── PRICE VERIFICATION: only needed when we DON'T have the actual fill price ──
+                # If we got the execution price from events, we know the close is real.
+                # Only do price plausibility checks when falling back to Chainlink.
+                if not execution_price and current_price and pos.stop_loss:
+                    is_long = pos.side == "LONG"
+                    sl_price = pos.stop_loss
+                    tolerance = sl_price * 0.02  # 2% tolerance
+
+                    # For a LONG: SL triggers when price drops BELOW SL
+                    # For a SHORT: SL triggers when price rises ABOVE SL
+                    sl_could_have_hit = False
+                    if is_long and current_price <= sl_price + tolerance:
+                        sl_could_have_hit = True
+                    elif not is_long and current_price >= sl_price - tolerance:
+                        sl_could_have_hit = True
+
+                    # Check if any TP could have been hit (all TPs filled = position closed)
+                    tp_could_have_hit = False
+                    if pos.take_profits:
+                        sorted_tps = sorted(pos.take_profits, key=lambda t: t.price,
+                                            reverse=(pos.side == "SHORT"))
+                        last_tp = sorted_tps[-1].price if sorted_tps else None
+                        if last_tp:
+                            if is_long and current_price >= last_tp - (last_tp * 0.02):
+                                tp_could_have_hit = True
+                            elif not is_long and current_price <= last_tp + (last_tp * 0.02):
+                                tp_could_have_hit = True
+
+                    if not sl_could_have_hit and not tp_could_have_hit:
+                        # Price doesn't justify this close — do a THIRD check
+                        self.logger.warning(
+                            f"Position {pos.symbol} {pos.side} disappeared but price "
+                            f"${current_price:,.2f} doesn't justify close. "
+                            f"SL=${sl_price:,.2f}, doing 3rd verification..."
+                        )
+                        await asyncio.sleep(5)
+                        try:
+                            acct = self._get_account(pos.wallet_id)
+                            third_check = await asyncio.to_thread(
+                                chain_fetch_positions, self.w3, acct.address
+                            )
+                            third_keys = {(cp.market.lower(), cp.is_long) for cp in third_check}
+                            if key in third_keys:
+                                self.logger.info(
+                                    f"Position {pos.symbol} {pos.side} reappeared on 3rd check — not closed"
+                                )
+                                continue
+                        except Exception as e:
+                            self.logger.warning(f"3rd verification failed: {e} — skipping close")
+                            continue
+
+                        # Position is truly gone but price doesn't match.
+                        # Try one more time to get the actual execution price from events
+                        # (maybe the event wasn't indexed yet on the first try).
+                        if not execution_price:
+                            self.logger.info(
+                                f"Retrying execution price fetch for {pos.symbol} after 3rd check..."
+                            )
+                            try:
+                                acct = self._get_account(pos.wallet_id)
+                                execution_price = await asyncio.to_thread(
+                                    fetch_execution_price,
+                                    self.w3, acct.address, pos.market_addr,
+                                    pos.side == "LONG", 500,  # wider lookback
+                                )
+                                if execution_price:
+                                    current_price = execution_price
+                                    self.logger.info(
+                                        f"Got execution price on retry: ${execution_price:,.2f}"
+                                    )
+                            except Exception as e:
+                                self.logger.debug(f"Retry execution price fetch failed: {e}")
+
+                        # Still no matching price — flag it in the notification
+                        if not execution_price:
+                            self.logger.warning(
+                                f"Position {pos.symbol} {pos.side} confirmed closed but "
+                                f"price ${current_price:,.2f} doesn't match SL=${sl_price:,.2f}. "
+                                f"Proceeding with close (may be a liquidation or keeper execution)."
+                            )
+
+                # Determine exit reason — use actual SL price + TP hit count
+                is_long = pos.side == "LONG"
+                if pos.tp_hits_count > 0 and pos.last_known_tp_count == 0:
+                    exit_reason = "All TPs filled"
+                elif pos.sl_moved_to_entry and pos.stop_loss:
+                    # SL was moved after TP hits. Check where it was moved to.
+                    sl_label = pos.sl_move_label or "Entry"
+                    sl_price = pos.stop_loss
+
+                    # Is exit price near the SL price? (2% tolerance)
+                    sl_tol = sl_price * 0.02
+                    sl_triggered = False
+                    if current_price:
+                        if is_long and current_price <= sl_price + sl_tol:
+                            sl_triggered = True
+                        elif not is_long and current_price >= sl_price - sl_tol:
+                            sl_triggered = True
+
+                    if sl_triggered:
+                        if sl_label == "Entry":
+                            exit_reason = "SL (breakeven)"
+                        else:
+                            # SL was at a TP level — this means profit was locked in
+                            exit_reason = f"SL at {sl_label} (${sl_price:,.2f})"
+                    else:
+                        # Price is NOT near SL — likely a TP fill or liquidation
+                        if pos.tp_hits_count > 0:
+                            exit_reason = f"TP/SL hit ({pos.tp_hits_count} TPs filled)"
+                        else:
+                            exit_reason = "SL/TP hit"
+                elif pos.tp_hits_count > 0:
+                    exit_reason = f"Closed ({pos.tp_hits_count} TPs hit)"
                 elif pos.last_known_tp_count > 0:
                     exit_reason = "SL/TP/liquidation"
                 else:
                     exit_reason = "SL/liquidation"
 
-                # Get last known price for PnL estimate
-                current_price = await self.get_current_price(pos.symbol)
+                # Calculate PnL from current price
                 if current_price:
                     pos.current_price = current_price
                     if pos.side == "LONG":
                         change = current_price - pos.entry_price
                     else:
                         change = pos.entry_price - current_price
-                    pos.unrealized_pnl = (change / pos.entry_price) * pos.size_usd * pos.leverage
+                    # size_usd already includes leverage — don't multiply again
+                    pos.unrealized_pnl = (change / pos.entry_price) * pos.size_usd
 
                 pnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+                price_source = "fill" if execution_price else "est"
                 price_str = f"${current_price:,.2f}" if current_price else "N/A"
 
                 self.logger.info(
                     f"Position closed on-chain: {pos.symbol} {pos.side} "
-                    f"PnL={pnl_sign}${pos.unrealized_pnl:,.2f} reason={exit_reason}"
+                    f"PnL={pnl_sign}${pos.unrealized_pnl:,.2f} reason={exit_reason} "
+                    f"price_source={price_source}"
                 )
 
                 # Determine emoji based on outcome
@@ -1771,10 +2149,19 @@ class GMXBot:
                 else:
                     outcome_emoji = "🔴"
 
+                # Show "(fill)" for actual execution price, "(est)" for Chainlink fallback
+                exit_label = f"Exit ({price_source}): {price_str}"
+
+                # Warn if SL move had failed during this position's lifetime
+                sl_warning = ""
+                if pos.sl_move_failed:
+                    sl_warning = "\n⚠️ Note: SL move failed earlier — exit may have been at original SL"
+
                 await self.notify(
                     f"{outcome_emoji} {pos.symbol} {pos.side} — {exit_reason}\n"
-                    f"Entry: ${pos.entry_price:,.2f}  |  Exit: {price_str}\n"
+                    f"Entry: ${pos.entry_price:,.2f}  |  {exit_label}\n"
                     f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f} ({pnl_sign}{pos.pnl_percentage:.1f}%)"
+                    f"{sl_warning}"
                 )
 
                 # Record trade for /winrate and /pnl stats
@@ -1967,17 +2354,22 @@ class GMXBot:
                         pos.last_known_tp_count = 0
                         continue
 
-                # ── Confirmed TP hit: count dropped and re-fetch agrees ──
-                pos.tp_hits_count += hit_count
-                self.logger.info(
-                    f"TP HIT detected: {pos.symbol} {pos.side} — "
-                    f"{hit_count} TP(s) executed (was {pos.last_known_tp_count}, now {current_tp_count}), "
-                    f"total hits: {pos.tp_hits_count}"
-                )
+                # ── TP count dropped and re-fetch agrees. Now VERIFY PRICE ──
+                # before committing the hit count, sending notifications, or moving SL.
+                # This prevents acting on cancelled orders or stale event-log reads.
 
-                # Fetch current PnL + price from chain for the notification
-                pnl_line = ""
+                sorted_tps = sorted(pos.take_profits, key=lambda t: t.price,
+                                    reverse=(pos.side == "SHORT"))
+                tentative_hits = pos.tp_hits_count + hit_count
+                first_hit_idx = pos.tp_hits_count  # first new TP index
+
+                # Wait for chain state to reflect the TP execution
+                await asyncio.sleep(3)
+
+                # Fetch fresh price + position data from chain
                 chain_price = None
+                chain_pos = None
+                pnl_line = ""
                 try:
                     chain_positions = await asyncio.to_thread(
                         chain_fetch_positions, self.w3, pos_acct.address
@@ -1989,110 +2381,158 @@ class GMXBot:
                     )
                     if chain_pos:
                         chain_price = chain_pos.current_price
-                        pnl_sign = "+" if chain_pos.unrealized_pnl >= 0 else ""
-                        pnl_line = (
-                            f"Current PnL: {pnl_sign}${chain_pos.unrealized_pnl:,.2f} "
-                            f"({pnl_sign}{chain_pos.pnl_percentage:.1f}%)\n"
-                            f"Remaining size: ${chain_pos.size_usd:,.2f}\n"
-                        )
                 except Exception:
                     pass
 
-                # ALWAYS notify user about TP hit (GMX executed it on-chain)
-                sorted_tps = sorted(pos.take_profits, key=lambda t: t.price,
-                                    reverse=(pos.side == "SHORT"))
+                current_price = await self.get_current_price(pos.symbol)
+                best_price = chain_price or current_price
 
-                # Build TP info for notification — show all TPs that were hit
-                first_hit_idx = pos.tp_hits_count - hit_count  # first TP that just hit
+                # ── PRICE VERIFICATION: did price actually reach the TP level? ──
+                # GMX wouldn't execute a TP without the oracle price reaching it,
+                # but our read could be stale. Verify against the FIRST TP that
+                # supposedly hit (most conservative check).
+                price_verified = True
+                verified_hit_count = hit_count
+
+                if first_hit_idx < len(sorted_tps) and not best_price:
+                    # No price available — can't verify. Treat as stale.
+                    self.logger.warning(
+                        f"TP count dropped for {pos.symbol} {pos.side} but no "
+                        f"current price available — skipping TP verification."
+                    )
+                    pos.last_known_tp_count = current_tp_count
+                    continue
+
+                if first_hit_idx < len(sorted_tps) and best_price:
+                    # Check the FIRST new TP that was supposedly hit
+                    first_tp_price = sorted_tps[first_hit_idx].price
+                    tolerance = first_tp_price * 0.03  # 3% tolerance
+
+                    first_reached = False
+                    if is_long and best_price >= first_tp_price - tolerance:
+                        first_reached = True
+                    elif not is_long and best_price <= first_tp_price + tolerance:
+                        first_reached = True
+
+                    if not first_reached:
+                        # Price hasn't reached even the FIRST TP — this might be a
+                        # cancelled order, not an execution. Don't act on it.
+                        self.logger.warning(
+                            f"TP count dropped for {pos.symbol} {pos.side} but price "
+                            f"${best_price:,.2f} hasn't reached TP{first_hit_idx + 1} "
+                            f"@ ${first_tp_price:,.2f}. Possible manual cancel or stale read. "
+                            f"NOT treating as TP hit — updating baseline."
+                        )
+                        # Update baseline but don't increment hit count or move SL
+                        pos.last_known_tp_count = current_tp_count
+                        continue
+
+                    # First TP verified. Now check the last TP if multiple hit.
+                    if hit_count > 1:
+                        last_hit_idx = tentative_hits - 1
+                        if last_hit_idx < len(sorted_tps):
+                            last_tp_price = sorted_tps[last_hit_idx].price
+                            last_tol = last_tp_price * 0.03
+
+                            last_reached = False
+                            if is_long and best_price >= last_tp_price - last_tol:
+                                last_reached = True
+                            elif not is_long and best_price <= last_tp_price + last_tol:
+                                last_reached = True
+
+                            if not last_reached:
+                                # Price reached first TP but not the last — count fewer hits.
+                                # Walk backwards to find how many TPs price actually reached.
+                                verified_hit_count = 0
+                                for h in range(hit_count):
+                                    idx = first_hit_idx + h
+                                    if idx < len(sorted_tps):
+                                        tp_p = sorted_tps[idx].price
+                                        tp_tol = tp_p * 0.03
+                                        reached = False
+                                        if is_long and best_price >= tp_p - tp_tol:
+                                            reached = True
+                                        elif not is_long and best_price <= tp_p + tp_tol:
+                                            reached = True
+                                        if reached:
+                                            verified_hit_count += 1
+                                        else:
+                                            break  # stop at first unverified TP
+
+                                if verified_hit_count == 0:
+                                    verified_hit_count = 1  # at least first TP was verified
+
+                                self.logger.info(
+                                    f"Price verified {verified_hit_count} of {hit_count} "
+                                    f"TP hits for {pos.symbol} (price ${best_price:,.2f})"
+                                )
+
+                # ── Verified: commit the TP hit count ──
+                pos.tp_hits_count += verified_hit_count
+                self.logger.info(
+                    f"TP HIT verified: {pos.symbol} {pos.side} — "
+                    f"{verified_hit_count} TP(s) confirmed "
+                    f"(count was {pos.last_known_tp_count}, now {current_tp_count}), "
+                    f"total hits: {pos.tp_hits_count}"
+                )
+
+                # Build PnL line for notification
+                if chain_pos:
+                    orig_collateral = pos.size_usd / pos.leverage if pos.leverage else 0
+                    if orig_collateral > 0:
+                        pnl_pct = (chain_pos.unrealized_pnl / orig_collateral) * 100
+                    else:
+                        pnl_pct = chain_pos.pnl_percentage
+                    pnl_sign = "+" if chain_pos.unrealized_pnl >= 0 else ""
+                    pnl_line = (
+                        f"Current PnL: {pnl_sign}${chain_pos.unrealized_pnl:,.2f} "
+                        f"({pnl_sign}{pnl_pct:.1f}%)\n"
+                        f"Remaining size: ${chain_pos.size_usd:,.2f}\n"
+                    )
+
+                # Build TP info for notification
                 tp_lines = []
-                for h in range(hit_count):
+                for h in range(verified_hit_count):
                     idx = first_hit_idx + h
                     if idx < len(sorted_tps):
                         tp_lines.append(f"TP{idx + 1} @ ${sorted_tps[idx].price:,.2f}")
                 tp_info = ", ".join(tp_lines) + "\n" if tp_lines else ""
 
-                if hit_count == 1:
+                if verified_hit_count == 1:
                     header = f"🎯 TP{pos.tp_hits_count} Hit: {pos.symbol} {pos.side}"
                 else:
                     header = (
-                        f"🎯 {hit_count} TPs Hit: {pos.symbol} {pos.side} "
-                        f"(TP{first_hit_idx + 1}–TP{pos.tp_hits_count})"
+                        f"🎯 {verified_hit_count} TPs Hit: {pos.symbol} {pos.side} "
+                        f"(TP{first_hit_idx + 1}–TP{first_hit_idx + verified_hit_count})"
                     )
 
+                # Price verification tag
+                price_tag = f"(verified @ ${best_price:,.2f})" if best_price else ""
+
                 await self.notify(
-                    f"{header}\n"
+                    f"{header} {price_tag}\n"
                     f"{tp_info}"
                     f"{pnl_line}"
                     f"TPs remaining: {current_tp_count}"
                 )
 
-                # ── PRICE VERIFICATION: only gate the SL move, not the notification ──
-                # Use the LAST TP that was hit for price verification (highest target reached)
-                current_price = await self.get_current_price(pos.symbol)
-                best_price = chain_price or current_price
+                # ── Move SL (always — price is already verified above) ──
+                hits = pos.tp_hits_count
+                if hits <= 1:
+                    new_sl_target = pos.entry_price
+                    sl_label = "Entry"
+                elif hits - 2 < len(sorted_tps):
+                    new_sl_target = sorted_tps[hits - 2].price
+                    sl_label = f"TP{hits - 1}"
+                else:
+                    new_sl_target = sorted_tps[-1].price if sorted_tps else pos.entry_price
+                    sl_label = f"TP{len(sorted_tps)}" if sorted_tps else "Entry"
 
-                last_hit_idx = pos.tp_hits_count - 1  # the most recent TP that fired
-                price_verified = True  # default: allow SL move
-                if last_hit_idx < len(sorted_tps) and best_price:
-                    expected_tp_price = sorted_tps[last_hit_idx].price
-                    tolerance = expected_tp_price * 0.03  # 3% tolerance
-
-                    price_reached = False
-                    if is_long and best_price >= expected_tp_price - tolerance:
-                        price_reached = True
-                    elif not is_long and best_price <= expected_tp_price + tolerance:
-                        price_reached = True
-
-                    if not price_reached:
-                        # Try the first TP that was hit instead (price may have retraced
-                        # past the last one but still reached the earlier one)
-                        if hit_count > 1 and first_hit_idx < len(sorted_tps):
-                            fallback_price = sorted_tps[first_hit_idx].price
-                            fallback_tol = fallback_price * 0.03
-                            if is_long and best_price >= fallback_price - fallback_tol:
-                                price_reached = True
-                                last_hit_idx = first_hit_idx
-                            elif not is_long and best_price <= fallback_price + fallback_tol:
-                                price_reached = True
-                                last_hit_idx = first_hit_idx
-
-                    if not price_reached:
-                        self.logger.warning(
-                            f"TP executed on-chain but current price ${best_price:,.2f} "
-                            f"hasn't reached TP ${expected_tp_price:,.2f} "
-                            f"(chainlink=${current_price}, chain=${chain_price}). "
-                            f"Skipping SL move — price may have retraced."
-                        )
-                        await self.notify(
-                            f"⚠️ TP{pos.tp_hits_count} executed but price retraced to "
-                            f"${best_price:,.2f} — SL NOT moved. "
-                            f"Use /addorder sl to set manually if needed."
-                        )
-                        price_verified = False
-                    else:
-                        self.logger.info(
-                            f"TP price verified for {pos.symbol} {pos.side}: "
-                            f"target ${expected_tp_price:,.2f}, best price ${best_price:,.2f}"
-                        )
-
-                # Move SL only if price verification passed
-                if price_verified:
-                    hits = pos.tp_hits_count
-                    if hits <= 1:
-                        new_sl_target = pos.entry_price
-                        sl_label = "Entry"
-                    elif hits - 2 < len(sorted_tps):
-                        new_sl_target = sorted_tps[hits - 2].price
-                        sl_label = f"TP{hits - 1}"
-                    else:
-                        new_sl_target = sorted_tps[-1].price if sorted_tps else pos.entry_price
-                        sl_label = f"TP{len(sorted_tps)}" if sorted_tps else "Entry"
-
-                    await self.notify(
-                        f"📊 SL moving → {sl_label} (${new_sl_target:,.2f}) "
-                        f"for {pos.symbol} {pos.side}"
-                    )
-                    await self.move_sl(pos, orders, new_sl_target, sl_label)
+                await self.notify(
+                    f"📊 SL moving → {sl_label} (${new_sl_target:,.2f}) "
+                    f"for {pos.symbol} {pos.side}"
+                )
+                await self.move_sl(pos, orders, new_sl_target, sl_label)
 
                 pos.last_known_tp_count = current_tp_count
 
@@ -2136,8 +2576,9 @@ class GMXBot:
                 f"move_sl: found {len(sl_orders)} SL order(s) to cancel for {pos.symbol}"
             )
 
-            # Cancel old SL order(s)
+            # Cancel old SL order(s) — track which TXs succeeded via receipt
             cancelled_count = 0
+            cancelled_keys = set()  # keys we got successful receipts for
             for sl in sl_orders:
                 if not sl.get("key_hex"):
                     self.logger.warning(f"  SL order has no key_hex, skipping")
@@ -2152,28 +2593,79 @@ class GMXBot:
                         )
                         txh = _open_mod.sign_send(self.w3, _acct, tx, dry_run=DRY_RUN)
                         if not DRY_RUN and not txh.startswith("dry_run"):
-                            _open_mod.wait_receipt(self.w3, txh)
-                        return txh
-                    txh = await asyncio.to_thread(_cancel_sl)
-                    self.logger.info(f"Old SL cancelled: {txh}")
-                    cancelled_count += 1
+                            receipt = _open_mod.wait_receipt(self.w3, txh)
+                            return txh, receipt.get("status") == 1
+                        return txh, True
+                    txh, receipt_ok = await asyncio.to_thread(_cancel_sl)
+                    if receipt_ok:
+                        self.logger.info(f"Old SL cancelled (receipt OK): {txh}")
+                        cancelled_count += 1
+                        cancelled_keys.add(sl["key_hex"])
+                    else:
+                        self.logger.warning(f"SL cancel TX reverted: {txh}")
                 except Exception as e:
                     self.logger.warning(f"Failed to cancel old SL: {e}")
 
             if sl_orders and cancelled_count == 0:
-                self.logger.error(
-                    f"Could not cancel any of {len(sl_orders)} old SL orders! "
-                    f"Aborting new SL placement to avoid duplicates."
+                # ── RETRY: wait and try cancelling again (event logs may have been stale) ──
+                self.logger.warning(
+                    f"Could not cancel any of {len(sl_orders)} old SL orders — "
+                    f"retrying after 10s..."
                 )
-                await self.notify(
-                    f"⚠️ Failed to cancel old SL for {pos.symbol}. "
-                    f"New SL NOT placed to avoid duplicates. Check manually."
-                )
-                return
+                await asyncio.sleep(10)
+                try:
+                    retry_orders = await asyncio.to_thread(
+                        fetch_open_orders, self.w3, pos_acct.address
+                    )
+                    retry_sls = [
+                        o for o in retry_orders
+                        if o["market"].lower() == market_lower
+                        and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                        and o.get("key_hex")
+                    ]
+                    for sl in retry_sls:
+                        try:
+                            kb = bytes.fromhex(sl["key_hex"])
+                            def _retry_cancel2(kb=kb, _acct=pos_acct):
+                                data = exchange.encode_abi("cancelOrder", [kb])
+                                tx = _open_mod.build_tx(
+                                    self.w3, _acct.address, exchange.address, data, value=0
+                                )
+                                txh = _open_mod.sign_send(self.w3, _acct, tx, dry_run=DRY_RUN)
+                                if not DRY_RUN and not txh.startswith("dry_run"):
+                                    receipt = _open_mod.wait_receipt(self.w3, txh)
+                                    return txh, receipt.get("status") == 1
+                                return txh, True
+                            txh, ok = await asyncio.to_thread(_retry_cancel2)
+                            if ok:
+                                cancelled_count += 1
+                                cancelled_keys.add(sl["key_hex"])
+                                self.logger.info(f"Retry cancel succeeded: {txh}")
+                        except Exception as e2:
+                            self.logger.warning(f"Retry cancel also failed: {e2}")
+                except Exception as e:
+                    self.logger.warning(f"Retry fetch failed: {e}")
 
-            # ── VERIFY old SLs are actually gone before placing new one ──
+                if cancelled_count == 0:
+                    self.logger.error(
+                        f"Could not cancel any of {len(sl_orders)} old SL orders after retry! "
+                        f"Aborting new SL placement to avoid duplicates."
+                    )
+                    pos.sl_move_failed = True
+                    await self.notify(
+                        f"⚠️ Could not remove old SL for {pos.symbol} after retries. "
+                        f"New SL NOT placed. Manual cleanup needed."
+                    )
+                    return
+
+            # ── VERIFY old SLs are actually gone ──
+            # Event-log-based fetch_open_orders can lag behind the chain state.
+            # If all cancel TXs got successful receipts, we trust that and proceed
+            # even if the verification fetch still shows stale orders.
+            all_receipts_ok = (cancelled_count == len([s for s in sl_orders if s.get("key_hex")]))
+
             if cancelled_count > 0 and not DRY_RUN:
-                await asyncio.sleep(3)  # wait for chain to process cancellations
+                await asyncio.sleep(5)  # wait for event logs to catch up
                 try:
                     verify_orders = await asyncio.to_thread(
                         fetch_open_orders, self.w3, pos_acct.address
@@ -2182,13 +2674,14 @@ class GMXBot:
                         o for o in verify_orders
                         if o["market"].lower() == market_lower
                         and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                        and o.get("key_hex") not in cancelled_keys  # exclude keys we successfully cancelled
                     ]
                     if remaining_sls:
-                        self.logger.error(
-                            f"move_sl: {len(remaining_sls)} old SL(s) still exist after cancellation! "
+                        self.logger.warning(
+                            f"move_sl: {len(remaining_sls)} unknown SL(s) still exist after cancellation. "
                             f"Retrying cancellation..."
                         )
-                        # Retry cancelling the remaining ones
+                        # Retry cancelling only truly remaining ones (not stale reads of already-cancelled keys)
                         for sl in remaining_sls:
                             if not sl.get("key_hex"):
                                 continue
@@ -2204,32 +2697,19 @@ class GMXBot:
                                         _open_mod.wait_receipt(self.w3, txh)
                                     return txh
                                 await asyncio.to_thread(_retry_cancel)
+                                cancelled_keys.add(sl["key_hex"])
                             except Exception as e:
                                 self.logger.error(f"Retry cancel failed: {e}")
-
-                        # Final check
-                        await asyncio.sleep(3)
-                        final_orders = await asyncio.to_thread(
-                            fetch_open_orders, self.w3, pos_acct.address
-                        )
-                        still_remaining = [
-                            o for o in final_orders
-                            if o["market"].lower() == market_lower
-                            and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
-                        ]
-                        if still_remaining:
-                            self.logger.error(
-                                f"move_sl: {len(still_remaining)} old SL(s) STILL exist! "
-                                f"Aborting new SL to avoid duplicates."
-                            )
-                            await self.notify(
-                                f"⚠️ Could not remove old SL for {pos.symbol} after retries. "
-                                f"New SL NOT placed. Manual cleanup needed."
-                            )
-                            return
                 except Exception as e:
                     self.logger.warning(f"move_sl: verification fetch failed: {e}")
-                    # Continue anyway — cancellation TXs were confirmed via receipts
+                    # Continue — cancel TXs were confirmed via receipts
+
+            # If all original cancel TXs had successful receipts, proceed regardless
+            # of what the event-log-based order fetch shows (it can lag)
+            if all_receipts_ok:
+                self.logger.info(
+                    f"move_sl: all {cancelled_count} cancel TX(s) confirmed via receipts — proceeding"
+                )
 
             # Fetch remaining position size from chain for the new SL
             try:
@@ -2258,30 +2738,101 @@ class GMXBot:
             order_vault = Web3.to_checksum_address(GMX_V2_ORDER_VAULT)
             collateral_token = Web3.to_checksum_address(GMX_V2_COLLATERAL_TOKEN)
 
-            txh = await asyncio.to_thread(
-                create_sl_order,
-                self.w3,
-                pos_acct,
-                exchange,
-                pos_acct.address,
-                pos.market_addr,
-                collateral_token,
-                order_vault,
-                new_sl_price,
-                remaining_size_usd,
-                pos.symbol,
-                is_long,
-                SLIPPAGE_BPS,
-                EXECUTION_FEE_WEI,
-                DRY_RUN,
-            )
+            # Place new SL — if this fails, try to restore old SL at previous price
+            old_sl_price = pos.stop_loss  # save current SL price for fallback
+            try:
+                txh = await asyncio.to_thread(
+                    create_sl_order,
+                    self.w3,
+                    pos_acct,
+                    exchange,
+                    pos_acct.address,
+                    pos.market_addr,
+                    collateral_token,
+                    order_vault,
+                    new_sl_price,
+                    remaining_size_usd,
+                    pos.symbol,
+                    is_long,
+                    SLIPPAGE_BPS,
+                    EXECUTION_FEE_WEI,
+                    DRY_RUN,
+                )
+            except Exception as place_err:
+                self.logger.error(
+                    f"Failed to place new SL at ${new_sl_price:,.2f}: {place_err}"
+                )
+                # CRITICAL: we cancelled old SL but failed to place new one.
+                # Try to restore SL at the old price so position isn't unprotected.
+                if old_sl_price and old_sl_price > 0:
+                    self.logger.info(
+                        f"Attempting to restore SL at old price ${old_sl_price:,.2f}..."
+                    )
+                    try:
+                        restore_txh = await asyncio.to_thread(
+                            create_sl_order,
+                            self.w3, pos_acct, exchange, pos_acct.address,
+                            pos.market_addr, collateral_token, order_vault,
+                            old_sl_price, remaining_size_usd, pos.symbol, is_long,
+                            SLIPPAGE_BPS, EXECUTION_FEE_WEI, DRY_RUN,
+                        )
+                        self.logger.info(f"Restored old SL at ${old_sl_price:,.2f}: {restore_txh}")
+                        await self.notify(
+                            f"⚠️ Failed to move SL to {sl_label} for {pos.symbol}. "
+                            f"Restored SL at ${old_sl_price:,.2f}."
+                        )
+                    except Exception as restore_err:
+                        self.logger.error(f"CRITICAL: Could not restore old SL either: {restore_err}")
+                        pos.sl_move_failed = True
+                        await self.notify(
+                            f"🚨 {pos.symbol} {pos.side} HAS NO STOP LOSS!\n"
+                            f"Failed to place new SL AND failed to restore old one.\n"
+                            f"Use /addorder sl to set one immediately!"
+                        )
+                else:
+                    pos.sl_move_failed = True
+                    await self.notify(
+                        f"🚨 {pos.symbol} {pos.side} HAS NO STOP LOSS!\n"
+                        f"Failed to place SL at {sl_label} (${new_sl_price:,.2f}).\n"
+                        f"Use /addorder sl to set one immediately!"
+                    )
+                return
 
             pos.stop_loss = new_sl_price
             pos.sl_moved_to_entry = True
+            pos.sl_move_label = sl_label  # "Entry", "TP1", "TP2", etc.
+
+            # Fetch the new SL's order key so we can protect it from accidental cancellation
+            if not DRY_RUN:
+                await asyncio.sleep(3)
+                try:
+                    new_orders = await asyncio.to_thread(
+                        fetch_open_orders, self.w3, pos_acct.address
+                    )
+                    new_sl_orders = [
+                        o for o in new_orders
+                        if o["market"].lower() == market_lower
+                        and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                        and o.get("key_hex")
+                        and o["key_hex"] not in cancelled_keys
+                    ]
+                    if new_sl_orders:
+                        pos.current_sl_key = new_sl_orders[0]["key_hex"]
+                        self.logger.info(
+                            f"Stored new SL key: 0x{pos.current_sl_key[:16]}..."
+                        )
+                    else:
+                        self.logger.warning("Could not find new SL order key — may have been executed already")
+                except Exception as e:
+                    self.logger.debug(f"Could not fetch new SL key: {e}")
 
             self.logger.info(
                 f"SL moved to {sl_label} ${new_sl_price:,.2f} for {pos.symbol} {pos.side} "
                 f"size=${remaining_size_usd:,.2f} tx={txh}"
+            )
+
+            await self.notify(
+                f"✅ SL placed at {sl_label} (${new_sl_price:,.2f}) for {pos.symbol} {pos.side}"
             )
 
         except Exception as e:
@@ -2379,6 +2930,11 @@ class GMXBot:
             elif cmd == "/addorder":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_addorder(chat_id, arg)
+            elif cmd == "/topup":
+                arg = " ".join(parts[1:]) if len(parts) > 1 else None
+                await self.cmd_topup(chat_id, arg)
+            elif cmd == "/prices":
+                await self.cmd_prices(chat_id)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -2405,6 +2961,8 @@ class GMXBot:
 /increase — Add collateral to an open position
 /cancelorder — List & cancel individual SL/TP orders by number
 /addorder — Manually add a SL or TP to an open position
+/prices — Live GMX & Chainlink prices for all tracked assets
+/topup — Manual ETH top-up (swap USDC → ETH for gas)
 /balance-wallets — Manually rebalance USDC between wallets
 /lastmsg — Print last message from monitored channel(s)
 /health — System health
@@ -2480,7 +3038,22 @@ class GMXBot:
             msg += f"**Positions ({len(positions)})**\n"
             for i, pos in enumerate(positions, 1):
                 side = "LONG" if pos.is_long else "SHORT"
-                pnl_icon = "+" if pos.unrealized_pnl >= 0 else ""
+
+                # Use GMX Reader current_price from the chain position data
+                display_price = pos.current_price
+
+                # Recalculate PnL with fresh GMX price
+                if display_price and pos.entry_price:
+                    if pos.is_long:
+                        price_diff = display_price - pos.entry_price
+                    else:
+                        price_diff = pos.entry_price - display_price
+                    pnl = (price_diff / pos.entry_price) * pos.size_usd
+                    pnl_pct = (pnl / pos.collateral_amount) * 100 if pos.collateral_amount else 0
+                else:
+                    pnl = pos.unrealized_pnl
+                    pnl_pct = pos.pnl_percentage
+                pnl_icon = "+" if pnl >= 0 else ""
 
                 # Orders tied to this position (same market)
                 pos_orders = [
@@ -2503,9 +3076,10 @@ class GMXBot:
                 msg += (
                     f"\n**#{i} {pos.symbol} {side}{wid_label}**\n"
                     f"  Size:    ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
+                    f"  Collateral: ${pos.collateral_amount:,.2f}\n"
                     f"  Entry:   ${pos.entry_price:,.2f}\n"
-                    f"  Current: ${pos.current_price:,.2f}\n"
-                    f"  PnL:     {pnl_icon}${pos.unrealized_pnl:.2f} ({pnl_icon}{pos.pnl_percentage:.1f}%)\n"
+                    f"  Current: ${display_price:,.2f}\n"
+                    f"  PnL:     {pnl_icon}${pnl:.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
                 )
 
                 if sl_orders or tp_orders:
@@ -2799,6 +3373,75 @@ class GMXBot:
         elif text_upper in ("NO", "N", "CANCEL"):
             del self.pending_closes[chat_id]
             await self.send_message(chat_id, "Close cancelled.")
+
+    async def cmd_prices(self, chat_id: int):
+        """Show live prices from GMX Reader and Chainlink for all tracked assets."""
+        try:
+            lines = ["**Live Prices**\n"]
+
+            # ── GMX Reader prices (from open positions) ──
+            gmx_prices = {}
+            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
+            for acct in all_wallets:
+                try:
+                    positions = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    for cp in positions:
+                        sym = cp.symbol.upper().split("/")[0]
+                        if cp.current_price and cp.current_price > 0:
+                            gmx_prices[sym] = cp.current_price
+                except Exception:
+                    pass
+
+            # ── Chainlink prices for all tracked feeds ──
+            chainlink_prices = {}
+            for symbol in CHAINLINK_FEEDS:
+                try:
+                    price = await asyncio.to_thread(fetch_current_price, symbol, self.w3)
+                    if price and price > 0:
+                        chainlink_prices[symbol] = price
+                except Exception:
+                    pass
+
+            # ── Combine and display ──
+            all_symbols = sorted(set(list(gmx_prices.keys()) + list(chainlink_prices.keys())))
+
+            if not all_symbols:
+                await self.send_message(chat_id, "No prices available.")
+                return
+
+            for sym in all_symbols:
+                gmx_p = gmx_prices.get(sym)
+                cl_p = chainlink_prices.get(sym)
+
+                if gmx_p and cl_p:
+                    diff = abs(gmx_p - cl_p) / cl_p * 100
+                    diff_str = f" (Δ {diff:.2f}%)" if diff > 0.05 else ""
+                    lines.append(
+                        f"**{sym}**\n"
+                        f"  GMX: ${gmx_p:,.2f} | Chainlink: ${cl_p:,.2f}{diff_str}"
+                    )
+                elif gmx_p:
+                    lines.append(f"**{sym}**\n  GMX: ${gmx_p:,.2f}")
+                elif cl_p:
+                    lines.append(f"**{sym}**\n  Chainlink: ${cl_p:,.2f}")
+
+            # ── Cached prices (from price_cache) ──
+            cached_syms = [s for s in self.price_cache if s not in all_symbols]
+            if cached_syms:
+                lines.append("\n_Cached:_")
+                for sym in sorted(cached_syms):
+                    pd = self.price_cache[sym]
+                    age = pd.age_seconds
+                    age_str = f"{int(age)}s ago" if age < 120 else f"{int(age/60)}m ago"
+                    lines.append(f"  {sym}: ${pd.price:,.2f} ({age_str})")
+
+            await self.send_message(chat_id, "\n".join(lines))
+
+        except Exception as e:
+            self.logger.error(f"cmd_prices error: {e}")
+            await self.send_message(chat_id, f"Error fetching prices: {e}")
 
     async def cmd_balance(self, chat_id: int):
         """Show wallet balances and trade sizing (combined pool)."""
