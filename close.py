@@ -255,12 +255,52 @@ def sign_send(w3: Web3, acct: Account, tx: dict, dry_run: bool) -> str:
     log.info(f"Close transaction sent: {tx_hash}")
     return tx_hash
 
-def fetch_current_price(symbol_pair: str) -> float:
-    """Fetch current price from CoinGecko for better P&L display"""
+# Chainlink on-chain price feeds (Arbitrum) — same feeds GMX V2 uses
+CHAINLINK_FEEDS = {
+    "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
+    "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
+    "SOL":  "0x24ceA4b8ce57cdA5058b924B9B9987992450590c",
+    "LINK": "0x86E53CF1B870786351Da77A57575e79CB55812CB",
+}
+CHAINLINK_ABI = [
+    {"name": "latestRoundData", "type": "function", "stateMutability": "view",
+     "inputs": [],
+     "outputs": [{"name": "roundId", "type": "uint80"},
+                 {"name": "answer", "type": "int256"},
+                 {"name": "startedAt", "type": "uint256"},
+                 {"name": "updatedAt", "type": "uint256"},
+                 {"name": "answeredInRound", "type": "uint80"}]},
+    {"name": "decimals", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "uint8"}]},
+]
+_chainlink_decimals_cache_close: dict = {}
+
+
+def fetch_current_price(symbol_pair: str, w3=None) -> float:
+    """Fetch current price from Chainlink on-chain feeds (primary).
+    Falls back to CoinGecko only if Chainlink unavailable."""
+
+    # ── Primary: Chainlink on-chain ──
+    feed_addr = CHAINLINK_FEEDS.get(symbol_pair.upper())
+    if feed_addr and w3:
+        try:
+            feed = w3.eth.contract(
+                address=Web3.to_checksum_address(feed_addr), abi=CHAINLINK_ABI
+            )
+            result = feed.functions.latestRoundData().call()
+            if symbol_pair.upper() not in _chainlink_decimals_cache_close:
+                _chainlink_decimals_cache_close[symbol_pair.upper()] = feed.functions.decimals().call()
+            decimals = _chainlink_decimals_cache_close[symbol_pair.upper()]
+            price = result[1] / (10 ** decimals)
+            if price > 0:
+                return float(price)
+        except Exception as e:
+            log.warning(f"Chainlink price failed for {symbol_pair}: {e}")
+
+    # ── Fallback: CoinGecko ──
     coin_id = COINGECKO_IDS.get(symbol_pair)
     if not coin_id:
         return 0.0
-    
     try:
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -360,8 +400,8 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
 
         size_tokens = size_tokens_raw / (10 ** idx_dec) if size_tokens_raw > 0 else 0
 
-        # Get current price from CoinGecko; fall back to entry_price
-        current_price = fetch_current_price(symbol)
+        # Get current price from Chainlink; fall back to entry_price
+        current_price = fetch_current_price(symbol, w3=w3)
         if current_price == 0:
             current_price = entry_price  # fallback
 

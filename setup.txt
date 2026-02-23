@@ -1,2 +1,19 @@
+CREATE VENV ENVIRONMENT
 python3 -m venv .venv
 source .venv/bin/activate
+
+SSH INTO VPS & CHECK BOT STATUS
+ssh root@187.77.200.149
+sudo systemctl is-active gmxbot
+
+ADMIN CONTROLS
+sudo systemctl stop gmxbot
+sudo systemctl restart gmxbot
+
+UPDATE CODE
+sudo systemctl stop gmxbot
+su - gmxbot
+cd ~/apps/gmxbotv3
+git pull
+exit
+sudo systemctl start gmxbot

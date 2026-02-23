@@ -377,7 +377,7 @@ def parse_signal(text: str) -> Signal:
     take_profits = []
     # Match patterns like: TP1: 48000 (50% close)  or  TP 1: 48000 50%
     tp_pattern = re.compile(
-        r'TP\s*(\d)?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
+        r'TP\s*(\d+)?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
         r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
         re.IGNORECASE
     )
@@ -414,10 +414,15 @@ def parse_signal(text: str) -> Signal:
     # The last TP always absorbs any rounding remainder so the total
     # is exactly 1.0 — no dust position left behind.
     DEFAULT_TP_DISTRIBUTIONS = {
-        2: [0.33, 0.67],
-        3: [0.20, 0.50, 0.30],
-        4: [0.15, 0.30, 0.30, 0.25],
-        5: [0.10, 0.20, 0.30, 0.25, 0.15],
+        2:  [0.33, 0.67],
+        3:  [0.20, 0.50, 0.30],
+        4:  [0.15, 0.30, 0.30, 0.25],
+        5:  [0.10, 0.20, 0.30, 0.25, 0.15],
+        6:  [0.08, 0.15, 0.22, 0.22, 0.18, 0.15],
+        7:  [0.06, 0.12, 0.18, 0.20, 0.18, 0.14, 0.12],
+        8:  [0.05, 0.10, 0.15, 0.18, 0.17, 0.14, 0.11, 0.10],
+        9:  [0.04, 0.08, 0.12, 0.16, 0.16, 0.14, 0.12, 0.10, 0.08],
+        10: [0.04, 0.07, 0.10, 0.13, 0.15, 0.14, 0.12, 0.10, 0.08, 0.07],
     }
 
     if take_profits:
@@ -430,6 +435,13 @@ def parse_signal(text: str) -> Signal:
             dist = DEFAULT_TP_DISTRIBUTIONS[len(take_profits)]
             for tp, pct in zip(take_profits, dist):
                 tp.close_pct = pct
+        elif all_unspecified:
+            # More TPs than we have a preset for — use ascending weights
+            n = len(take_profits)
+            weights = list(range(1, n + 1))
+            total_w = sum(weights)
+            for tp, w in zip(take_profits, weights):
+                tp.close_pct = w / total_w
         elif unspecified:
             # Some explicit, some missing → split remaining evenly
             remaining = max(0, 1.0 - specified)
@@ -956,68 +968,75 @@ def cancel_orders_for_market(
     return cancelled
 
 
+# ── Chainlink on-chain price feeds (Arbitrum) ──
+# These are the same Chainlink feeds that underpin GMX V2's oracle.
+# Using on-chain reads avoids CoinGecko rate limits and price discrepancies.
+CHAINLINK_FEEDS = {
+    "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
+    "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
+    "SOL":  "0x24ceA4b8ce57cdA5058b924B9B9987992450590c",
+    "LINK": "0x86E53CF1B870786351Da77A57575e79CB55812CB",
+}
+CHAINLINK_ABI = [
+    {"name": "latestRoundData", "type": "function", "stateMutability": "view",
+     "inputs": [],
+     "outputs": [{"name": "roundId", "type": "uint80"},
+                 {"name": "answer", "type": "int256"},
+                 {"name": "startedAt", "type": "uint256"},
+                 {"name": "updatedAt", "type": "uint256"},
+                 {"name": "answeredInRound", "type": "uint80"}]},
+    {"name": "decimals", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"type": "uint8"}]},
+]
+
+# Cache decimals per feed so we don't make an extra RPC call every time
+_chainlink_decimals_cache: Dict[str, int] = {}
+
+
 def fetch_current_price(symbol: str, w3=None) -> float:
-    """Fetch current price from CoinGecko free API, with retry + Chainlink fallback."""
-    import time as _time
+    """Fetch current price from Chainlink on-chain feeds (primary).
+    Falls back to CoinGecko only if Chainlink is unavailable."""
 
-    # ── Try CoinGecko (with 1 retry after short wait) ──
-    coin_id = COINGECKO_IDS.get(symbol.upper())
-    if not coin_id:
-        raise ValueError(f"Unknown symbol '{symbol}'. Supported: "
-                         f"{', '.join(COINGECKO_IDS.keys())}")
+    symbol_upper = symbol.upper()
 
-    for attempt in range(2):
-        try:
-            url = (f"https://api.coingecko.com/api/v3/simple/price"
-                   f"?ids={coin_id}&vs_currencies=usd")
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            price = data[coin_id]["usd"]
-            log.debug(f"Fetched live price for {symbol}: ${price:,.2f}")
-            return float(price)
-        except Exception as e:
-            if attempt == 0:
-                log.debug(f"CoinGecko attempt {attempt+1} failed ({e}), retrying in 3s...")
-                _time.sleep(3)
-            else:
-                log.warning(f"CoinGecko failed after 2 attempts: {e}")
-
-    # ── Fallback: Chainlink on-chain price feed ──
-    CHAINLINK_FEEDS = {
-        "BTC":  "0x6ce185860a4963106506C203335A2910413708e9",
-        "ETH":  "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612",
-        "SOL":  "0x24ceA4b8ce57cdA5058b924B9B9987992450590c",
-        "LINK": "0x86E53CF1B870786351Da77A57575e79CB55812CB",
-    }
-    CHAINLINK_ABI = [
-        {"name": "latestRoundData", "type": "function", "stateMutability": "view",
-         "inputs": [],
-         "outputs": [{"name": "roundId", "type": "uint80"},
-                     {"name": "answer", "type": "int256"},
-                     {"name": "startedAt", "type": "uint256"},
-                     {"name": "updatedAt", "type": "uint256"},
-                     {"name": "answeredInRound", "type": "uint80"}]},
-        {"name": "decimals", "type": "function", "stateMutability": "view",
-         "inputs": [], "outputs": [{"type": "uint8"}]},
-    ]
-
-    feed_addr = CHAINLINK_FEEDS.get(symbol.upper())
+    # ── Primary: Chainlink on-chain price feed ──
+    feed_addr = CHAINLINK_FEEDS.get(symbol_upper)
     if feed_addr and w3:
         try:
             feed = w3.eth.contract(
                 address=Web3.to_checksum_address(feed_addr), abi=CHAINLINK_ABI
             )
             result = feed.functions.latestRoundData().call()
-            decimals = feed.functions.decimals().call()
+
+            if symbol_upper not in _chainlink_decimals_cache:
+                _chainlink_decimals_cache[symbol_upper] = feed.functions.decimals().call()
+            decimals = _chainlink_decimals_cache[symbol_upper]
+
             price = result[1] / (10 ** decimals)
             if price > 0:
-                log.info(f"Chainlink fallback price for {symbol}: ${price:,.2f}")
+                log.debug(f"Chainlink price for {symbol}: ${price:,.2f}")
                 return float(price)
         except Exception as e:
-            log.error(f"Chainlink fallback also failed for {symbol}: {e}")
+            log.warning(f"Chainlink price feed failed for {symbol}: {e}")
 
-    raise RuntimeError(f"Could not fetch price for {symbol} from CoinGecko or Chainlink")
+    # ── Fallback: CoinGecko (only if Chainlink unavailable) ──
+    coin_id = COINGECKO_IDS.get(symbol_upper)
+    if not coin_id:
+        raise ValueError(f"Unknown symbol '{symbol}'. Supported: "
+                         f"{', '.join(COINGECKO_IDS.keys())}")
+    try:
+        url = (f"https://api.coingecko.com/api/v3/simple/price"
+               f"?ids={coin_id}&vs_currencies=usd")
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        price = data[coin_id]["usd"]
+        log.info(f"CoinGecko fallback price for {symbol}: ${price:,.2f}")
+        return float(price)
+    except Exception as e:
+        log.warning(f"CoinGecko fallback also failed for {symbol}: {e}")
+
+    raise RuntimeError(f"Could not fetch price for {symbol} from Chainlink or CoinGecko")
 
 
 def fetch_positions(w3: Web3, wallet: str) -> list:
@@ -1480,11 +1499,15 @@ def execute_signal(
     market: str,
     collateral_token: str,
     size_usd: float,
+    collateral_usd: float,
     execution_fee: int,
     slippage_bps: int,
     dry_run: bool,
 ) -> Dict[str, Any]:
     """Execute a full signal: open position + place TP/SL orders.
+
+    collateral_usd is passed from the caller (25% of combined portfolio).
+    size_usd = collateral_usd * leverage.
 
     Returns dict with tx hashes for each order.
     """
@@ -1497,36 +1520,19 @@ def execute_signal(
         abi=EXCHANGE_ROUTER_ABI,
     )
 
-    collateral_usd = size_usd / signal.leverage
+    log.info(f"Collateral: ${collateral_usd:.2f}, Size: ${size_usd:.2f}, Leverage: {signal.leverage}x")
 
     # Fetch current price for entry validation
     current_price = fetch_current_price(signal.symbol, w3=w3)
     entry_price = signal.entry_mid
 
-    # Decide: MarketIncrease (immediate) vs LimitIncrease (wait for price)
-    # If current price is within the entry range → market order (fills now)
-    # If current price is outside range but within 10% → limit order (waits)
-    # If current price is >10% away → reject (too far, handled by caller)
+    # Always use MarketIncrease (immediate fill at current price).
+    # This avoids limit-order edge cases where unfilled orders get
+    # misinterpreted as closed positions by the monitoring loop.
     use_limit = False
-    if signal.entry_low <= current_price <= signal.entry_high:
-        entry_price = current_price
-        log.info(f"Current price ${current_price:,.2f} is within entry range "
-                 f"[${signal.entry_low:,.2f} - ${signal.entry_high:,.2f}] → MARKET order")
-    else:
-        deviation = abs(current_price - entry_price) / entry_price
-        if deviation <= 0.10:
-            use_limit = True
-            log.info(
-                f"Current price ${current_price:,.2f} is OUTSIDE entry range "
-                f"[${signal.entry_low:,.2f} - ${signal.entry_high:,.2f}] "
-                f"but within 10% ({deviation:.1%}) → LIMIT order at ${entry_price:,.2f}"
-            )
-        else:
-            log.warning(
-                f"Current price ${current_price:,.2f} is OUTSIDE entry range "
-                f"[${signal.entry_low:,.2f} - ${signal.entry_high:,.2f}] "
-                f"and beyond 10% ({deviation:.1%}). Using market order at midpoint."
-            )
+    entry_price = current_price
+    log.info(f"Current price ${current_price:,.2f} (signal entry: "
+             f"[${signal.entry_low:,.2f} - ${signal.entry_high:,.2f}]) → MARKET order")
 
     results = {"open": None, "tp": [], "sl": None, "order_type": "limit" if use_limit else "market"}
 

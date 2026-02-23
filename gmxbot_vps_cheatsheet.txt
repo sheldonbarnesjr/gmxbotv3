@@ -1,0 +1,182 @@
+GMXBot VPS Cheat Sheet (SSH, Start/Stop, Update)
+
+IMPORTANT
+- If you run: `python3 gmx.py` in your SSH session, the bot stops when you close the terminal.
+- To keep it running 24/7 after you close your terminal, run it as a systemd service.
+
+========================
+1) SSH INTO THE VPS
+========================
+From your Mac:
+  ssh root@187.77.200.149
+
+(Optional) If you want to log in directly as the bot user (only if configured):
+  ssh gmxbot@187.77.200.149
+
+========================
+2) SWITCH TO BOT USER
+========================
+After logging in as root:
+  su - gmxbot
+
+Confirm:
+  whoami
+  pwd
+
+========================
+3) GO TO THE BOT FOLDER
+========================
+  cd ~/apps/gmxbotv3
+  ls -la
+
+========================
+4) FOREGROUND RUN (NOT 24/7)
+========================
+Activate venv:
+  source .venv/bin/activate
+
+Run:
+  python3 gmx.py
+
+Stop (foreground):
+  Ctrl + C
+
+Deactivate venv:
+  deactivate
+
+========================
+5) 24/7 RUNNING WITH systemd (RECOMMENDED)
+========================
+
+A) Create the service file (do this as root)
+1) If you are currently gmxbot, go back to root:
+   exit
+
+2) Create/edit service:
+   sudo nano /etc/systemd/system/gmxbot.service
+
+3) Paste this (edit paths ONLY if your folder/name differs):
+   [Unit]
+   Description=GMX V2 Telegram Trading Bot
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=gmxbot
+   WorkingDirectory=/home/gmxbot/apps/gmxbotv3
+   EnvironmentFile=/home/gmxbot/apps/gmxbotv3/.env
+   ExecStart=/home/gmxbot/apps/gmxbotv3/.venv/bin/python /home/gmxbot/apps/gmxbotv3/gmx.py
+   Restart=always
+   RestartSec=3
+   StandardOutput=journal
+   StandardError=journal
+
+   [Install]
+   WantedBy=multi-user.target
+
+4) Save/exit nano:
+   Ctrl+O, Enter, Ctrl+X
+
+B) Enable + start
+  sudo systemctl daemon-reload
+  sudo systemctl enable gmxbot
+  sudo systemctl start gmxbot
+
+C) Check status
+  sudo systemctl status gmxbot --no-pager
+
+D) View logs (live)
+  sudo journalctl -u gmxbot -f
+
+========================
+6) STOP / START / RESTART THE BOT (systemd)
+========================
+Stop:
+  sudo systemctl stop gmxbot
+
+Start:
+  sudo systemctl start gmxbot
+
+Restart (use this after code/env changes):
+  sudo systemctl restart gmxbot
+
+Disable autostart on reboot:
+  sudo systemctl disable gmxbot
+
+Enable autostart on reboot:
+  sudo systemctl enable gmxbot
+
+========================
+7) MAKE CODE CHANGES + DEPLOY UPDATES
+========================
+
+A) If your repo is cloned: use git pull
+1) Stop or restart safely:
+   sudo systemctl stop gmxbot
+   # or just restart after updating
+
+2) Switch to bot user:
+   su - gmxbot
+   cd ~/apps/gmxbotv3
+
+3) Pull updates:
+   git pull
+
+4) If you changed Python deps, install them:
+   source .venv/bin/activate
+   pip install -U pip
+   # if you have requirements.txt:
+   pip install -r requirements.txt
+   deactivate
+
+5) Start again (back to root):
+   exit
+   sudo systemctl start gmxbot
+   # or:
+   sudo systemctl restart gmxbot
+
+B) “Reclone” the repo (usually not needed)
+- Prefer `git pull`. Re-cloning is only needed if the repo folder is broken.
+- If you MUST reclone:
+  sudo systemctl stop gmxbot
+  su - gmxbot
+  cd ~/apps
+  mv gmxbotv3 gmxbotv3_backup_$(date +%F_%H%M)
+  git clone git@github.com:sheldonbarnesjr/gmxbotv3.git
+  cd gmxbotv3
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -U pip
+  # install deps you used previously (example):
+  pip install telethon python-dotenv web3 requests aiohttp
+  deactivate
+  exit
+  sudo systemctl start gmxbot
+
+========================
+8) EDIT ENV / SECRETS
+========================
+Edit .env (as root):
+  sudo nano /home/gmxbot/apps/gmxbotv3/.env
+Lock it down:
+  sudo chmod 600 /home/gmxbot/apps/gmxbotv3/.env
+  sudo chown gmxbot:gmxbot /home/gmxbot/apps/gmxbotv3/.env
+
+========================
+9) QUICK HEALTH CHECKS
+========================
+Is service running?
+  sudo systemctl is-active gmxbot
+
+Last 200 log lines:
+  sudo journalctl -u gmxbot -n 200 --no-pager
+
+Where are we?
+  whoami && pwd && ls -la
+
+========================
+10) ANSWER TO YOUR QUESTION
+========================
+- If you set up systemd (Section 5), YES: you can close your local terminal and the bot keeps running.
+- If you are running it manually in SSH (Section 4), NO: closing the terminal stops it.
