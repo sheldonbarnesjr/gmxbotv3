@@ -245,6 +245,7 @@ READER_ABI = [
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GMX_V2_READER = "0xf60becbba223EEA9495Da3f606753867eC10d139"
 GMX_V2_DATASTORE = "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8"
+GMX_V2_EVENT_EMITTER = "0xC8ee91A54287DB53897056e12D9819156D3822Fb"
 
 # GMX V2 OrderType enum
 ORDER_TYPE_MARKET_SWAP = 0
@@ -301,6 +302,8 @@ class Signal:
     stop_loss: float
     leverage: float
     raw_text: str = ""
+    trade_type: str = "scalp"  # "swing" or "scalp"
+    swing_keyword_match: bool = False  # True only if classified via explicit keyword
 
     @property
     def is_long(self) -> bool:
@@ -309,6 +312,150 @@ class Signal:
     @property
     def entry_mid(self) -> float:
         return (self.entry_low + self.entry_high) / 2
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Signal Classifier — Swing vs Scalp
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Keywords configurable via env — comma-separated
+_SWING_KEYWORDS_RAW = os.getenv(
+    "SWING_KEYWORDS",
+    "swing,long term,long-term,hold,htf,weekly,daily,position trade,macro,mid term,mid-term,spot"
+)
+_SCALP_KEYWORDS_RAW = os.getenv(
+    "SCALP_KEYWORDS",
+    "scalp,intraday,day trade,quick,ltf,15m,5m,1h,sniper,short term,short-term"
+)
+SWING_KEYWORDS = [k.strip().lower() for k in _SWING_KEYWORDS_RAW.split(",") if k.strip()]
+SCALP_KEYWORDS = [k.strip().lower() for k in _SCALP_KEYWORDS_RAW.split(",") if k.strip()]
+
+# Heuristic thresholds (configurable via env)
+SWING_MAX_LEVERAGE = float(os.getenv("SWING_MAX_LEVERAGE", "5"))       # ≤ 5x → swing
+SCALP_MIN_LEVERAGE = float(os.getenv("SCALP_MIN_LEVERAGE", "10"))      # ≥ 10x → scalp
+SWING_MIN_SL_DIST_PCT = float(os.getenv("SWING_MIN_SL_DIST_PCT", "3"))  # SL > 3% from entry → swing
+
+
+def classify_signal(signal: 'Signal') -> str:
+    """Classify a signal as 'swing' or 'scalp' based on keywords and heuristics.
+
+    Priority:
+      1. Explicit keywords in the raw text (swing/scalp/long term/etc.)
+      2. Leverage + SL distance heuristic
+      3. Default: 'scalp'
+
+    Also sets signal.swing_keyword_match = True when classification is
+    based on an explicit swing keyword (not heuristic).
+    """
+    txt = signal.raw_text.lower()
+
+    # Check for swing keywords first
+    for kw in SWING_KEYWORDS:
+        if kw in txt:
+            signal.swing_keyword_match = True
+            return "swing"
+
+    # Check for scalp keywords
+    for kw in SCALP_KEYWORDS:
+        if kw in txt:
+            signal.swing_keyword_match = False
+            return "scalp"
+
+    # Heuristic: leverage + SL distance from entry
+    entry = signal.entry_mid
+    if entry > 0 and signal.stop_loss > 0:
+        sl_dist_pct = abs(entry - signal.stop_loss) / entry * 100
+
+        # Low leverage + wide SL → swing (heuristic, NOT keyword match)
+        if signal.leverage <= SWING_MAX_LEVERAGE and sl_dist_pct >= SWING_MIN_SL_DIST_PCT:
+            signal.swing_keyword_match = False
+            return "swing"
+
+        # High leverage OR tight SL → scalp
+        if signal.leverage >= SCALP_MIN_LEVERAGE or sl_dist_pct < 2.0:
+            return "scalp"
+
+    # Default to scalp
+    return "scalp"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TP Percentage Override from .env — Per TP-Count Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Each TP count (2-8) has its own set of percentages:
+#   TP_2_1, TP_2_2                         → when signal has 2 TPs
+#   TP_3_1, TP_3_2, TP_3_3                 → when signal has 3 TPs
+#   TP_4_1, TP_4_2, TP_4_3, TP_4_4         → when signal has 4 TPs
+#   ...
+#   TP_8_1, TP_8_2, ..., TP_8_8            → when signal has 8 TPs
+#
+# Values are 0-100 (percentages). Must sum to 100.
+# Set all to 0 for a given count to use the signal's own distribution.
+
+def _load_env_tp_dist(n_tps: int, prefix: str = "TP") -> List[float]:
+    """Load {prefix}_{n}_{1..n} from .env for a specific TP count.
+    Returns list of floats in 0-1 scale, or empty list if not configured.
+
+    prefix="TP"       → reads TP_4_1, TP_4_2, ...  (scalp)
+    prefix="SWING_TP" → reads SWING_TP_4_1, SWING_TP_4_2, ...  (swing)
+    """
+    if n_tps < 2 or n_tps > 8:
+        return []
+
+    pcts = []
+    for i in range(1, n_tps + 1):
+        val = os.getenv(f"{prefix}_{n_tps}_{i}", "0")
+        try:
+            pcts.append(float(val) / 100.0)
+        except (ValueError, TypeError):
+            pcts.append(0.0)
+    return pcts
+
+
+def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
+                      swing_keyword_match: bool = False) -> List[TakeProfit]:
+    """Apply .env TP percentage overrides based on trade type.
+
+    Each TP count (2-8) has its own separate distribution in .env:
+      TP_3_1=30, TP_3_2=40, TP_3_3=30        → scalp 3 TPs: 30% / 40% / 30%
+      SWING_TP_3_1=30, SWING_TP_3_2=40, ...   → swing 3 TPs: 30% / 40% / 30%
+
+    - For scalp trades: TP_* env percentages override signal percentages
+    - For swing trades with explicit keyword match: SWING_TP_* env percentages
+    - For swing trades via heuristic only: scalp TP_* splits are used
+      (heuristic swings aren't confident enough to use swing splits)
+    """
+    n_tps = len(take_profits)
+    if n_tps < 2:
+        # 0 or 1 TPs — nothing to distribute
+        return take_profits
+
+    # Pick the right env prefix based on trade type + keyword confidence
+    if trade_type == "swing" and swing_keyword_match:
+        env_pcts = _load_env_tp_dist(n_tps, prefix="SWING_TP")
+    else:
+        # Scalp trades AND heuristic-only swings both use the scalp splits
+        env_pcts = _load_env_tp_dist(n_tps, prefix="TP")
+
+    # If not configured (all zeros or empty), keep signal defaults
+    if not env_pcts or all(p == 0 for p in env_pcts):
+        return take_profits
+
+    # Normalize: make sure they sum to 1.0
+    total = sum(env_pcts)
+    if total <= 0:
+        return take_profits
+
+    for i, tp in enumerate(take_profits):
+        tp.close_pct = env_pcts[i] / total  # normalize to sum to 1.0
+
+    # Final fix: ensure exact 1.0 total (absorb rounding into last TP)
+    actual_total = sum(tp.close_pct for tp in take_profits)
+    if take_profits and abs(actual_total - 1.0) > 0.001:
+        take_profits[-1].close_pct += 1.0 - actual_total
+
+    return take_profits
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -481,7 +628,7 @@ def parse_signal(text: str) -> Signal:
             )
         leverage = float(lev_match.group(1)) if lev_match else 2.0
 
-    return Signal(
+    signal = Signal(
         symbol=symbol,
         side=side,
         entry_low=entry_low,
@@ -491,6 +638,17 @@ def parse_signal(text: str) -> Signal:
         leverage=leverage,
         raw_text=txt,
     )
+
+    # Classify as swing or scalp
+    signal.trade_type = classify_signal(signal)
+
+    # Apply .env TP percentage overrides
+    # Swing keyword matches → SWING_TP_* splits; everything else → TP_* splits
+    signal.take_profits = apply_env_tp_pcts(
+        signal.take_profits, signal.trade_type, signal.swing_keyword_match
+    )
+
+    return signal
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -585,7 +743,6 @@ def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int
     Validates each key with cancelOrder gas estimate to confirm it's still active.
     Returns list of bytes objects (each 32 bytes).
     """
-    EVENT_EMITTER = "0xC8ee91A54287DB53897056e12D9819156D3822Fb"
     ORDER_CREATED_TOPIC = "0x468a25a7ba624ceea6e540ad6f49171b52495b648417ae91bca21676d8a24dc5"
     EXCHANGE_ROUTER = os.getenv("GMX_V2_EXCHANGE_ROUTER", "").strip()
 
@@ -605,7 +762,7 @@ def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int
     current = w3.eth.block_number
     try:
         logs = w3.eth.get_logs({
-            "address": EVENT_EMITTER,
+            "address": GMX_V2_EVENT_EMITTER,
             "fromBlock": max(0, current - lookback_blocks),
             "toBlock": current,
             "topics": [ORDER_CREATED_TOPIC, None, None, wallet_topic],
@@ -737,7 +894,7 @@ def fetch_execution_price(
     Returns:
         The execution price as a float (USD), or None if not found.
     """
-    emitter_addr = Web3.to_checksum_address(EVENT_EMITTER)
+    emitter_addr = Web3.to_checksum_address(GMX_V2_EVENT_EMITTER)
 
     # Pad addresses to 32 bytes for topic matching
     wallet_topic = "0x" + "0" * 24 + wallet_addr.lower().replace("0x", "")
@@ -2008,7 +2165,7 @@ if __name__ == "__main__":
         eth_bal = w3.eth.get_balance(acct.address)
         if eth_bal < total_fee:
             raise SystemExit(
-                f"Insufficient ETH for execution fees. "
+                "Insufficient ETH for execution fees. "
                 f"Need {total_fee / 10**18:.4f} ETH for {num_orders} orders, "
                 f"have {eth_bal / 10**18:.6f} ETH"
             )

@@ -20,7 +20,6 @@ import time
 import uuid
 import asyncio
 import logging
-import importlib
 import statistics
 import traceback
 from datetime import datetime, timedelta
@@ -41,30 +40,33 @@ from eth_account import Account
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # IMPORT REAL EXECUTION FROM open.py AND close.py
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# "open" is a Python builtin, so we use importlib to import the module
-_open_mod = importlib.import_module("open")
+# "open" shadows the Python builtin — alias it so the IDE can resolve symbols
+import open as _open_mod  # type: ignore[assignment]  # noqa: A004
 
 # From open.py — signal parsing & execution
-parse_signal = _open_mod.parse_signal
-Signal = _open_mod.Signal
-TakeProfit = _open_mod.TakeProfit
-execute_signal = _open_mod.execute_signal
-create_market_increase_order = _open_mod.create_market_increase_order
-create_limit_increase_order = _open_mod.create_limit_increase_order
-create_sl_order = _open_mod.create_sl_order
-create_tp_order = _open_mod.create_tp_order
-fetch_current_price = _open_mod.fetch_current_price
-cancel_orders_for_market = _open_mod.cancel_orders_for_market
-cancel_all_orders = _open_mod.cancel_all_orders
-fetch_open_orders = _open_mod.fetch_open_orders
-scale_price = _open_mod.scale_price
-fetch_execution_price = _open_mod.fetch_execution_price
-COINGECKO_IDS = _open_mod.COINGECKO_IDS
-INDEX_TOKEN_DECIMALS = _open_mod.INDEX_TOKEN_DECIMALS
-ERC20_ABI = _open_mod.ERC20_ABI
-EXCHANGE_ROUTER_ABI = _open_mod.EXCHANGE_ROUTER_ABI
-ORDER_TYPE_STOP_LOSS_DECREASE = _open_mod.ORDER_TYPE_STOP_LOSS_DECREASE
-ORDER_TYPE_LIMIT_DECREASE = _open_mod.ORDER_TYPE_LIMIT_DECREASE
+from open import (  # type: ignore[assignment]  # noqa: A004
+    parse_signal,
+    Signal,
+    TakeProfit,
+    execute_signal,
+    create_market_increase_order,
+    create_limit_increase_order,
+    create_sl_order,
+    create_tp_order,
+    fetch_current_price,
+    cancel_orders_for_market,
+    cancel_all_orders,
+    fetch_open_orders,
+    scale_price,
+    fetch_execution_price,
+    classify_signal,
+    COINGECKO_IDS,
+    INDEX_TOKEN_DECIMALS,
+    ERC20_ABI,
+    EXCHANGE_ROUTER_ABI,
+    ORDER_TYPE_STOP_LOSS_DECREASE,
+    ORDER_TYPE_LIMIT_DECREASE,
+)
 
 # From close.py — position fetching & closing
 from close import (
@@ -91,6 +93,8 @@ ADMIN_USERNAMES = [u.strip().lstrip("@").lower() for u in os.getenv("ADMIN_USERN
 NETWORK = os.getenv("NETWORK", "arbitrum").lower()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 PRIVATE_KEY_2 = os.getenv("PRIVATE_KEY_2", "")
+PRIVATE_KEY_3 = os.getenv("PRIVATE_KEY_3", "")
+PRIVATE_KEY_4 = os.getenv("PRIVATE_KEY_4", "")
 RPC_URL = os.getenv("ARBITRUM_RPC_URL") or os.getenv("RPC_URL", "https://arb1.arbitrum.io/rpc")
 
 # GMX V2 addresses
@@ -134,7 +138,7 @@ CHAINLINK_ABI = [
 MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "10"))
 MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "50000"))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", "2"))
-PORTFOLIO_PCT = float(os.getenv("PORTFOLIO_PCT", "0.25"))  # 25% of portfolio per trade
+PORTFOLIO_PCT = float(os.getenv("PORTFOLIO_PCT", "0.20"))  # % of portfolio per trade (adjustable via /tradesize)
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "30"))
 EXECUTION_FEE_WEI = int(os.getenv("GMX_V2_EXECUTION_FEE_WEI", str(Web3.to_wei(0.0002, "ether"))))
 
@@ -192,7 +196,7 @@ class Position:
     sl_tx_hash: Optional[str] = None
     exit_reason: Optional[str] = None
 
-    # Which wallet this position belongs to (1 or 2)
+    # Which wallet this position belongs to (1=swing, 2-4=scalp)
     wallet_id: int = 1
 
     # On-chain tracking for TP-hit → move SL
@@ -269,7 +273,9 @@ class GMXBot:
         self.client: Optional[TelegramClient] = None
         self.w3: Optional[Web3] = None
         self.account: Optional[Account] = None
-        self.account2: Optional[Account] = None  # Second wallet for duplicate signals
+        self.account2: Optional[Account] = None
+        self.account3: Optional[Account] = None
+        self.account4: Optional[Account] = None
 
         # State
         self.positions: Dict[str, Position] = {}
@@ -440,14 +446,20 @@ class GMXBot:
         self.w3 = Web3(Web3.HTTPProvider(RPC_URL))
         if PRIVATE_KEY:
             self.account = Account.from_key(PRIVATE_KEY)
-            self.logger.info(f"Web3 on {NETWORK}, wallet 1: {self.account.address[:10]}...")
+            self.logger.info(f"Web3 on {NETWORK}, wallet 1 (swing): {self.account.address[:10]}...")
         else:
             self.logger.warning("No private key — read-only mode")
         if PRIVATE_KEY_2:
             self.account2 = Account.from_key(PRIVATE_KEY_2)
-            self.logger.info(f"Wallet 2: {self.account2.address[:10]}...")
+            self.logger.info(f"Wallet 2 (scalp): {self.account2.address[:10]}...")
         else:
             self.logger.info("No PRIVATE_KEY_2 — single wallet mode")
+        if PRIVATE_KEY_3:
+            self.account3 = Account.from_key(PRIVATE_KEY_3)
+            self.logger.info(f"Wallet 3 (scalp): {self.account3.address[:10]}...")
+        if PRIVATE_KEY_4:
+            self.account4 = Account.from_key(PRIVATE_KEY_4)
+            self.logger.info(f"Wallet 4 (scalp): {self.account4.address[:10]}...")
 
     async def _sync_on_chain_positions(self):
         """Scan on-chain positions for all wallets and add any that aren't
@@ -455,9 +467,7 @@ class GMXBot:
         opened manually or before a reboot."""
         MARKET_TO_SYMBOL = {v.lower(): k for k, v in GMX_V2_MARKETS.items()}
 
-        wallets = [(1, self.account)]
-        if self.account2:
-            wallets.append((2, self.account2))
+        wallets = self._all_wallets()
 
         synced = 0
         for wid, acct in wallets:
@@ -543,9 +553,9 @@ class GMXBot:
 
     async def _get_combined_usdc(self) -> float:
         """Get combined FREE USDC balance across all wallets (not deployed).
-        Both wallets act as one pool for sizing trades."""
+        All wallets act as one pool for sizing trades."""
         total_usdc = 0.0
-        all_wallets = [self.account] + ([self.account2] if self.account2 else [])
+        all_wallets = [acct for _, acct in self._all_wallets()]
         for acct in all_wallets:
             try:
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
@@ -558,14 +568,14 @@ class GMXBot:
         """Get total portfolio value: free USDC + deployed collateral + unrealized PnL.
 
         This gives the true account value including capital locked in open positions.
-        Used for position sizing so trades are 25% of TOTAL balance, not just free USDC.
+        Used for position sizing so trades are PORTFOLIO_PCT of TOTAL balance, not just free USDC.
         """
         # Free USDC across all wallets
         free_usdc = await self._get_combined_usdc()
 
         # Deployed collateral + PnL from on-chain positions
         deployed_value = 0.0
-        all_wallets = [self.account] + ([self.account2] if self.account2 else [])
+        all_wallets = [acct for _, acct in self._all_wallets()]
         for acct in all_wallets:
             try:
                 positions = await asyncio.to_thread(
@@ -584,9 +594,15 @@ class GMXBot:
         return total
 
     async def _rebalance_wallets(self):
-        """Send USDC from the richer wallet to the poorer one to equalize balances.
-        Called after positions open/close to keep wallets balanced."""
-        if not self.account2:
+        """Equalize USDC across all configured wallets (up to 4).
+
+        Calculates the average balance, then each wallet above average sends
+        its excess to the wallets below average. Handles 2, 3, or 4 wallets
+        in a single pass with multiple transfers if needed.
+
+        Called after positions open/close and hourly to keep wallets balanced."""
+        wallets = self._all_wallets()
+        if len(wallets) < 2:
             return  # Single wallet mode — nothing to balance
 
         if DRY_RUN:
@@ -594,102 +610,137 @@ class GMXBot:
             return
 
         try:
-            w1_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
-            w2_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
+            # Fetch balances for all wallets
+            balances = {}
+            for wid, acct in wallets:
+                bal = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+                balances[wid] = bal
 
-            diff = w1_usdc - w2_usdc
-            # Only rebalance if difference > $1 (avoid dust transfers)
-            if abs(diff) < 1.0:
-                self.logger.debug(
-                    f"Wallets balanced (W1: ${w1_usdc:.2f}, W2: ${w2_usdc:.2f}, diff: ${abs(diff):.2f})"
-                )
+            avg_bal = sum(balances.values()) / len(balances)
+
+            # Find wallets above and below average
+            above = {wid: bal - avg_bal for wid, bal in balances.items() if bal > avg_bal + 0.50}
+            below = {wid: avg_bal - bal for wid, bal in balances.items() if bal < avg_bal - 0.50}
+
+            if not above or not below:
+                bal_str = ", ".join(f"W{wid}: ${bal:.2f}" for wid, bal in balances.items())
+                self.logger.debug(f"Wallets balanced ({bal_str}, avg=${avg_bal:.2f})")
                 return
 
-            transfer_amount = abs(diff) / 2.0  # send half the difference
-            if diff > 0:
-                # W1 has more — send from W1 to W2
-                sender_acct = self.account
-                receiver_addr = self.account2.address
-                sender_label, receiver_label = "W1", "W2"
-            else:
-                # W2 has more — send from W2 to W1
-                sender_acct = self.account2
-                receiver_addr = self.account.address
-                sender_label, receiver_label = "W2", "W1"
+            bal_str = ", ".join(f"W{wid}: ${bal:.2f}" for wid, bal in balances.items())
+            self.logger.info(f"Rebalancing {len(wallets)} wallets (avg=${avg_bal:.2f}): {bal_str}")
 
-            self.logger.info(
-                f"Rebalancing: sending ${transfer_amount:.2f} USDC from {sender_label} to {receiver_label} "
-                f"(before: W1=${w1_usdc:.2f}, W2=${w2_usdc:.2f})"
-            )
-
-            # Build ERC20 transfer
             usdc_contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(GMX_V2_COLLATERAL_TOKEN),
                 abi=ERC20_ABI,
             )
             decimals = await asyncio.to_thread(lambda: usdc_contract.functions.decimals().call())
-            raw_amount = int(transfer_amount * (10 ** decimals))
 
-            # Encode transfer(address, uint256)
-            transfer_data = usdc_contract.encode_abi(
-                "transfer",
-                [Web3.to_checksum_address(receiver_addr), raw_amount],
-            )
+            # Build transfer pairs: from each above-avg wallet to below-avg wallets
+            transfers = []
+            above_list = sorted(above.items(), key=lambda x: x[1], reverse=True)
+            below_list = sorted(below.items(), key=lambda x: x[1], reverse=True)
 
-            tx_hash = await asyncio.to_thread(
-                self._send_tx,
-                GMX_V2_COLLATERAL_TOKEN,
-                transfer_data,
-                0,
-                sender_acct,
-            )
+            ai = 0  # index into above_list
+            bi = 0  # index into below_list
+            above_remaining = {wid: excess for wid, excess in above_list}
+            below_remaining = {wid: deficit for wid, deficit in below_list}
 
-            receipt = await asyncio.to_thread(_open_mod.wait_receipt, self.w3, tx_hash)
+            while ai < len(above_list) and bi < len(below_list):
+                sender_wid = above_list[ai][0]
+                receiver_wid = below_list[bi][0]
 
-            if receipt.get("status") == 1:
-                # Verify new balances
-                new_w1 = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
-                new_w2 = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
-                self.logger.info(
-                    f"Rebalance complete: W1=${new_w1:.2f}, W2=${new_w2:.2f} (TX: {tx_hash})"
+                send_amount = min(above_remaining[sender_wid], below_remaining[receiver_wid])
+
+                if send_amount >= 0.50:  # minimum $0.50 transfer to avoid dust
+                    transfers.append((sender_wid, receiver_wid, send_amount))
+
+                above_remaining[sender_wid] -= send_amount
+                below_remaining[receiver_wid] -= send_amount
+
+                if above_remaining[sender_wid] < 0.50:
+                    ai += 1
+                if below_remaining[receiver_wid] < 0.50:
+                    bi += 1
+
+            if not transfers:
+                self.logger.debug("No transfers needed after computing pairs")
+                return
+
+            # Execute transfers sequentially (each is a separate on-chain tx)
+            transfer_log = []
+            for sender_wid, receiver_wid, amount in transfers:
+                sender_acct = self._get_account(sender_wid)
+                receiver_acct = self._get_account(receiver_wid)
+                raw_amount = int(amount * (10 ** decimals))
+
+                transfer_data = usdc_contract.encode_abi(
+                    "transfer",
+                    [Web3.to_checksum_address(receiver_acct.address), raw_amount],
                 )
-                await self.notify(
-                    f"🔄 Wallets rebalanced\n"
-                    f"Sent ${transfer_amount:.2f} USDC: {sender_label} → {receiver_label}\n"
-                    f"W1: ${new_w1:.2f} | W2: ${new_w2:.2f}"
-                )
-            else:
-                self.logger.error(f"Rebalance tx reverted: {tx_hash}")
-                await self.notify(f"⚠️ Wallet rebalance failed (tx reverted): {tx_hash}")
+
+                try:
+                    tx_hash = await asyncio.to_thread(
+                        self._send_tx,
+                        GMX_V2_COLLATERAL_TOKEN,
+                        transfer_data,
+                        0,
+                        sender_acct,
+                    )
+                    receipt = await asyncio.to_thread(_open_mod.wait_receipt, self.w3, tx_hash)
+
+                    if receipt.get("status") == 1:
+                        transfer_log.append(f"W{sender_wid} → W{receiver_wid}: ${amount:.2f}")
+                        self.logger.info(
+                            f"Rebalance transfer OK: ${amount:.2f} W{sender_wid} → W{receiver_wid} (TX: {tx_hash})"
+                        )
+                    else:
+                        self.logger.error(f"Rebalance tx reverted: W{sender_wid} → W{receiver_wid} (TX: {tx_hash})")
+                        transfer_log.append(f"W{sender_wid} → W{receiver_wid}: FAILED")
+                except Exception as e:
+                    self.logger.error(f"Rebalance transfer error W{sender_wid} → W{receiver_wid}: {e}")
+                    transfer_log.append(f"W{sender_wid} → W{receiver_wid}: ERROR")
+
+            # Verify final balances
+            new_bals = {}
+            for wid, acct in wallets:
+                new_bals[wid] = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+            new_str = " | ".join(f"W{wid}: ${bal:.2f}" for wid, bal in new_bals.items())
+
+            self.logger.info(f"Rebalance complete: {new_str}")
+            await self.notify(
+                f"🔄 Wallets rebalanced ({len(transfers)} transfer(s))\n"
+                + "\n".join(transfer_log) + "\n"
+                + new_str
+            )
 
         except Exception as e:
             self.logger.error(f"Wallet rebalance error: {e}")
             # Don't notify on rebalance failure — it's not critical
-            # The bot will try again after the next trade
 
     async def rebalance_loop(self):
         """Check wallet balance every hour and auto-rebalance if needed."""
         while True:
             try:
                 await asyncio.sleep(3600)  # 1 hour
-                if not self.account2:
+                wallets = self._all_wallets()
+                if len(wallets) < 2:
                     continue
 
-                w1_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
-                w2_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
-                diff = abs(w1_usdc - w2_usdc)
+                bals = {}
+                for wid, acct in wallets:
+                    bals[wid] = await asyncio.to_thread(self._get_portfolio_value_for, acct)
 
+                max_bal = max(bals.values())
+                min_bal = min(bals.values())
+                diff = max_bal - min_bal
+
+                bal_str = ", ".join(f"W{wid}: ${bal:.2f}" for wid, bal in bals.items())
                 if diff > 1.0:
-                    self.logger.info(
-                        f"Hourly rebalance check: W1=${w1_usdc:.2f}, W2=${w2_usdc:.2f}, "
-                        f"diff=${diff:.2f} — rebalancing"
-                    )
+                    self.logger.info(f"Hourly rebalance check: {bal_str}, diff=${diff:.2f} — rebalancing")
                     await self._rebalance_wallets()
                 else:
-                    self.logger.debug(
-                        f"Hourly rebalance check: balanced "
-                        f"(W1=${w1_usdc:.2f}, W2=${w2_usdc:.2f}, diff=${diff:.2f})"
-                    )
+                    self.logger.debug(f"Hourly rebalance check: balanced ({bal_str})")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -705,8 +756,8 @@ class GMXBot:
             pos_count = 0
             wallet_lines = []
 
-            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
-            for i, acct in enumerate(all_wallets, 1):
+            wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
+            for wid, acct in self._all_wallets():
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
                 total_usdc += usdc
 
@@ -723,12 +774,13 @@ class GMXBot:
                 pos_count += n_pos
 
                 addr = f"{acct.address[:8]}...{acct.address[-6:]}"
-                wallet_lines.append(f"W{i}: {addr} — ${usdc:,.2f} USDC")
+                role = wallet_roles.get(wid, "scalp")
+                wallet_lines.append(f"W{wid} ({role}): {addr} — ${usdc:,.2f} USDC")
 
             collateral_per_trade = total_usdc * PORTFOLIO_PCT
 
             msg = (
-                f"🟢 **Bot Online**\n\n"
+                "🟢 **Bot Online**\n\n"
                 + "\n".join(wallet_lines) + "\n"
                 f"Network: {NETWORK.upper()}\n"
                 f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}\n\n"
@@ -807,22 +859,27 @@ class GMXBot:
                 self.logger.debug(f"Ignored signal for {signal.symbol} — not in allowed pairs (BTC/ETH/SOL)")
                 return
 
-            self.logger.info(f"Signal parsed: {signal.symbol} {signal.side}")
+            self.logger.info(f"Signal parsed: {signal.symbol} {signal.side} [{signal.trade_type}]")
 
             # Validation
             if not await self.validate_signal(signal):
                 return
 
-            # Pick wallet (prefer wallet 1, fallback to wallet 2 if same symbol is open)
-            # Queries on-chain positions to determine which wallet is available
-            wallet_id, acct = await self._pick_wallet(signal.symbol)
+            # Pick wallet based on trade type:
+            #   swing → W1 only
+            #   scalp → W2, W3, W4 (first available)
+            wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type)
             if not acct:
-                await self.notify(f"Rejected {signal.symbol} {signal.side}: all wallets have open positions")
+                await self.notify(
+                    f"Rejected {signal.symbol} {signal.side} [{signal.trade_type}]: "
+                    "no available wallets"
+                )
                 return
 
-            wallet_label = f" [W{wallet_id}]" if self.account2 else ""
+            wallet_label = f" [W{wallet_id}]" if len(self._all_wallets()) > 1 else ""
+            type_label = signal.trade_type.upper()
 
-            # Determine collateral = 25% of TOTAL portfolio (free USDC + deployed collateral + PnL)
+            # Determine collateral = PORTFOLIO_PCT of TOTAL portfolio (free USDC + deployed collateral + PnL)
             total_portfolio = await self._get_total_portfolio_value()
             free_usdc = await self._get_combined_usdc()
 
@@ -846,7 +903,7 @@ class GMXBot:
             # Notify that we're executing
             tp_list = ", ".join(f"${tp.price:,.0f} ({tp.close_pct:.0%})" for tp in signal.take_profits)
             await self.notify(
-                f"Executing {signal.symbol} {signal.side}{wallet_label}\n"
+                f"Executing {signal.symbol} {signal.side}{wallet_label} [{type_label}]\n"
                 f"Entry: ${signal.entry_low:,.0f}-${signal.entry_high:,.0f}\n"
                 f"TP: {tp_list}\n"
                 f"SL: ${signal.stop_loss:,.0f}\n"
@@ -898,13 +955,44 @@ class GMXBot:
             await self.notify(f"Error processing signal: {e}")
 
     def _get_account(self, wallet_id: int) -> Account:
-        """Get the Account object for a given wallet_id (1 or 2)."""
+        """Get the Account object for a given wallet_id (1-4)."""
+        if wallet_id == 4 and self.account4:
+            return self.account4
+        if wallet_id == 3 and self.account3:
+            return self.account3
         if wallet_id == 2 and self.account2:
             return self.account2
         return self.account
 
-    async def _pick_wallet(self, symbol: str) -> tuple:
-        """Pick which wallet to use for a new position.
+    def _all_wallets(self) -> List[tuple]:
+        """Return list of (wallet_id, account) for all configured wallets."""
+        wallets = [(1, self.account)]
+        if self.account2:
+            wallets.append((2, self.account2))
+        if self.account3:
+            wallets.append((3, self.account3))
+        if self.account4:
+            wallets.append((4, self.account4))
+        return wallets
+
+    def _scalp_wallets(self) -> List[tuple]:
+        """Return list of (wallet_id, account) for scalp wallets (W2-W4)."""
+        wallets = []
+        if self.account2:
+            wallets.append((2, self.account2))
+        if self.account3:
+            wallets.append((3, self.account3))
+        if self.account4:
+            wallets.append((4, self.account4))
+        return wallets
+
+    async def _pick_wallet(self, symbol: str, trade_type: str = "scalp") -> tuple:
+        """Pick which wallet to use for a new position based on trade type.
+
+        Routing logic:
+          - swing/long-term → W1 only
+          - scalp → W2, W3, W4 (first available without that symbol)
+
         Queries ON-CHAIN positions (not just internal tracking) so the bot
         is aware of positions opened manually or before a reboot.
         Returns (wallet_id, account) or (None, None) if all wallets busy."""
@@ -912,9 +1000,15 @@ class GMXBot:
         if not market_addr:
             return 1, self.account  # unknown symbol, default to W1
 
-        wallets = [(1, self.account)]
-        if self.account2:
-            wallets.append((2, self.account2))
+        if trade_type == "swing":
+            # Swing trades → only W1
+            wallets = [(1, self.account)]
+        else:
+            # Scalp trades → W2, W3, W4
+            wallets = self._scalp_wallets()
+            if not wallets:
+                # No scalp wallets configured, fall back to all wallets
+                wallets = self._all_wallets()
 
         for wid, acct in wallets:
             try:
@@ -926,7 +1020,7 @@ class GMXBot:
                 )
                 if not has_symbol:
                     self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) has no {symbol} position — selected"
+                        f"Wallet {wid} ({acct.address[:10]}...) has no {symbol} position — selected [{trade_type}]"
                     )
                     return wid, acct
                 else:
@@ -935,7 +1029,6 @@ class GMXBot:
                     )
             except Exception as e:
                 self.logger.warning(f"Failed to check wallet {wid} on-chain: {e}")
-                # If we can't check, skip this wallet to be safe
                 continue
 
         return None, None
@@ -1282,8 +1375,7 @@ class GMXBot:
         ]
 
         # Check and top up ALL wallets
-        all_wallets = [(1, self.account)] + ([(2, self.account2)] if self.account2 else [])
-        for wid, acct in all_wallets:
+        for wid, acct in self._all_wallets():
             await self._topup_eth_for_wallet(acct, f"W{wid}", UNISWAP_ROUTER, WETH_ARBITRUM, USDC_ARBITRUM, POOL_FEE, UNISWAP_ABI)
 
     async def _topup_eth_for_wallet(self, acct, label, UNISWAP_ROUTER, WETH_ARBITRUM, USDC_ARBITRUM, POOL_FEE, UNISWAP_ABI):
@@ -1381,6 +1473,8 @@ class GMXBot:
             /topup all      — top up all wallets with $5 USDC → ETH each
             /topup 1        — top up wallet 1 only
             /topup 2        — top up wallet 2 only
+            /topup 3        — top up wallet 3 only
+            /topup 4        — top up wallet 4 only
             /topup 1 10     — top up wallet 1 with $10 worth of USDC → ETH
             /topup all 15   — top up all wallets with $15 each
         """
@@ -1419,7 +1513,7 @@ class GMXBot:
             },
         ]
 
-        all_wallets = [(1, self.account)] + ([(2, self.account2)] if self.account2 else [])
+        all_wallets = self._all_wallets()
 
         # Get ETH price for display
         eth_price = await self.get_current_price("ETH")
@@ -1443,8 +1537,8 @@ class GMXBot:
                 except Exception as e:
                     lines.append(f"W{wid}: error fetching balance ({e})")
             lines.append(
-                f"\nUsage: /topup <1|2|all> [amount_usd]\n"
-                f"Default: $5 USDC → ETH"
+                "\nUsage: /topup <1|2|3|4|all> [amount_usd]\n"
+                "Default: $5 USDC → ETH"
             )
             await self.send_message(chat_id, "\n".join(lines))
             return
@@ -1458,7 +1552,7 @@ class GMXBot:
             try:
                 topup_usd = float(parts[1].replace("$", ""))
             except ValueError:
-                await self.send_message(chat_id, f"Invalid amount: {parts[1]}\nUsage: /topup <1|2|all> [amount_usd]")
+                await self.send_message(chat_id, f"Invalid amount: {parts[1]}\nUsage: /topup <1|2|3|4|all> [amount_usd]")
                 return
 
         if topup_usd < 1 or topup_usd > 100:
@@ -1466,17 +1560,22 @@ class GMXBot:
             return
 
         # Determine which wallets to top up
+        wallet_map = {
+            "1": (1, self.account), "w1": (1, self.account),
+            "2": (2, self.account2), "w2": (2, self.account2),
+            "3": (3, self.account3), "w3": (3, self.account3),
+            "4": (4, self.account4), "w4": (4, self.account4),
+        }
         if target == "all":
             targets = all_wallets
-        elif target in ("1", "w1"):
-            targets = [(1, self.account)]
-        elif target in ("2", "w2"):
-            if not self.account2:
-                await self.send_message(chat_id, "Wallet 2 not configured")
+        elif target in wallet_map:
+            wid, acct = wallet_map[target]
+            if not acct:
+                await self.send_message(chat_id, f"Wallet {target} not configured")
                 return
-            targets = [(2, self.account2)]
+            targets = [(wid, acct)]
         else:
-            await self.send_message(chat_id, f"Unknown target: {target}\nUsage: /topup <1|2|all> [amount_usd]")
+            await self.send_message(chat_id, f"Unknown target: {target}\nUsage: /topup <1|2|3|4|all> [amount_usd]")
             return
 
         if DRY_RUN:
@@ -1717,8 +1816,7 @@ class GMXBot:
         total_usdc = 0.0
         total_deployed = 0.0
         try:
-            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
-            for i, acct in enumerate(all_wallets, 1):
+            for wid, acct in self._all_wallets():
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
                 total_usdc += usdc
                 try:
@@ -1730,7 +1828,7 @@ class GMXBot:
                     deployed = 0.0
                 total_deployed += deployed
                 addr = f"{acct.address[:8]}...{acct.address[-6:]}"
-                balance_lines.append(f"  W{i} ({addr}): ${usdc:,.2f} USDC")
+                balance_lines.append(f"  W{wid} ({addr}): ${usdc:,.2f} USDC")
         except Exception as e:
             self.logger.warning(f"Daily summary: balance fetch failed: {e}")
             balance_lines.append("  (could not fetch balances)")
@@ -1739,7 +1837,7 @@ class GMXBot:
         open_pnl = 0.0
         open_count = 0
         try:
-            for acct in [self.account] + ([self.account2] if self.account2 else []):
+            for _, acct in self._all_wallets():
                 cps = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
                 )
@@ -1776,7 +1874,7 @@ class GMXBot:
             )
 
         msg += (
-            f"\nAccount Balance:\n"
+            "\nAccount Balance:\n"
             + "\n".join(balance_lines) + "\n"
             f"  Total USDC: ${total_usdc:,.2f}\n"
             f"  Deployed: ${total_deployed:,.2f}"
@@ -1964,7 +2062,7 @@ class GMXBot:
                         self.logger.info(
                             f"Position {pos.symbol} {pos.side} appears gone but "
                             f"{len(market_orders)} SL/TP orders still exist on-chain. "
-                            f"Waiting for next cycle (orders will be auto-cancelled if truly closed)."
+                            "Waiting for next cycle (orders will be auto-cancelled if truly closed)."
                         )
                         # Don't declare closed yet — if position is truly closed,
                         # keepers will cancel remaining orders and next cycle will
@@ -2081,7 +2179,7 @@ class GMXBot:
                             self.logger.warning(
                                 f"Position {pos.symbol} {pos.side} confirmed closed but "
                                 f"price ${current_price:,.2f} doesn't match SL=${sl_price:,.2f}. "
-                                f"Proceeding with close (may be a liquidation or keeper execution)."
+                                "Proceeding with close (may be a liquidation or keeper execution)."
                             )
 
                 # Determine exit reason — use actual SL price + TP hit count
@@ -2294,7 +2392,7 @@ class GMXBot:
                 self.logger.info(
                     f"TP count dropped for {pos.symbol} {pos.side}: "
                     f"{pos.last_known_tp_count} → {current_tp_count}. "
-                    f"Confirming in 5s..."
+                    "Confirming in 5s..."
                 )
                 await asyncio.sleep(5)
                 try:
@@ -2315,7 +2413,7 @@ class GMXBot:
                     self.logger.info(
                         f"TP count restored for {pos.symbol} {pos.side}: "
                         f"confirmed {confirm_tp_count} TPs (was {pos.last_known_tp_count}). "
-                        f"False alarm — skipping."
+                        "False alarm — skipping."
                     )
                     pos.last_known_tp_count = confirm_tp_count
                     continue
@@ -2330,7 +2428,7 @@ class GMXBot:
                 if current_tp_count == 0 and hit_count > 1:
                     self.logger.info(
                         f"All {hit_count} TPs vanished for {pos.symbol} {pos.side} — "
-                        f"verifying position still exists on-chain..."
+                        "verifying position still exists on-chain..."
                     )
                     try:
                         chain_positions = await asyncio.to_thread(
@@ -2348,8 +2446,8 @@ class GMXBot:
                     if not chain_pos:
                         self.logger.warning(
                             f"Position {pos.symbol} {pos.side} not found on-chain. "
-                            f"TPs were auto-cancelled (position rejected or already closed). "
-                            f"NOT treating as TP hit."
+                            "TPs were auto-cancelled (position rejected or already closed). "
+                            "NOT treating as TP hit."
                         )
                         pos.last_known_tp_count = 0
                         continue
@@ -2398,7 +2496,7 @@ class GMXBot:
                     # No price available — can't verify. Treat as stale.
                     self.logger.warning(
                         f"TP count dropped for {pos.symbol} {pos.side} but no "
-                        f"current price available — skipping TP verification."
+                        "current price available — skipping TP verification."
                     )
                     pos.last_known_tp_count = current_tp_count
                     continue
@@ -2421,7 +2519,7 @@ class GMXBot:
                             f"TP count dropped for {pos.symbol} {pos.side} but price "
                             f"${best_price:,.2f} hasn't reached TP{first_hit_idx + 1} "
                             f"@ ${first_tp_price:,.2f}. Possible manual cancel or stale read. "
-                            f"NOT treating as TP hit — updating baseline."
+                            "NOT treating as TP hit — updating baseline."
                         )
                         # Update baseline but don't increment hit count or move SL
                         pos.last_known_tp_count = current_tp_count
@@ -2576,13 +2674,43 @@ class GMXBot:
                 f"move_sl: found {len(sl_orders)} SL order(s) to cancel for {pos.symbol}"
             )
 
-            # Cancel old SL order(s) — track which TXs succeeded via receipt
-            cancelled_count = 0
-            cancelled_keys = set()  # keys we got successful receipts for
+            # ── PRE-VALIDATE: check which SL orders are still active via gas estimate ──
+            # Event-log-based order fetching can return stale keys (already executed/cancelled).
+            # Gas estimate for cancelOrder will fail if the order is gone → skip those.
+            validated_sls = []
+            stale_count = 0
+            last_error = ""
             for sl in sl_orders:
                 if not sl.get("key_hex"):
-                    self.logger.warning(f"  SL order has no key_hex, skipping")
+                    self.logger.warning("  SL order has no key_hex, skipping")
                     continue
+                key_bytes = bytes.fromhex(sl["key_hex"])
+                try:
+                    def _validate_key(kb=key_bytes, _acct=pos_acct):
+                        exchange.functions.cancelOrder(kb).estimate_gas(
+                            {"from": _acct.address}
+                        )
+                    await asyncio.to_thread(_validate_key)
+                    validated_sls.append(sl)
+                    self.logger.info(f"  SL 0x{sl['key_hex'][:16]}... validated (still active)")
+                except Exception as e:
+                    stale_count += 1
+                    last_error = str(e)
+                    self.logger.info(
+                        f"  SL 0x{sl['key_hex'][:16]}... already gone (gas estimate failed): {e}"
+                    )
+
+            if stale_count > 0 and not validated_sls:
+                # ALL SL orders were stale — they've already been executed/cancelled.
+                # Safe to proceed directly to placing the new SL.
+                self.logger.info(
+                    f"move_sl: all {stale_count} old SL(s) already gone — proceeding to place new SL"
+                )
+
+            # Cancel validated (still-active) SL orders
+            cancelled_count = 0
+            cancelled_keys = set()
+            for sl in validated_sls:
                 key_bytes = bytes.fromhex(sl["key_hex"])
                 self.logger.info(f"Cancelling old SL 0x{sl['key_hex'][:16]}...")
                 try:
@@ -2602,15 +2730,17 @@ class GMXBot:
                         cancelled_count += 1
                         cancelled_keys.add(sl["key_hex"])
                     else:
+                        last_error = f"TX reverted: {txh}"
                         self.logger.warning(f"SL cancel TX reverted: {txh}")
                 except Exception as e:
+                    last_error = str(e)
                     self.logger.warning(f"Failed to cancel old SL: {e}")
 
-            if sl_orders and cancelled_count == 0:
-                # ── RETRY: wait and try cancelling again (event logs may have been stale) ──
+            if validated_sls and cancelled_count == 0:
+                # ── RETRY: wait and try cancelling again ──
                 self.logger.warning(
-                    f"Could not cancel any of {len(sl_orders)} old SL orders — "
-                    f"retrying after 10s..."
+                    f"Could not cancel any of {len(validated_sls)} validated SL orders — "
+                    "retrying after 10s..."
                 )
                 await asyncio.sleep(10)
                 try:
@@ -2624,8 +2754,22 @@ class GMXBot:
                         and o.get("key_hex")
                     ]
                     for sl in retry_sls:
+                        kb = bytes.fromhex(sl["key_hex"])
+                        # Re-validate before retrying
                         try:
-                            kb = bytes.fromhex(sl["key_hex"])
+                            def _revalidate(kb=kb, _acct=pos_acct):
+                                exchange.functions.cancelOrder(kb).estimate_gas(
+                                    {"from": _acct.address}
+                                )
+                            await asyncio.to_thread(_revalidate)
+                        except Exception:
+                            # Order gone — count as resolved
+                            cancelled_count += 1
+                            cancelled_keys.add(sl["key_hex"])
+                            self.logger.info(f"Retry: SL 0x{sl['key_hex'][:16]}... now gone")
+                            continue
+
+                        try:
                             def _retry_cancel2(kb=kb, _acct=pos_acct):
                                 data = exchange.encode_abi("cancelOrder", [kb])
                                 tx = _open_mod.build_tx(
@@ -2642,19 +2786,22 @@ class GMXBot:
                                 cancelled_keys.add(sl["key_hex"])
                                 self.logger.info(f"Retry cancel succeeded: {txh}")
                         except Exception as e2:
+                            last_error = str(e2)
                             self.logger.warning(f"Retry cancel also failed: {e2}")
                 except Exception as e:
+                    last_error = str(e)
                     self.logger.warning(f"Retry fetch failed: {e}")
 
                 if cancelled_count == 0:
                     self.logger.error(
-                        f"Could not cancel any of {len(sl_orders)} old SL orders after retry! "
-                        f"Aborting new SL placement to avoid duplicates."
+                        f"Could not cancel any of {len(validated_sls)} old SL orders after retry! "
+                        "Aborting new SL placement to avoid duplicates."
                     )
                     pos.sl_move_failed = True
                     await self.notify(
                         f"⚠️ Could not remove old SL for {pos.symbol} after retries. "
-                        f"New SL NOT placed. Manual cleanup needed."
+                        f"New SL NOT placed.\nError: {last_error}\n"
+                        "Use /cancelorder to remove old SL, then /addorder sl to set new one."
                     )
                     return
 
@@ -2679,7 +2826,7 @@ class GMXBot:
                     if remaining_sls:
                         self.logger.warning(
                             f"move_sl: {len(remaining_sls)} unknown SL(s) still exist after cancellation. "
-                            f"Retrying cancellation..."
+                            "Retrying cancellation..."
                         )
                         # Retry cancelling only truly remaining ones (not stale reads of already-cancelled keys)
                         for sl in remaining_sls:
@@ -2786,15 +2933,15 @@ class GMXBot:
                         pos.sl_move_failed = True
                         await self.notify(
                             f"🚨 {pos.symbol} {pos.side} HAS NO STOP LOSS!\n"
-                            f"Failed to place new SL AND failed to restore old one.\n"
-                            f"Use /addorder sl to set one immediately!"
+                            "Failed to place new SL AND failed to restore old one.\n"
+                            "Use /addorder sl to set one immediately!"
                         )
                 else:
                     pos.sl_move_failed = True
                     await self.notify(
                         f"🚨 {pos.symbol} {pos.side} HAS NO STOP LOSS!\n"
                         f"Failed to place SL at {sl_label} (${new_sl_price:,.2f}).\n"
-                        f"Use /addorder sl to set one immediately!"
+                        "Use /addorder sl to set one immediately!"
                     )
                 return
 
@@ -2935,6 +3082,14 @@ class GMXBot:
                 await self.cmd_topup(chat_id, arg)
             elif cmd == "/prices":
                 await self.cmd_prices(chat_id)
+            elif cmd == "/sl":
+                arg = " ".join(parts[1:]) if len(parts) > 1 else None
+                await self.cmd_sl(chat_id, arg)
+            elif cmd == "/gas":
+                await self.cmd_gas(chat_id)
+            elif cmd == "/tradesize":
+                arg = " ".join(parts[1:]) if len(parts) > 1 else None
+                await self.cmd_tradesize(chat_id, arg)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -2951,6 +3106,9 @@ class GMXBot:
 /close all — Close all positions + cancel all orders
 /close BTC — Close by symbol
 /confirm — Confirm pending close
+/sl — Move SL to entry or TP level
+/sl 1 entry — Move #1 SL to entry (breakeven)
+/sl 1 tp2 — Move #1 SL to TP2 price
 /balance — Wallet ETH & token balance
 /halt [reason] — Halt trading
 /resume [reason] — Resume trading
@@ -2962,24 +3120,28 @@ class GMXBot:
 /cancelorder — List & cancel individual SL/TP orders by number
 /addorder — Manually add a SL or TP to an open position
 /prices — Live GMX & Chainlink prices for all tracked assets
+/gas — ETH gas balances for all wallets
+/tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
-/balance-wallets — Manually rebalance USDC between wallets
+/balance-wallets — Manually rebalance USDC between wallets (W1-W4)
 /lastmsg — Print last message from monitored channel(s)
 /health — System health
-/help — This message"""
+/help — This message
+
+**Wallets:** W1=swing, W2-W4=scalps"""
         await self.send_message(chat_id, msg)
 
     async def cmd_status(self, chat_id: int):
         health = self.get_health_report()
         status = "HALTED" if health["status"] == "HALTED" else "ACTIVE"
+        wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
         wallet_lines = []
-        if self.account:
-            wallet_lines.append(f"W1: {self.account.address[:8]}...{self.account.address[-6:]}")
-        if self.account2:
-            wallet_lines.append(f"W2: {self.account2.address[:8]}...{self.account2.address[-6:]}")
+        for wid, acct in self._all_wallets():
+            role = wallet_roles.get(wid, "scalp")
+            wallet_lines.append(f"W{wid} ({role}): {acct.address[:8]}...{acct.address[-6:]}")
         wallet_str = "\n".join(wallet_lines) if wallet_lines else "N/A"
         msg = (
-            f"**GMX V2 Bot Status**\n\n"
+            "**GMX V2 Bot Status**\n\n"
             f"Status: {status}\n"
             f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}\n"
             f"{wallet_str}\n"
@@ -2997,10 +3159,10 @@ class GMXBot:
 
     async def _fetch_all_positions_and_orders(self):
         """Fetch positions and orders from all wallets, merged.
-        Each GMXPosition gets a _wallet_acct attribute for close routing."""
+        Each GMXPosition gets a _wallet_acct and _wallet_id attribute for close routing."""
         all_positions = []
         all_orders = []
-        for acct in [self.account] + ([self.account2] if self.account2 else []):
+        for wid, acct in self._all_wallets():
             try:
                 pos, ords = await asyncio.gather(
                     asyncio.to_thread(chain_fetch_positions, self.w3, acct.address),
@@ -3008,12 +3170,14 @@ class GMXBot:
                 )
                 for p in pos:
                     p._wallet_acct = acct  # tag with owning wallet
+                    p._wallet_id = wid
                 all_positions.extend(pos)
                 for o in ords:
                     o["_wallet_acct"] = acct  # tag orders with owning wallet too
+                    o["_wallet_id"] = wid
                 all_orders.extend(ords)
             except Exception as e:
-                self.logger.warning(f"Failed to fetch from {acct.address[:10]}: {e}")
+                self.logger.warning(f"Failed to fetch from W{wid} {acct.address[:10]}: {e}")
         return all_positions, all_orders
 
     async def cmd_positions(self, chat_id: int):
@@ -3067,11 +3231,13 @@ class GMXBot:
 
                 # Determine wallet label
                 wid_label = ""
-                if self.account2 and hasattr(pos, '_wallet_acct'):
-                    if pos._wallet_acct.address == self.account.address:
-                        wid_label = " [W1]"
-                    elif pos._wallet_acct.address == self.account2.address:
-                        wid_label = " [W2]"
+                if hasattr(pos, '_wallet_id'):
+                    wid_label = f" [W{pos._wallet_id}]"
+                elif hasattr(pos, '_wallet_acct'):
+                    for wid_check, acct_check in self._all_wallets():
+                        if pos._wallet_acct.address == acct_check.address:
+                            wid_label = f" [W{wid_check}]"
+                            break
 
                 msg += (
                     f"\n**#{i} {pos.symbol} {side}{wid_label}**\n"
@@ -3306,7 +3472,7 @@ class GMXBot:
                                 await self.send_message(
                                     chat_id,
                                     f"Warning: {pos.symbol} {side} did not close "
-                                    f"within 2 minutes. Order cancellation may fail."
+                                    "within 2 minutes. Order cancellation may fail."
                                 )
                     else:
                         close_failed = True
@@ -3319,10 +3485,9 @@ class GMXBot:
                     address=Web3.to_checksum_address(GMX_V2_EXCHANGE_ROUTER),
                     abi=EXCHANGE_ROUTER_ABI,
                 )
-                all_wallets = [self.account] + ([self.account2] if self.account2 else [])
                 if also_cancel_orders:
                     # /close all — cancel every open order on all wallets
-                    for acct in all_wallets:
+                    for _, acct in self._all_wallets():
                         n_cancelled += await asyncio.to_thread(
                             cancel_all_orders,
                             self.w3,
@@ -3333,7 +3498,7 @@ class GMXBot:
                 elif positions_to_close:
                     # /close btc — cancel orders for those markets on all wallets
                     for pos in positions_to_close:
-                        for acct in all_wallets:
+                        for _, acct in self._all_wallets():
                             n_cancelled += await asyncio.to_thread(
                                 cancel_orders_for_market,
                                 self.w3,
@@ -3381,8 +3546,7 @@ class GMXBot:
 
             # ── GMX Reader prices (from open positions) ──
             gmx_prices = {}
-            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
-            for acct in all_wallets:
+            for _, acct in self._all_wallets():
                 try:
                     positions = await asyncio.to_thread(
                         chain_fetch_positions, self.w3, acct.address
@@ -3443,15 +3607,183 @@ class GMXBot:
             self.logger.error(f"cmd_prices error: {e}")
             await self.send_message(chat_id, f"Error fetching prices: {e}")
 
+    async def cmd_sl(self, chat_id: int, arg: Optional[str]):
+        """Move stop loss for a position to entry or a TP level.
+
+        Syntax:
+            /sl              → Show positions with SL targets
+            /sl 1 entry      → Move position #1 SL to entry price
+            /sl 1 tp2        → Move position #1 SL to TP2 price
+            /sl 2 tp5        → Move position #2 SL to TP5 price
+        """
+        try:
+            positions, orders = await self._fetch_all_positions_and_orders()
+
+            if not positions:
+                await self.send_message(chat_id, "No open positions.")
+                return
+
+            # If no args, show positions with SL options
+            if not arg or not arg.strip():
+                msg = "**Move Stop Loss**\n\nUsage: `/sl <#> <target>`\n\n"
+                for i, pos in enumerate(positions, 1):
+                    side = "LONG" if pos.is_long else "SHORT"
+                    wid_label = f" [W{pos._wallet_id}]" if hasattr(pos, '_wallet_id') else ""
+
+                    # Find current SL
+                    market_lower = pos.market.lower()
+                    sl_orders = [o for o in orders
+                                 if o["market"].lower() == market_lower
+                                 and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE]
+                    current_sl = f"${sl_orders[0]['trigger_price']:,.2f}" if sl_orders else "None"
+
+                    # Find tracked TPs from internal positions
+                    internal_pos = None
+                    for p in self.positions.values():
+                        if (p.is_open and p.market_addr
+                                and p.market_addr.lower() == market_lower
+                                and p.side == side):
+                            internal_pos = p
+                            break
+
+                    targets = ["entry"]
+                    if internal_pos and internal_pos.take_profits:
+                        sorted_tps = sorted(internal_pos.take_profits,
+                                            key=lambda t: t.price,
+                                            reverse=(side == "SHORT"))
+                        for j, tp in enumerate(sorted_tps, 1):
+                            targets.append(f"tp{j} (${tp.price:,.2f})")
+
+                    msg += (
+                        f"**#{i} {pos.symbol} {side}{wid_label}**\n"
+                        f"  Entry: ${pos.entry_price:,.2f} | SL: {current_sl}\n"
+                        f"  Targets: {', '.join(targets)}\n\n"
+                    )
+
+                msg += "Example: `/sl 1 entry` or `/sl 1 tp2`"
+                await self.send_message(chat_id, msg)
+                return
+
+            # Parse: /sl <pos_number> <target>
+            parts = arg.strip().split()
+            if len(parts) < 2:
+                await self.send_message(chat_id, "Usage: `/sl <#> <target>`\nExample: `/sl 1 entry` or `/sl 1 tp2`")
+                return
+
+            try:
+                pos_num = int(parts[0])
+            except ValueError:
+                await self.send_message(chat_id, f"Invalid position number: {parts[0]}")
+                return
+
+            target = parts[1].lower().strip()
+
+            if pos_num < 1 or pos_num > len(positions):
+                await self.send_message(chat_id, f"Position #{pos_num} not found. Use /sl to see available positions.")
+                return
+
+            chain_pos = positions[pos_num - 1]
+            side = "LONG" if chain_pos.is_long else "SHORT"
+            market_lower = chain_pos.market.lower()
+
+            # Find the internal tracked position for TP prices
+            internal_pos = None
+            for p in self.positions.values():
+                if (p.is_open and p.market_addr
+                        and p.market_addr.lower() == market_lower
+                        and p.side == side):
+                    internal_pos = p
+                    break
+
+            if not internal_pos:
+                await self.send_message(
+                    chat_id,
+                    f"Position #{pos_num} ({chain_pos.symbol} {side}) not tracked internally. "
+                    "Cannot resolve TP prices — try using /addorder to set TP levels first."
+                )
+                return
+
+            # Resolve target price
+            if target == "entry":
+                new_sl_price = internal_pos.entry_price
+                sl_label = "Entry"
+            elif target.startswith("tp"):
+                try:
+                    tp_num = int(target[2:])
+                except ValueError:
+                    await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry' or 'tp1'-'tp8'.")
+                    return
+
+                sorted_tps = sorted(internal_pos.take_profits,
+                                    key=lambda t: t.price,
+                                    reverse=(side == "SHORT"))
+
+                if tp_num < 1 or tp_num > len(sorted_tps):
+                    await self.send_message(
+                        chat_id,
+                        f"TP{tp_num} not found. Position has {len(sorted_tps)} TP(s)."
+                    )
+                    return
+
+                new_sl_price = sorted_tps[tp_num - 1].price
+                sl_label = f"TP{tp_num}"
+            else:
+                await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry' or 'tp1'-'tp8'.")
+                return
+
+            # Validate direction: SL should be below current price for LONG, above for SHORT
+            current_price = chain_pos.current_price or await self.get_current_price(chain_pos.symbol)
+            if current_price:
+                if side == "LONG" and new_sl_price >= current_price:
+                    await self.send_message(
+                        chat_id,
+                        f"⚠️ Warning: SL ${new_sl_price:,.2f} is above current price "
+                        f"${current_price:,.2f} for a LONG. This would close the position immediately.\n"
+                        "Proceeding anyway..."
+                    )
+                elif side == "SHORT" and new_sl_price <= current_price:
+                    await self.send_message(
+                        chat_id,
+                        f"⚠️ Warning: SL ${new_sl_price:,.2f} is below current price "
+                        f"${current_price:,.2f} for a SHORT. This would close the position immediately.\n"
+                        "Proceeding anyway..."
+                    )
+
+            # Execute the SL move
+            await self.notify(
+                f"📊 Manual SL move: {internal_pos.symbol} {side} → {sl_label} (${new_sl_price:,.2f})"
+            )
+
+            # Fetch fresh orders for this wallet
+            pos_acct = self._get_account(internal_pos.wallet_id)
+            try:
+                fresh_orders = await asyncio.to_thread(
+                    fetch_open_orders, self.w3, pos_acct.address
+                )
+            except Exception as e:
+                await self.send_message(chat_id, f"Error fetching orders: {e}")
+                return
+
+            await self.move_sl(internal_pos, fresh_orders, new_sl_price, sl_label)
+
+            await self.send_message(
+                chat_id,
+                f"✅ SL moved for #{pos_num} {internal_pos.symbol} {side} → {sl_label} (${new_sl_price:,.2f})"
+            )
+
+        except Exception as e:
+            self.logger.error(f"cmd_sl error: {e}\n{traceback.format_exc()}")
+            await self.send_message(chat_id, f"Error: {e}")
+
     async def cmd_balance(self, chat_id: int):
         """Show wallet balances and trade sizing (combined pool)."""
         try:
             total_usdc = 0.0
             total_deployed = 0.0
             wallet_lines = []
+            wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
 
-            all_wallets = [self.account] + ([self.account2] if self.account2 else [])
-            for i, acct in enumerate(all_wallets, 1):
+            for wid, acct in self._all_wallets():
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
 
                 try:
@@ -3467,7 +3799,8 @@ class GMXBot:
                 total_usdc += usdc
                 total_deployed += deployed
 
-                label = f"W{i}"
+                role = wallet_roles.get(wid, "scalp")
+                label = f"W{wid} ({role})"
                 addr = f"{acct.address[:10]}...{acct.address[-6:]}"
                 dep_str = f"${deployed:,.2f}" if deployed > 0 else "$0.00"
 
@@ -3478,7 +3811,7 @@ class GMXBot:
 
             # Total portfolio = free USDC + deployed collateral + unrealized PnL
             total_pnl = 0.0
-            for acct in all_wallets:
+            for _, acct in self._all_wallets():
                 try:
                     positions = await asyncio.to_thread(
                         chain_fetch_positions, self.w3, acct.address
@@ -3492,9 +3825,9 @@ class GMXBot:
 
             pnl_sign = "+" if total_pnl >= 0 else ""
             msg = (
-                f"**Wallet Balance**\n\n"
+                "**Wallet Balance**\n\n"
                 + "\n".join(wallet_lines)
-                + f"\n\n**Combined**\n"
+                + "\n\n**Combined**\n"
                 f"Free USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f}\n"
                 f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}\n"
@@ -3538,49 +3871,152 @@ class GMXBot:
         await self.send_message(
             chat_id,
             f"Trade history cleared ({count} trade records removed).\n"
-            f"PnL and win rate stats have been reset to zero."
+            "PnL and win rate stats have been reset to zero."
         )
+
+    async def cmd_gas(self, chat_id: int):
+        """Show ETH gas balance for all wallets."""
+        try:
+            eth_price = await self.get_current_price("ETH")
+            if not eth_price:
+                try:
+                    eth_price = await asyncio.to_thread(close_fetch_current_price, "ETH", self.w3)
+                except Exception:
+                    eth_price = 0.0
+
+            wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
+            lines = ["**Gas Balances (ETH)**\n"]
+            total_eth = 0.0
+            low_wallets = []
+
+            for wid, acct in self._all_wallets():
+                try:
+                    eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, acct.address)
+                    eth_amount = eth_bal / 10**18
+                    eth_usd = eth_amount * eth_price if eth_price else 0
+                    total_eth += eth_amount
+                    role = wallet_roles.get(wid, "scalp")
+                    status = "⚠️" if eth_usd < 2.0 else "✅"
+                    lines.append(
+                        f"{status} W{wid} ({role}): {eth_amount:.6f} ETH (${eth_usd:.2f})"
+                    )
+                    if eth_usd < 2.0:
+                        low_wallets.append(f"W{wid}")
+                except Exception as e:
+                    lines.append(f"❌ W{wid}: error ({e})")
+
+            total_usd = total_eth * eth_price if eth_price else 0
+            lines.append(f"\nTotal: {total_eth:.6f} ETH (${total_usd:.2f})")
+
+            if low_wallets:
+                lines.append(f"\n⚠️ Low gas: {', '.join(low_wallets)} — use /topup to refill")
+
+            await self.send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            await self.send_message(chat_id, f"Error fetching gas balances: {e}")
+
+    async def cmd_tradesize(self, chat_id: int, arg: Optional[str] = None):
+        """Show or adjust the trade size percentage (PORTFOLIO_PCT).
+
+        Usage:
+            /tradesize          — show current trade size and what it means in $
+            /tradesize 15       — set to 15% of portfolio per trade
+            /tradesize 0.15     — same thing (accepts decimal)
+        """
+        global PORTFOLIO_PCT
+        try:
+            if not arg or not arg.strip():
+                # Show current trade size
+                total_portfolio = await self._get_total_portfolio_value()
+                collateral = total_portfolio * PORTFOLIO_PCT
+                pct_display = PORTFOLIO_PCT * 100
+
+                msg = (
+                    "**Trade Size**\n\n"
+                    f"Portfolio: ${total_portfolio:,.2f}\n"
+                    f"Trade size: {pct_display:.0f}% → ${collateral:,.2f} collateral per trade\n\n"
+                    "Usage: `/tradesize <percent>` to change\n"
+                    "Example: `/tradesize 15` → 15% per trade"
+                )
+                await self.send_message(chat_id, msg)
+                return
+
+            # Parse new percentage
+            new_val = float(arg.strip().replace("%", ""))
+
+            # Accept both "20" (percent) and "0.20" (decimal)
+            if new_val > 1.0:
+                new_pct = new_val / 100.0
+            else:
+                new_pct = new_val
+
+            if new_pct < 0.01 or new_pct > 0.50:
+                await self.send_message(chat_id, "Trade size must be between 1% and 50%.")
+                return
+
+            old_pct = PORTFOLIO_PCT
+            PORTFOLIO_PCT = new_pct
+
+            total_portfolio = await self._get_total_portfolio_value()
+            new_collateral = total_portfolio * PORTFOLIO_PCT
+
+            await self.send_message(
+                chat_id,
+                f"✅ Trade size updated: {old_pct*100:.0f}% → {new_pct*100:.0f}%\n"
+                f"New collateral per trade: ${new_collateral:,.2f} "
+                f"(of ${total_portfolio:,.2f} portfolio)"
+            )
+            self.logger.info(f"PORTFOLIO_PCT changed: {old_pct} → {new_pct}")
+
+        except ValueError:
+            await self.send_message(chat_id, f"Invalid value: {arg}\nUsage: `/tradesize 20` for 20%")
+        except Exception as e:
+            await self.send_message(chat_id, f"Error: {e}")
 
     async def cmd_balance_wallets(self, chat_id: int):
         """Manually trigger wallet rebalance and report results."""
-        if not self.account2:
+        wallets = self._all_wallets()
+        if len(wallets) < 2:
             await self.send_message(chat_id, "Single wallet mode — nothing to rebalance.")
             return
 
         # Show current state
-        w1_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
-        w2_usdc = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
-        diff = abs(w1_usdc - w2_usdc)
+        before_bals = {}
+        for wid, acct in wallets:
+            before_bals[wid] = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+
+        before_str = "\n".join(f"  W{wid}: ${bal:,.2f}" for wid, bal in before_bals.items())
+        diff = max(before_bals.values()) - min(before_bals.values())
 
         await self.send_message(
             chat_id,
-            f"Before:\n  W1: ${w1_usdc:,.2f}\n  W2: ${w2_usdc:,.2f}\n  Diff: ${diff:,.2f}\n\n"
-            f"Rebalancing..."
+            f"Before:\n{before_str}\n  Spread: ${diff:,.2f}\n\nRebalancing..."
         )
 
         await self._rebalance_wallets()
 
         # Show after state
-        new_w1 = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
-        new_w2 = await asyncio.to_thread(self._get_portfolio_value_for, self.account2)
-        new_diff = abs(new_w1 - new_w2)
+        after_bals = {}
+        for wid, acct in wallets:
+            after_bals[wid] = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+
+        after_str = "\n".join(f"  W{wid}: ${bal:,.2f}" for wid, bal in after_bals.items())
+        new_diff = max(after_bals.values()) - min(after_bals.values())
 
         if new_diff < diff:
             await self.send_message(
                 chat_id,
-                f"After:\n  W1: ${new_w1:,.2f}\n  W2: ${new_w2:,.2f}\n  Diff: ${new_diff:,.2f}\n\n"
-                f"✅ Wallets rebalanced"
+                f"After:\n{after_str}\n  Spread: ${new_diff:,.2f}\n\n✅ Wallets rebalanced"
             )
         elif diff < 1.0:
             await self.send_message(
                 chat_id,
-                f"Wallets already balanced (diff ${diff:,.2f} < $1.00)"
+                f"Wallets already balanced (spread ${diff:,.2f} < $1.00)"
             )
         else:
             await self.send_message(
                 chat_id,
-                f"After:\n  W1: ${new_w1:,.2f}\n  W2: ${new_w2:,.2f}\n\n"
-                f"⚠️ Rebalance may have failed — check logs"
+                f"After:\n{after_str}\n\n⚠️ Rebalance may have failed — check logs"
             )
 
     async def cmd_lastmsg(self, chat_id: int):
@@ -3607,15 +4043,12 @@ class GMXBot:
                 await self.send_message(chat_id, f"📡 **{ch_name}** — error: {e}")
 
     async def cmd_increase(self, chat_id: int, amount_str: str = None):
-        """Show open positions across both wallets and let user pick one to increase.
+        """Show open positions across all wallets and let user pick one to increase.
         Usage: /increase [amount]  — amount is USDC collateral to add (optional)."""
         # Fetch on-chain positions from all wallets
         all_positions = []
-        wallets = [(1, self.account)]
-        if self.account2:
-            wallets.append((2, self.account2))
 
-        for wid, acct in wallets:
+        for wid, acct in self._all_wallets():
             try:
                 chain_positions = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
@@ -3626,7 +4059,7 @@ class GMXBot:
                 self.logger.warning(f"Failed to fetch positions for W{wid}: {e}")
 
         if not all_positions:
-            await self.send_message(chat_id, "No open positions found on either wallet.")
+            await self.send_message(chat_id, "No open positions found across wallets.")
             return
 
         msg = "**Select position to increase:**\n\n"
@@ -3644,7 +4077,7 @@ class GMXBot:
         if amount_str:
             msg += f"Amount: ${amount_str} USDC\nReply with position number (1-{len(all_positions)})"
         else:
-            msg += f"Reply with: <number> <amount>\nExample: 1 25  (adds $25 USDC to position 1)"
+            msg += "Reply with: <number> <amount>\nExample: 1 25  (adds $25 USDC to position 1)"
 
         self.pending_increase[chat_id] = {
             "positions": all_positions,
@@ -3708,7 +4141,7 @@ class GMXBot:
             chat_id,
             f"Increasing {cp.symbol} {side} [W{wid}]\n"
             f"Adding: ${amount:.2f} collateral → ${additional_size:.2f} size @ {cp.leverage:.1f}x\n"
-            f"Executing..."
+            "Executing..."
         )
 
         try:
@@ -3805,11 +4238,13 @@ class GMXBot:
 
                 # Wallet label
                 wid = ""
-                if self.account2 and o.get("_wallet_acct"):
-                    if o["_wallet_acct"].address == self.account.address:
-                        wid = " [W1]"
-                    else:
-                        wid = " [W2]"
+                if o.get("_wallet_id"):
+                    wid = f" [W{o['_wallet_id']}]"
+                elif o.get("_wallet_acct"):
+                    for wid_check, acct_check in self._all_wallets():
+                        if o["_wallet_acct"].address == acct_check.address:
+                            wid = f" [W{wid_check}]"
+                            break
 
                 msg += (
                     f"**#{i}** {o['symbol']} {side} — {label} "
@@ -3856,7 +4291,7 @@ class GMXBot:
                 await self.send_message(
                     chat_id,
                     f"Order #{idx+1} ({o['symbol']} {label}) cannot be cancelled "
-                    f"(market orders execute immediately)."
+                    "(market orders execute immediately)."
                 )
                 return
 
@@ -3943,11 +4378,13 @@ class GMXBot:
             for i, pos in enumerate(positions, 1):
                 side = "LONG" if pos.is_long else "SHORT"
                 wid = ""
-                if self.account2 and hasattr(pos, '_wallet_acct'):
-                    if pos._wallet_acct.address == self.account.address:
-                        wid = " [W1]"
-                    else:
-                        wid = " [W2]"
+                if hasattr(pos, '_wallet_id'):
+                    wid = f" [W{pos._wallet_id}]"
+                elif hasattr(pos, '_wallet_acct'):
+                    for wid_check, acct_check in self._all_wallets():
+                        if pos._wallet_acct.address == acct_check.address:
+                            wid = f" [W{wid_check}]"
+                            break
 
                 # Show existing SL/TP for this position
                 pos_orders = [o for o in orders if o["market"].lower() == pos.market.lower()]
@@ -4036,14 +4473,14 @@ class GMXBot:
                 await self.send_message(
                     chat_id,
                     f"Warning: SL ${price:,.2f} is above entry ${pos.entry_price:,.2f} for a LONG. "
-                    f"Send the command again to confirm, or use a lower price."
+                    "Send the command again to confirm, or use a lower price."
                 )
                 return
             elif not pos.is_long and price <= pos.entry_price:
                 await self.send_message(
                     chat_id,
                     f"Warning: SL ${price:,.2f} is below entry ${pos.entry_price:,.2f} for a SHORT. "
-                    f"Send the command again to confirm, or use a higher price."
+                    "Send the command again to confirm, or use a higher price."
                 )
                 return
 
@@ -4099,9 +4536,9 @@ class GMXBot:
         if remaining_size <= 0:
             await self.send_message(
                 chat_id,
-                f"Existing TPs already cover the full position size "
+                "Existing TPs already cover the full position size "
                 f"(${existing_tp_size:,.2f} / ${pos.size_usd:,.2f}).\n"
-                f"Cancel a TP first with /cancelorder."
+                "Cancel a TP first with /cancelorder."
             )
             return
 
@@ -4172,7 +4609,7 @@ class GMXBot:
     async def cmd_health(self, chat_id: int):
         h = self.get_health_report()
         msg = (
-            f"**System Health**\n\n"
+            "**System Health**\n\n"
             f"Status: {h['status']}\n"
             f"Uptime: {h['uptime_hours']:.1f}h\n"
             f"Heartbeat: {time.time() - self.last_heartbeat:.0f}s ago\n"
@@ -4231,7 +4668,7 @@ class GMXBot:
         open_pnl: dict = {sym: 0.0 for sym in PNL_SYMBOLS}
         try:
             chain_positions = []
-            for acct in [self.account] + ([self.account2] if self.account2 else []):
+            for _, acct in self._all_wallets():
                 cps = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
                 )
