@@ -330,19 +330,16 @@ _SCALP_KEYWORDS_RAW = os.getenv(
 SWING_KEYWORDS = [k.strip().lower() for k in _SWING_KEYWORDS_RAW.split(",") if k.strip()]
 SCALP_KEYWORDS = [k.strip().lower() for k in _SCALP_KEYWORDS_RAW.split(",") if k.strip()]
 
-# Heuristic thresholds (configurable via env)
-SWING_MAX_LEVERAGE = float(os.getenv("SWING_MAX_LEVERAGE", "5"))       # ≤ 5x → swing
+# Heuristic threshold — no keywords, leverage decides
 SCALP_MIN_LEVERAGE = float(os.getenv("SCALP_MIN_LEVERAGE", "10"))      # ≥ 10x → scalp
-SWING_MIN_SL_DIST_PCT = float(os.getenv("SWING_MIN_SL_DIST_PCT", "3"))  # SL > 3% from entry → swing
 
 
 def classify_signal(signal: 'Signal') -> str:
-    """Classify a signal as 'swing' or 'scalp' based on keywords and heuristics.
+    """Classify a signal as 'swing' or 'scalp' based on keywords and leverage.
 
     Priority:
       1. Explicit keywords in the raw text (swing/scalp/long term/etc.)
-      2. Leverage + SL distance heuristic
-      3. Default: 'scalp'
+      2. Leverage heuristic: < 10x → swing, >= 10x → scalp
 
     Also sets signal.swing_keyword_match = True when classification is
     based on an explicit swing keyword (not heuristic).
@@ -361,22 +358,14 @@ def classify_signal(signal: 'Signal') -> str:
             signal.swing_keyword_match = False
             return "scalp"
 
-    # Heuristic: leverage + SL distance from entry
-    entry = signal.entry_mid
-    if entry > 0 and signal.stop_loss > 0:
-        sl_dist_pct = abs(entry - signal.stop_loss) / entry * 100
+    # No keywords matched — classify by leverage alone
+    # < 10x → swing (heuristic, NOT keyword match)
+    # >= 10x → scalp
+    signal.swing_keyword_match = False
+    if signal.leverage >= SCALP_MIN_LEVERAGE:
+        return "scalp"
 
-        # Low leverage + wide SL → swing (heuristic, NOT keyword match)
-        if signal.leverage <= SWING_MAX_LEVERAGE and sl_dist_pct >= SWING_MIN_SL_DIST_PCT:
-            signal.swing_keyword_match = False
-            return "swing"
-
-        # High leverage OR tight SL → scalp
-        if signal.leverage >= SCALP_MIN_LEVERAGE or sl_dist_pct < 2.0:
-            return "scalp"
-
-    # Default to scalp
-    return "scalp"
+    return "swing"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

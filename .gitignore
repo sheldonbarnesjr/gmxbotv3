@@ -16,3 +16,5 @@ __pycache__/
 
 # Claude
 .claude/
+setup.txt
+alerts_breakdown.pdf
