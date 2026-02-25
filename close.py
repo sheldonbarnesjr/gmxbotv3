@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import logging
+import functools
 import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional
@@ -28,6 +29,39 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("gmx-v2-close")
+
+
+def retry_on_chain(max_retries: int = 3, base_delay: float = 2.0, label: str = ""):
+    """Decorator that retries on-chain calls with exponential backoff."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except RuntimeError:
+                    raise  # Reverted tx — don't retry
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    last_exc = e
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** (attempt - 1))
+                        log.warning(f"{label or func.__name__}: attempt {attempt}/{max_retries} failed ({e}), retrying in {delay:.0f}s...")
+                        time.sleep(delay)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_rpc = any(kw in err_str for kw in ["connection", "timeout", "nonce too low", "replacement", "already known", "rate limit", "502", "503", "429"])
+                    if is_rpc and attempt < max_retries:
+                        last_exc = e
+                        delay = base_delay * (2 ** (attempt - 1))
+                        log.warning(f"{label or func.__name__}: attempt {attempt}/{max_retries} RPC error ({e}), retrying in {delay:.0f}s...")
+                        time.sleep(delay)
+                    else:
+                        raise
+            raise last_exc
+        return wrapper
+    return decorator
+
 
 # -----------------------------
 # ABIs (Same as open.py)
@@ -298,7 +332,7 @@ def fetch_current_price(symbol_pair: str, w3=None) -> float:
             log.warning(f"Chainlink price failed for {symbol_pair}: {e}")
 
     # ── Fallback: CoinGecko ──
-    coin_id = COINGECKO_IDS.get(symbol_pair)
+    coin_id = COINGECKO_IDS.get(symbol_pair.upper())
     if not coin_id:
         return 0.0
     try:
@@ -461,6 +495,7 @@ def display_positions(positions: List[GMXPosition]):
     
     print(f"\n{'='*90}")
 
+@retry_on_chain(max_retries=3, label="create_close_order")
 def create_close_order(
     w3: Web3,
     acct: Account,

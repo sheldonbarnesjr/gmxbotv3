@@ -31,6 +31,7 @@ import re
 import time
 import json
 import logging
+import functools
 import urllib.request
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
@@ -49,6 +50,62 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("gmx-v2-open")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Retry utility for on-chain operations
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def retry_on_chain(max_retries: int = 3, base_delay: float = 2.0, label: str = ""):
+    """Decorator that retries on-chain calls with exponential backoff.
+
+    Retries on network/RPC errors (ConnectionError, TimeoutError, ValueError
+    from nonce issues, etc.). Does NOT retry on reverted transactions
+    (RuntimeError from receipt.status != 1) since those indicate logic errors.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except RuntimeError:
+                    raise  # Reverted tx — don't retry, it will keep reverting
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    last_exc = e
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** (attempt - 1))
+                        fn_label = label or func.__name__
+                        log.warning(
+                            f"{fn_label}: attempt {attempt}/{max_retries} failed "
+                            f"({type(e).__name__}: {e}), retrying in {delay:.0f}s..."
+                        )
+                        time.sleep(delay)
+                    else:
+                        log.error(f"{fn_label}: all {max_retries} attempts failed")
+                except Exception as e:
+                    # Catch Web3 RPC errors (often wrapped as ValueError or generic Exception)
+                    err_str = str(e).lower()
+                    is_rpc_error = any(kw in err_str for kw in [
+                        "connection", "timeout", "nonce too low", "replacement",
+                        "already known", "rate limit", "502", "503", "429",
+                    ])
+                    if is_rpc_error and attempt < max_retries:
+                        last_exc = e
+                        delay = base_delay * (2 ** (attempt - 1))
+                        fn_label = label or func.__name__
+                        log.warning(
+                            f"{fn_label}: attempt {attempt}/{max_retries} RPC error "
+                            f"({e}), retrying in {delay:.0f}s..."
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
+            raise last_exc
+        return wrapper
+    return decorator
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Minimal ABIs
@@ -512,8 +569,10 @@ def parse_signal(text: str) -> Signal:
     # ── Take Profits ──
     take_profits = []
     # Match patterns like: TP1: 48000 (50% close)  or  TP 1: 48000 50%
+    # The separator [:=@\-$] is REQUIRED to prevent backtracking where
+    # the TP number (e.g. "1") gets captured as the price ($1).
     tp_pattern = re.compile(
-        r'TP\s*(\d+)?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
+        r'TP\s*(\d+)?\s*[:=@\-$]\s*\$?([\d,]+(?:\.\d+)?)\s*'
         r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
         re.IGNORECASE
     )
@@ -535,6 +594,28 @@ def parse_signal(text: str) -> Signal:
             pct_str = m.group(2)
             pct = float(pct_str) / 100.0 if pct_str else None
             take_profits.append(TakeProfit(price=price, close_pct=pct or 0))
+
+    # Sanity check: filter out TP prices that are absurdly far from entry.
+    # This catches regex backtracking bugs (e.g. TP number parsed as price: $1, $2, $3)
+    # and other parsing artifacts. A real TP should be within 10%-1000% of entry.
+    if entry_low > 0 and take_profits:
+        sane_tps = []
+        for tp in take_profits:
+            ratio = tp.price / entry_low
+            if 0.10 <= ratio <= 10.0:
+                sane_tps.append(tp)
+            else:
+                log.warning(
+                    f"Filtered absurd TP price ${tp.price:,.2f} "
+                    f"(entry ~${entry_low:,.0f}, ratio={ratio:.4f})"
+                )
+        if sane_tps:
+            take_profits = sane_tps
+        elif take_profits:
+            log.error(
+                f"ALL {len(take_profits)} TPs failed sanity check — "
+                f"keeping originals to avoid empty TP list"
+            )
 
     # Assign close percentages if not specified in the signal.
     # Each TP's close_pct is a fraction of the ORIGINAL position size.
@@ -584,6 +665,15 @@ def parse_signal(text: str) -> Signal:
             each = remaining / len(unspecified) if unspecified else 0
             for tp in unspecified:
                 tp.close_pct = each
+
+        # Clamp: if explicit TPs already sum >1.0, normalize all down
+        total_pct = sum(tp.close_pct for tp in take_profits)
+        if total_pct > 1.0 + 0.001:
+            log.warning(
+                f"TP percentages sum to {total_pct:.2f} (>1.0) — normalizing"
+            )
+            for tp in take_profits:
+                tp.close_pct /= total_pct
 
         # Ensure total sums to exactly 1.0 — push any rounding
         # remainder onto the last TP so the position fully closes.
@@ -722,8 +812,78 @@ def sign_send(w3: Web3, acct: Account, tx: dict, dry_run: bool) -> str:
     return tx_hash
 
 
+def _get_order_keys_from_datastore(w3: Web3, wallet_addr: str) -> list:
+    """Get active order keys directly from the DataStore EnumerableSet.
+
+    This queries the same on-chain data that the Reader's getAccountOrders
+    uses internally, so keys are guaranteed 1:1 with raw orders — no event
+    scanning, no gas-estimate validation, no offset alignment needed.
+
+    GMX V2 stores account order keys in:
+      DataStore.getBytes32ValuesAt(
+          keccak256(abi.encode(keccak256(abi.encode("ACCOUNT_ORDER_LIST")), account)),
+          start, end
+      )
+
+    Returns list of bytes objects (each 32 bytes), in the same order as
+    getAccountOrders returns order data.
+    """
+    datastore_addr = os.getenv("GMX_V2_DATASTORE", GMX_V2_DATASTORE)
+    datastore = Web3.to_checksum_address(datastore_addr)
+    wallet = Web3.to_checksum_address(wallet_addr)
+
+    # Step 1: Compute the EnumerableSet key for this account's order list
+    # Solidity: keccak256(abi.encode("ACCOUNT_ORDER_LIST"))
+    aol_str = b"ACCOUNT_ORDER_LIST"
+    aol_encoded = (
+        (0x20).to_bytes(32, "big")           # offset to string data
+        + len(aol_str).to_bytes(32, "big")   # string length
+        + aol_str.ljust(32, b"\x00")         # string data padded to 32 bytes
+    )
+    ACCOUNT_ORDER_LIST = Web3.keccak(aol_encoded)
+
+    # Solidity: keccak256(abi.encode(ACCOUNT_ORDER_LIST, account))
+    wallet_bytes = bytes.fromhex(wallet[2:])
+    set_key = Web3.keccak(
+        bytes(ACCOUNT_ORDER_LIST) + b"\x00" * 12 + wallet_bytes
+    )
+
+    # Step 2: Query DataStore.getBytes32ValuesAt(setKey, 0, 50)
+    fn_sig = Web3.keccak(text="getBytes32ValuesAt(bytes32,uint256,uint256)")[:4]
+    call_data = (
+        fn_sig
+        + bytes(set_key)
+        + (0).to_bytes(32, "big")
+        + (50).to_bytes(32, "big")
+    )
+
+    try:
+        result_hex = w3.eth.call({"to": datastore, "data": call_data})
+    except Exception as e:
+        log.warning(f"_get_order_keys_from_datastore: DataStore query failed: {e}")
+        return []
+
+    # Step 3: Decode bytes32[] return value
+    data = bytes(result_hex)
+    if len(data) < 64:
+        return []
+
+    arr_offset = int.from_bytes(data[0:32], "big")
+    count = int.from_bytes(data[arr_offset:arr_offset + 32], "big")
+
+    keys = []
+    for i in range(count):
+        start = arr_offset + 32 + i * 32
+        if start + 32 > len(data):
+            break
+        keys.append(data[start:start + 32])
+
+    log.debug(f"_get_order_keys_from_datastore: {len(keys)} active keys from DataStore")
+    return keys
+
+
 def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int = 500000) -> list:
-    """Get active order keys via EventEmitter OrderCreated logs.
+    """Get active order keys via EventEmitter OrderCreated logs (FALLBACK).
 
     The GMX V2 EventEmitter emits OrderCreated with:
       topic[2] = bytes32 order key
@@ -737,7 +897,7 @@ def _get_order_keys_from_events(w3: Web3, wallet_addr: str, lookback_blocks: int
 
     wallet = Web3.to_checksum_address(wallet_addr)
     # topic[3] = account padded to 32 bytes (0x + 24 zeros + 40-char address)
-    wallet_topic = "0x" + "0" * 24 + wallet_addr.lower().lstrip("0x")
+    wallet_topic = "0x" + "0" * 24 + wallet_addr.lower().replace("0x", "", 1)
 
     CANCEL_ABI = [{
         "name": "cancelOrder", "type": "function", "stateMutability": "payable",
@@ -852,6 +1012,9 @@ _EVENT_LOG2_ABI = [{
 }]
 
 # Topic hashes
+# EventLog2 selector — keccak256 of the full EventLog2 event signature with tuple types.
+# This is the SAME hash used as ORDER_CREATED_TOPIC in _get_order_keys_from_events
+# because both OrderCreated and PositionDecrease are emitted via EventLog2.
 _EVENT_LOG2_TOPIC = "0x468a25a7ba624ceea6e540ad6f49171b52495b648417ae91bca21676d8a24dc5"
 _POSITION_DECREASE_TOPIC = "0x84b670ed7b7ee8ccb350963a7dea39493daff6e7a43ab021a0e4ac2d652d359e"
 
@@ -864,7 +1027,7 @@ def fetch_execution_price(
     wallet_addr: str,
     market_addr: str,
     is_long: bool,
-    lookback_blocks: int = 300,
+    lookback_blocks: int = 3000,
 ) -> Optional[float]:
     """Fetch the actual execution price from GMX V2 PositionDecrease events.
 
@@ -1138,11 +1301,14 @@ def _parse_orders_raw(w3: Web3, wallet_addr: str) -> list:
 def fetch_open_orders(w3: Web3, wallet_addr: str) -> list:
     """Fetch all open orders for the wallet and return a list of dicts with decoded fields.
 
-    Combines:
-      - _parse_orders_raw()  for order metadata (type, size, trigger price, market)
-      - _get_order_keys_from_events()  for bytes32 order keys via EventEmitter logs
+    Uses two sources from the same DataStore to ensure 1:1 key-to-order mapping:
+      - _parse_orders_raw()              → order metadata (type, size, trigger, market)
+      - _get_order_keys_from_datastore() → bytes32 order keys from EnumerableSet
 
-    Keys and metadata are merged by index position (both return orders in creation order).
+    Both read from the DataStore's account order list, so keys and orders
+    are in the same sequence — no offset alignment or event scanning needed.
+
+    Falls back to the older event-based key detection if DataStore query fails.
 
     Each dict contains:
       market        — checksummed market address
@@ -1155,16 +1321,48 @@ def fetch_open_orders(w3: Web3, wallet_addr: str) -> list:
       key_hex       — hex string of the order key (or None if not found)
     """
     raw_orders  = _parse_orders_raw(w3, wallet_addr)
-    active_keys = _get_order_keys_from_events(w3, wallet_addr)
+
+    # Primary: get keys directly from DataStore (same source as Reader)
+    active_keys = _get_order_keys_from_datastore(w3, wallet_addr)
+
+    if active_keys and len(active_keys) == len(raw_orders):
+        # Perfect 1:1 mapping — DataStore keys match raw orders
+        return [
+            {**o, "key_hex": active_keys[i].hex()}
+            for i, o in enumerate(raw_orders)
+        ]
+
+    # Fallback: DataStore query failed or count mismatch — use event-based keys
+    if not active_keys:
+        log.warning("fetch_open_orders: DataStore key query returned empty, falling back to events")
+        active_keys = _get_order_keys_from_events(w3, wallet_addr)
+    else:
+        log.warning(
+            f"fetch_open_orders: DataStore returned {len(active_keys)} keys "
+            f"for {len(raw_orders)} raw orders — falling back to events"
+        )
+        active_keys = _get_order_keys_from_events(w3, wallet_addr)
+
+    # Legacy offset alignment for event-based fallback
+    offset = max(0, len(raw_orders) - len(active_keys))
+    if offset > 0:
+        log.info(
+            f"fetch_open_orders: {len(raw_orders)} raw orders, {len(active_keys)} active keys — "
+            f"skipping {offset} stale order(s) at start"
+        )
 
     result = []
     for i, o in enumerate(raw_orders):
-        key_bytes = active_keys[i] if i < len(active_keys) else None
-        result.append({**o, "key_hex": key_bytes.hex() if key_bytes else None})
+        key_idx = i - offset
+        if key_idx >= 0 and key_idx < len(active_keys):
+            result.append({**o, "key_hex": active_keys[key_idx].hex()})
+        else:
+            result.append({**o, "key_hex": None})
 
     return result
 
 
+@retry_on_chain(max_retries=2, label="cancel_all_orders")
 def cancel_all_orders(
     w3: Web3,
     acct: Account,
@@ -1215,6 +1413,7 @@ def cancel_all_orders(
     return cancelled
 
 
+@retry_on_chain(max_retries=2, label="cancel_orders_for_market")
 def cancel_orders_for_market(
     w3: Web3,
     acct: Account,
@@ -1381,9 +1580,6 @@ def fetch_positions(w3: Web3, wallet: str) -> list:
         log.info("No open positions found.")
         return []
     log.info(f"Found {len(positions)} open position(s):")
-    print(f"\n{'='*70}")
-    print(f"  OPEN POSITIONS for {wallet[:10]}...{wallet[-6:]}")
-    print(f"{'='*70}")
     for i, pos in enumerate(positions):
         addresses, numbers, flags = pos[0], pos[1], pos[2]
         market, collateral_token, is_long = addresses[1], addresses[2], flags[0]
@@ -1404,14 +1600,11 @@ def fetch_positions(w3: Web3, wallet: str) -> list:
         else:
             entry_price = 0
         side = "LONG" if is_long else "SHORT"
-        print(f"\n  Position #{i+1}")
-        print(f"    Market:     {market}")
-        print(f"    Side:       {side}")
-        print(f"    Size:       ${size_usd:,.2f}")
-        print(f"    Collateral: {collateral_amount:,.2f} {col_sym}")
-        print(f"    Leverage:   {leverage:.1f}x")
-        print(f"    Entry:      ${entry_price:,.2f}")
-    print(f"\n{'='*70}\n")
+        log.info(
+            f"  Position #{i+1}: {market} {side} "
+            f"${size_usd:,.2f} {collateral_amount:,.2f} {col_sym} "
+            f"{leverage:.1f}x entry=${entry_price:,.2f}"
+        )
     return positions
 
 
@@ -1489,6 +1682,7 @@ def _build_order_params(
     )
 
 
+@retry_on_chain(max_retries=3, label="create_market_increase_order")
 def create_market_increase_order(
     w3: Web3,
     acct: Account,
@@ -1570,6 +1764,7 @@ def create_market_increase_order(
     return txh
 
 
+@retry_on_chain(max_retries=3, label="create_limit_increase_order")
 def create_limit_increase_order(
     w3: Web3,
     acct: Account,
@@ -1659,6 +1854,7 @@ def create_limit_increase_order(
     return txh
 
 
+@retry_on_chain(max_retries=3, label="create_tp_order")
 def create_tp_order(
     w3: Web3,
     acct: Account,
@@ -1736,6 +1932,7 @@ def create_tp_order(
     return txh
 
 
+@retry_on_chain(max_retries=3, label="create_sl_order")
 def create_sl_order(
     w3: Web3,
     acct: Account,
@@ -2161,11 +2358,13 @@ if __name__ == "__main__":
         log.info(f"ETH balance: {eth_bal / 10**18:.6f} ETH "
                  f"(need {total_fee / 10**18:.4f} for {num_orders} orders)")
 
+    COLLATERAL_USD = SIZE_USD / signal.leverage if signal.leverage else SIZE_USD
     results = execute_signal(
         w3=w3, acct=acct, signal=signal,
         exchange_router=EXCHANGE_ROUTER, order_vault=ORDER_VAULT,
         market=MARKET, collateral_token=COLLATERAL_TOKEN,
-        size_usd=SIZE_USD, execution_fee=EXECUTION_FEE_WEI,
+        size_usd=SIZE_USD, collateral_usd=COLLATERAL_USD,
+        execution_fee=EXECUTION_FEE_WEI,
         slippage_bps=SLIPPAGE_BPS, dry_run=DRY_RUN,
     )
 
