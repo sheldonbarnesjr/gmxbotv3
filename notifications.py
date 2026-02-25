@@ -64,7 +64,7 @@ class NotificationsMixin:
             self.logger.error(f"Send message to {chat_id} failed: {e}")
             return False
 
-    async def notify_position_opened(self, position, order_type: str = "market"):
+    async def notify_position_opened(self, position, order_type: str = "market", signal_tp_count: int = 0):
         """Notify about a newly opened position."""
         tp_lines = ""
         for i, tp in enumerate(position.take_profits):
@@ -72,12 +72,17 @@ class NotificationsMixin:
         order_label = "LIMIT ORDER" if order_type == "limit" else "MARKET ORDER"
         sl_str = f"${position.stop_loss:,.2f}" if position.stop_loss is not None else "None"
         wallet_label = f" [W{position.wallet_id}]" if hasattr(position, 'wallet_id') else ""
+        placed_count = len(position.take_profits)
+        tp_header = f"TPs on-chain: {placed_count}"
+        if signal_tp_count > placed_count:
+            tp_header += f" (of {signal_tp_count} from signal — {signal_tp_count - placed_count} failed)"
         msg = (
             f"**Position Opened ({order_label})**\n\n"
             f"{position.symbol} {position.side}{wallet_label}\n"
             f"Size: ${position.size_usd:,.2f} @ {position.leverage:.0f}x\n"
             f"Entry: ${position.entry_price:,.2f}\n"
             f"SL: {sl_str}\n"
+            f"{tp_header}\n"
             f"{tp_lines}"
             f"TX: {position.tx_hash}"
         )

@@ -18,6 +18,7 @@ import os
 import time
 import uuid
 import asyncio
+import hashlib
 import logging
 import statistics
 import traceback
@@ -205,6 +206,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Increase position state: chat_id -> pending increase info
         self.pending_increase: Dict[int, Dict[str, Any]] = {}
+
+        # Last signal text for /lastsignal replay
+        self.last_signal_text: Optional[str] = None
+
+        # Concurrency: prevent duplicate signal execution
+        self._signal_lock = asyncio.Lock()
+        self._recent_signal_hashes: Dict[str, float] = {}  # hash -> timestamp
+        self._signal_dedup_window: float = 300.0  # 5 minutes
 
         # System
         self.is_halted = False
@@ -415,7 +424,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # Signal Processing
     # ──────────────────────────────────────────────────────────────────────
     async def process_signal(self, text: str):
-        """Process a trading signal from a Telegram channel."""
+        """Process a trading signal from a Telegram channel.
+
+        Protected by _signal_lock to prevent concurrent duplicate execution,
+        and a dedup check to skip identical signals within 30 seconds.
+        """
+        async with self._signal_lock:
+            await self._process_signal_inner(text)
+
+    async def _process_signal_inner(self, text: str):
+        """Inner signal processing (called under _signal_lock)."""
         try:
             self.health_stats["signals_processed"] += 1
 
@@ -443,6 +461,25 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             if signal.symbol not in ALLOWED_SYMBOLS:
                 self.logger.debug(f"Ignored signal for {signal.symbol} — not in allowed pairs (BTC/ETH/SOL)")
                 return
+
+            # Dedup: skip if same signal text was processed within the dedup window
+            sig_hash = hashlib.md5(text.encode()).hexdigest()
+            now = time.time()
+
+            # Purge expired entries
+            self._recent_signal_hashes = {
+                h: t for h, t in self._recent_signal_hashes.items()
+                if now - t < self._signal_dedup_window
+            }
+
+            if sig_hash in self._recent_signal_hashes:
+                elapsed = now - self._recent_signal_hashes[sig_hash]
+                self.logger.info(f"Duplicate signal ignored (same text {elapsed:.0f}s ago, window={self._signal_dedup_window:.0f}s)")
+                return
+            self._recent_signal_hashes[sig_hash] = now
+
+            # Store for /lastsignal replay
+            self.last_signal_text = text
 
             self.logger.info(f"Signal parsed: {signal.symbol} {signal.side} [{signal.trade_type}]")
 
@@ -522,13 +559,38 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     return
 
+            # Final safety check: scan ALL wallets for an existing on-chain
+            # position in this market+side to prevent duplicates even when
+            # slightly different signal text bypasses the hash-based dedup.
+            market_addr = self.cfg.markets.get(signal.symbol, "").lower()
+            if market_addr:
+                for wid_chk, acct_chk in self._all_wallets():
+                    try:
+                        chain_positions = await asyncio.to_thread(
+                            chain_fetch_positions, self.w3, acct_chk.address
+                        )
+                        for cp in chain_positions:
+                            if cp.market.lower() == market_addr and cp.is_long == signal.is_long:
+                                self.logger.warning(
+                                    f"Duplicate blocked: {signal.symbol} {signal.side} already open "
+                                    f"on W{wid_chk} ({acct_chk.address[:10]}...)"
+                                )
+                                await self.notify(
+                                    f"Blocked duplicate {signal.symbol} {signal.side}: "
+                                    f"already open on W{wid_chk}"
+                                )
+                                return
+                    except Exception as e:
+                        self.logger.warning(f"Could not check W{wid_chk} for duplicates: {e}")
+
             # Execute on-chain with the selected wallet
+            signal_tp_count = len(signal.take_profits)
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd)
             if position:
                 position.wallet_id = wallet_id
                 self.positions[position.id] = position
                 self.health_stats["trades_executed"] += 1
-                await self.notify_position_opened(position, order_type)
+                await self.notify_position_opened(position, order_type, signal_tp_count=signal_tp_count)
                 # Top up ETH for gas if balance is low
                 await self.topup_eth_if_needed()
                 # Rebalance USDC between wallets after opening
@@ -654,8 +716,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             await self.notify(f"Rejected {signal.symbol} {signal.side}: {tp_err}")
             return False
 
-        # Note: wallet availability (on-chain position check) is done in
-        # process_signal via _pick_wallet() after validation passes.
+        # Reject if we already have an open position for this symbol (same side)
+        existing = [
+            p for p in self.positions.values()
+            if p.symbol == signal.symbol and p.side == signal.side and p.is_open
+        ]
+        if existing:
+            self.logger.warning(
+                f"Rejected {signal.symbol} {signal.side}: already have {len(existing)} open position(s)"
+            )
+            await self.notify(
+                f"Rejected {signal.symbol} {signal.side}: already have an open {signal.side} position"
+            )
+            return False
 
         # Price deviation check — reject if too far from signal entry
         try:
@@ -756,9 +829,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 tx_hash = results.get("open", "")
                 position.tx_hash = tx_hash
 
-                # Set last_known_tp_count from successfully placed TP orders
-                successful_tps = sum(1 for tp_r in results.get("tp", []) if tp_r.get("tx"))
-                position.last_known_tp_count = successful_tps
+                # Filter take_profits to only include TPs that were actually placed on-chain.
+                # This prevents the notification from showing TPs that failed to place,
+                # and keeps check_tp_hits from tracking phantom TP orders.
+                tp_results = results.get("tp", [])
+                successfully_placed_prices = {
+                    tp_r["price"] for tp_r in tp_results if tp_r.get("tx")
+                }
+                if tp_results:  # only filter if we have results to check against
+                    position.take_profits = [
+                        tp for tp in position.take_profits
+                        if tp.price in successfully_placed_prices
+                    ]
+                position.last_known_tp_count = len(position.take_profits)
 
                 self.logger.info(f"Position opened: {position.symbol} {position.side} TX={tx_hash} ({order_type})")
                 return position, order_type

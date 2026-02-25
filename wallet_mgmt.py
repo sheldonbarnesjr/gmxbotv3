@@ -97,6 +97,18 @@ class WalletMixin:
 
         for wid, acct in wallets:
             try:
+                # Check in-memory positions first (catches pending/unconfirmed trades)
+                has_symbol_inmem = any(
+                    p.symbol == symbol and p.is_open and p.wallet_id == wid
+                    for p in self.positions.values()
+                )
+                if has_symbol_inmem:
+                    self.logger.info(
+                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} in-memory — skipping"
+                    )
+                    continue
+
+                # Then check on-chain (catches positions from before reboot or manual opens)
                 chain_positions = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
                 )

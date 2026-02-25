@@ -82,6 +82,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
 /balance-wallets — Manually rebalance USDC between wallets (W1-W4)
 /lastmsg — Print last message from monitored channel(s)
+/lastsignal — Re-run the last parsed signal
 /health — System health
 /help — This message
 
@@ -233,6 +234,8 @@ class CoreTelegramMixin:
                 await self.cmd_balance_wallets(chat_id)
             elif cmd == "/lastmsg":
                 await self.cmd_lastmsg(chat_id)
+            elif cmd == "/lastsignal":
+                await self.cmd_lastsignal(chat_id)
             elif cmd == "/increase":
                 arg = parts[1] if len(parts) > 1 else None
                 await self.cmd_increase(chat_id, arg)
@@ -876,6 +879,20 @@ class CoreTelegramMixin:
                     await self.send_message(chat_id, f"📡 **{ch_name}** — no messages found")
             except Exception as e:
                 await self.send_message(chat_id, f"📡 **{ch_name}** — error: {e}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # /lastsignal
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def cmd_lastsignal(self, chat_id: int):
+        """Re-run the last parsed signal through process_signal()."""
+        if not self.last_signal_text:
+            await self.send_message(chat_id, "No signal stored yet. Wait for a signal from the channel first.")
+            return
+
+        preview = self.last_signal_text[:200]
+        await self.send_message(chat_id, f"Re-running last signal:\n\n{preview}\n\nExecuting...")
+        await self.process_signal(self.last_signal_text)
 
     # ──────────────────────────────────────────────────────────────────────
     # /tradesize
