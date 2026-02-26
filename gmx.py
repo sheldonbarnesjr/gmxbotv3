@@ -262,6 +262,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.reconcile_task: Optional[asyncio.Task] = None
         self.order_retry_task: Optional[asyncio.Task] = None
         self.resolved_channels: Dict[int, str] = {}  # channel_id -> channel_name
+
+        # Bot API polling state
+        self._bot_api_chats: set = set()       # chat IDs from Bot API DMs
+        self._bot_update_offset: int = 0       # getUpdates offset
+        self.bot_polling_task: Optional[asyncio.Task] = None
+
         self.setup_logging()
 
     def setup_logging(self):
@@ -298,6 +304,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
         self.hourly_pnl_task = asyncio.create_task(self.hourly_pnl_loop())
+
+        # Bot API polling for DM commands
+        if self.cfg.telegram_bot_token:
+            self.bot_polling_task = asyncio.create_task(self.bot_api_polling_loop())
 
         # Record initial balance snapshot for 24h tracking
         try:
@@ -341,6 +351,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.reconcile_task.cancel()
         if self.order_retry_task:
             self.order_retry_task.cancel()
+        if self.bot_polling_task:
+            self.bot_polling_task.cancel()
 
         # Reconnect if needed so the offline message can be sent
         try:
@@ -351,6 +363,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 await self.client.disconnect()
         except Exception as e:
             self.logger.error(f"Failed to send offline notification: {e}")
+
+        # Send shutdown notice via Bot API (works even if Telethon is down)
+        try:
+            await self.notify_admin(f"🔴 Bot Offline — {reason}")
+        except Exception:
+            pass
 
         self.logger.info("Bot shutdown complete")
 
@@ -1305,6 +1323,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.logger.error(f"Error processing signal: {e}\n{traceback.format_exc()}")
             self.health_stats["errors"] += 1
             await self.notify(f"Error processing signal: {e}")
+            await self.notify_admin(f"⚠️ Error processing signal: {e}")
 
     async def _close_existing_position(self, pos: 'Position', new_signal: Signal) -> bool:
         """Close an existing position + cancel its orders to make room for a new signal.

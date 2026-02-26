@@ -28,6 +28,8 @@ from zoneinfo import ZoneInfo
 from telethon import TelegramClient, events
 from web3 import Web3
 
+import bot_api
+
 # ── Imports from sibling modules ──
 from config import ALLOWED_SYMBOLS
 from risk import is_update_message
@@ -205,6 +207,55 @@ class CoreTelegramMixin:
             self.logger.info(f"Admin chat configured: {admin_chat_id}")
 
         self.logger.info(f"Telegram initialized, monitoring {len(resolved_channels)} channel(s)")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Bot API polling loop (DM command interface)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def bot_api_polling_loop(self):
+        """Poll the Bot HTTP API for DM commands.
+
+        Runs alongside Telethon (which only reads VIP signal channels).
+        All user interaction — commands, confirmations, responses — flows
+        through here instead of the Telethon admin chat.
+        """
+        token = self.cfg.telegram_bot_token
+        self.logger.info("Bot API polling loop started")
+
+        # Flush any old updates so we only process new messages
+        _, self._bot_update_offset = await bot_api.get_updates(token, offset=0, timeout=0)
+
+        while True:
+            try:
+                updates, self._bot_update_offset = await bot_api.get_updates(
+                    token, offset=self._bot_update_offset, timeout=30
+                )
+                for update in updates:
+                    # Handle both private messages and channel posts
+                    msg = update.get("message") or update.get("channel_post")
+                    if not msg:
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    chat_id = msg["chat"]["id"]
+
+                    # Track this chat as a Bot API chat for response routing
+                    self._bot_api_chats.add(chat_id)
+
+                    if text.startswith("/"):
+                        await self.process_admin_command(text, chat_id)
+                    elif chat_id in self.pending_increase:
+                        await self.handle_increase_reply(chat_id, text)
+                    else:
+                        await self.handle_close_confirmation(chat_id, text)
+
+            except asyncio.CancelledError:
+                self.logger.info("Bot API polling loop cancelled")
+                return
+            except Exception as e:
+                self.logger.error(f"Bot API polling error: {e}")
+                await asyncio.sleep(5)
 
     # ──────────────────────────────────────────────────────────────────────
     # Admin command dispatcher
@@ -548,7 +599,10 @@ class CoreTelegramMixin:
                             proj_sign = "+" if proj >= 0 else ""
                             chg_sign = "+" if price_chg >= 0 else ""
                             sym = pos.symbol or ""
-                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}  ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
+                            msg += (
+                                f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
+                                f"         {pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%\n"
+                            )
                         elif tp_price:
                             msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
                         else:
@@ -1295,4 +1349,5 @@ class CoreTelegramMixin:
         msg += f"  Total USDC: ${total_usdc:,.2f}\n  Deployed: ${total_deployed:,.2f}"
 
         await self.notify(msg)
+        await self.notify_admin(msg)
         self.logger.info(f"Daily summary sent: daily PnL={d_sign}${daily_pnl:,.2f}")

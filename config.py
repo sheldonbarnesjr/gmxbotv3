@@ -159,6 +159,10 @@ class Config:
     admin_chat: Any = 0   # int (chat ID), str (@username), or 0 (disabled)
     admin_usernames: List[str] = field(default_factory=list)
 
+    # ── Bot API (separate from Telethon user session) ──
+    telegram_bot_token: str = ""
+    bot_admin_chat_id: str = ""
+
     # ── Network & Web3 ──
     network: str = "arbitrum"
     rpc_url: str = "https://arb1.arbitrum.io/rpc"
@@ -232,6 +236,10 @@ def load_config() -> Config:
         notify_chat=_parse_chat_id(_env("NOTIFY_CHAT", "")),
         admin_chat=_parse_chat_id(_env("ADMIN_CHAT", "")),
         admin_usernames=admin_usernames,
+
+        # Bot API
+        telegram_bot_token=_env("TELEGRAM_BOT_TOKEN", ""),
+        bot_admin_chat_id=_env("ADMIN_CHAT_ID", ""),
 
         # Network
         network=_env("NETWORK", "arbitrum").lower(),

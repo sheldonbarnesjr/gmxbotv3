@@ -19,6 +19,7 @@ import logging
 from typing import Optional
 
 from close import fetch_positions as chain_fetch_positions
+import bot_api
 
 
 class NotificationsMixin:
@@ -27,33 +28,59 @@ class NotificationsMixin:
     _notify_chat_warned: bool = False
 
     async def notify(self, message: str):
-        """Send notification to the configured notify_chat.
+        """Send notification to all configured channels.
 
-        Returns True if the message was sent, False otherwise.
+        Sends via Telethon (notify_chat) AND Bot API (admin DM).
+        Returns True if at least one channel succeeded.
         """
-        if not self.cfg.notify_chat and self.cfg.notify_chat != "me":
-            if not self._notify_chat_warned:
-                self.logger.warning(
-                    "notify_chat not configured — Telegram notifications are disabled. "
-                    "Set NOTIFY_CHAT in .env to receive alerts."
+        sent = False
+
+        # Telethon path (existing)
+        if self.cfg.notify_chat or self.cfg.notify_chat == "me":
+            if self.client:
+                try:
+                    await self.client.send_message(self.cfg.notify_chat, message)
+                    sent = True
+                except Exception as e:
+                    self.logger.error(f"Notify (Telethon) failed: {e}")
+            elif not self._notify_chat_warned:
+                self.logger.warning("Telegram client not initialised — Telethon notification dropped")
+
+        # Bot API path — send to every DM chat that has interacted with the bot
+        bot_api_chats = getattr(self, '_bot_api_chats', set())
+        for chat_id in bot_api_chats:
+            try:
+                ok = await bot_api.send_admin_message(
+                    self.cfg.telegram_bot_token, str(chat_id), message
                 )
-                self._notify_chat_warned = True
-            return False
-        if not self.client:
-            self.logger.warning("Telegram client not initialised — notification dropped")
-            return False
-        try:
-            await self.client.send_message(self.cfg.notify_chat, message)
-            return True
-        except Exception as e:
-            self.logger.error(f"Notify failed: {e}")
-            return False
+                if ok:
+                    sent = True
+            except Exception as e:
+                self.logger.error(f"Notify (Bot API) to {chat_id} failed: {e}")
+
+        if not sent and not self._notify_chat_warned:
+            self.logger.warning(
+                "No notification channels available — set NOTIFY_CHAT or "
+                "TELEGRAM_BOT_TOKEN in .env, and DM the bot to register."
+            )
+            self._notify_chat_warned = True
+
+        return sent
 
     async def send_message(self, chat_id: int, message: str):
         """Send a message to a specific chat.
 
+        Routes through Bot API for chats that originated from the bot,
+        falls back to Telethon for all others.
         Returns True if the message was sent, False otherwise.
         """
+        bot_api_chats = getattr(self, '_bot_api_chats', set())
+        if chat_id in bot_api_chats:
+            return await bot_api.send_admin_message(
+                self.cfg.telegram_bot_token, str(chat_id), message
+            )
+
+        # Telethon fallback
         if not self.client:
             self.logger.warning("Telegram client not initialised — message dropped")
             return False
@@ -63,6 +90,21 @@ class NotificationsMixin:
         except Exception as e:
             self.logger.error(f"Send message to {chat_id} failed: {e}")
             return False
+
+    async def notify_admin(self, message: str) -> bool:
+        """Send a message to ADMIN_CHAT_ID via the Bot HTTP API.
+
+        Returns True on success, False if unconfigured or on error.
+        """
+        return await bot_api.send_admin_message(
+            self.cfg.telegram_bot_token, self.cfg.bot_admin_chat_id, message
+        )
+
+    async def send_admin_pdf(self, file_path: str, caption: str = "") -> bool:
+        """Send a PDF document to ADMIN_CHAT_ID via the Bot HTTP API."""
+        return await bot_api.send_admin_pdf(
+            self.cfg.telegram_bot_token, self.cfg.bot_admin_chat_id, file_path, caption
+        )
 
     async def notify_position_opened(self, position, order_type: str = "market", signal_tp_count: int = 0):
         """Notify about a newly opened position."""
@@ -89,6 +131,7 @@ class NotificationsMixin:
         if order_type == "limit":
             msg += "\n\nLimit order placed — waiting for price to reach entry."
         await self.notify(msg)
+        await self.notify_admin(msg)
 
     async def send_startup_notification(self):
         """Send status update to admin when bot comes online."""
@@ -136,5 +179,6 @@ class NotificationsMixin:
                 f"Channels: {', '.join(cfg.telegram_channels)}"
             )
             await self.notify(msg)
+            await self.notify_admin(msg)
         except Exception as e:
             self.logger.error(f"Startup notification error: {e}")

@@ -382,7 +382,15 @@ class AnalyticsMixin:
 
         try:
             pdf_path = await asyncio.to_thread(self._generate_trade_pdf)
-            await self.client.send_file(chat_id, pdf_path, caption="Trade History Report")
+            bot_api_chats = getattr(self, '_bot_api_chats', set())
+            if chat_id in bot_api_chats:
+                import bot_api
+                await bot_api.send_admin_pdf(
+                    self.cfg.telegram_bot_token, str(chat_id), pdf_path,
+                    caption="Trade History Report",
+                )
+            else:
+                await self.client.send_file(chat_id, pdf_path, caption="Trade History Report")
             os.remove(pdf_path)
         except Exception as e:
             self.logger.error(f"PDF generation failed: {e}")
