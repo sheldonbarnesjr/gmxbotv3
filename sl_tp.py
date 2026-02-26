@@ -862,16 +862,23 @@ class SLTPMixin:
             await self.send_message(chat_id, "No cancellable orders selected.")
             return
 
+        # Filter out non-cancellable orders and warn user
+        valid_indices = []
         for idx in indices:
             o = numbered[idx]
             if not o["_cancellable"]:
                 label = ORDER_TYPE_NAMES.get(o["order_type"], f"Type{o['order_type']}")
                 await self.send_message(
                     chat_id,
-                    f"Order #{idx+1} ({o['symbol']} {label}) cannot be cancelled (market orders execute immediately)."
+                    f"Order #{idx+1} ({o['symbol']} {label}) cannot be cancelled (market orders execute immediately). Skipping."
                 )
-                return
+            else:
+                valid_indices.append(idx)
 
+        if not valid_indices:
+            return
+
+        indices = valid_indices
         exchange = self.w3.eth.contract(
             address=Web3.to_checksum_address(cfg.exchange_router),
             abi=EXCHANGE_ROUTER_ABI,

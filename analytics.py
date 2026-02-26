@@ -23,11 +23,14 @@ import time
 import uuid
 import asyncio
 import logging
+import tempfile
 import statistics
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from fpdf import FPDF
 
 from close import fetch_positions as chain_fetch_positions
 from risk import calculate_unrealized_pnl, calculate_pnl_percentage
@@ -57,6 +60,7 @@ class TradeRecord:
     exit_reason: str
     opened_at: float
     closed_at: float
+    wallet_id: int = 0  # 0 = unknown (legacy records), 1-4 = wallet
 
 
 class AnalyticsMixin:
@@ -131,6 +135,7 @@ class AnalyticsMixin:
             exit_reason=exit_reason,
             opened_at=pos_obj.opened_at,
             closed_at=pos_obj.closed_at,
+            wallet_id=getattr(pos_obj, 'wallet_id', 0),
         )
         self.trade_history.append(trade)
         self._save_trade_history()
@@ -362,3 +367,109 @@ class AnalyticsMixin:
             f"Errors: {h['errors']}"
         )
         await self.send_message(chat_id, msg)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Telegram command: /pdf
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def cmd_pdf(self, chat_id: int):
+        """Generate and send a PDF of all closed trade history."""
+        if not self.trade_history:
+            await self.send_message(chat_id, "No closed trades to export.")
+            return
+
+        await self.send_message(chat_id, "Generating trade history PDF...")
+
+        try:
+            pdf_path = await asyncio.to_thread(self._generate_trade_pdf)
+            await self.client.send_file(chat_id, pdf_path, caption="Trade History Report")
+            os.remove(pdf_path)
+        except Exception as e:
+            self.logger.error(f"PDF generation failed: {e}")
+            await self.send_message(chat_id, f"PDF generation failed: {e}")
+
+    def _generate_trade_pdf(self) -> str:
+        """Build the PDF file and return its path."""
+        ET = ZoneInfo("America/New_York")
+        trades = self.trade_history
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        # ── Title ──
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.cell(0, 12, "GMX V2 Trade History", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(
+            0, 6,
+            f"Generated: {datetime.now(ET).strftime('%b %d, %Y %I:%M %p ET')}",
+            new_x="LMARGIN", new_y="NEXT", align="C",
+        )
+        pdf.ln(6)
+
+        # ── Summary ──
+        total_pnl = sum(t.pnl_usd for t in trades)
+        wins = [t for t in trades if t.pnl_usd > 0]
+        losses = [t for t in trades if t.pnl_usd < 0]
+        win_rate = (len(wins) / len(trades) * 100) if trades else 0
+        avg_win = sum(t.pnl_usd for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.pnl_usd for t in losses) / len(losses) if losses else 0
+
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        summary_lines = [
+            f"Total Trades: {len(trades)}",
+            f"Win Rate: {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)",
+            f"Net PnL: {pnl_sign}${total_pnl:,.2f}",
+            f"Avg Win: +${avg_win:,.2f}" if avg_win >= 0 else f"Avg Win: ${avg_win:,.2f}",
+            f"Avg Loss: ${avg_loss:,.2f}",
+        ]
+        for line in summary_lines:
+            pdf.cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
+
+        pdf.ln(4)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(4)
+
+        # ── Trade List (newest first) ──
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Trades", new_x="LMARGIN", new_y="NEXT")
+
+        for i, t in enumerate(reversed(trades), 1):
+            closed_dt = datetime.fromtimestamp(t.closed_at, tz=ET)
+            date_str = closed_dt.strftime("%b %d, %Y %I:%M %p")
+
+            wallet_str = f" [W{t.wallet_id}]" if t.wallet_id > 0 else ""
+            pnl_sign = "+" if t.pnl_usd >= 0 else ""
+            pct_sign = "+" if t.pnl_percentage >= 0 else ""
+
+            # Green for wins, red for losses
+            if t.pnl_usd >= 0:
+                pdf.set_text_color(0, 128, 0)
+            else:
+                pdf.set_text_color(200, 0, 0)
+
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, f"#{i}  {t.symbol} {t.side}{wallet_str}", new_x="LMARGIN", new_y="NEXT")
+
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 9)
+
+            pdf.cell(0, 5, f"  Entry: ${t.entry_price:,.2f}  |  Exit: ${t.exit_price:,.2f}", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(
+                0, 5,
+                f"  Size: ${t.size_usd:,.2f} @ {t.leverage:.0f}x  |  "
+                f"PnL: {pnl_sign}${t.pnl_usd:,.2f} ({pct_sign}{t.pnl_percentage:.1f}%)",
+                new_x="LMARGIN", new_y="NEXT",
+            )
+            pdf.cell(0, 5, f"  Closed: {date_str}  |  Reason: {t.exit_reason}", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
+        pdf.output(tmp.name)
+        return tmp.name

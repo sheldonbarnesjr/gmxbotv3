@@ -18,6 +18,9 @@ from typing import Optional, List, Tuple, Dict
 from web3 import Web3
 from eth_account import Account
 
+import json
+import os
+
 from close import fetch_positions as chain_fetch_positions, fetch_current_price as close_fetch_current_price
 from open import (
     ERC20_ABI,
@@ -26,6 +29,9 @@ from open import (
     wait_receipt as open_wait_receipt,
     fetch_open_orders,
 )
+
+BALANCE_SNAPSHOTS_FILE = "balance_snapshots.json"
+MAX_SNAPSHOT_AGE_HOURS = 48
 
 
 class WalletMixin:
@@ -190,6 +196,59 @@ class WalletMixin:
             f"Portfolio: free=${free_usdc:.2f} + deployed=${deployed_value:.2f} = total=${total:.2f}"
         )
         return total
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Balance snapshots (for 24h change tracking)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _save_balance_snapshot(self, total_portfolio: float):
+        """Append a balance snapshot and prune entries older than 48h."""
+        snapshots = self._load_balance_snapshots()
+        snapshots.append({
+            "timestamp": time.time(),
+            "total_portfolio": total_portfolio,
+        })
+        cutoff = time.time() - (MAX_SNAPSHOT_AGE_HOURS * 3600)
+        snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
+        try:
+            with open(BALANCE_SNAPSHOTS_FILE, "w") as f:
+                json.dump(snapshots, f)
+        except Exception as e:
+            self.logger.warning(f"Failed to save balance snapshot: {e}")
+
+    def _load_balance_snapshots(self) -> list:
+        """Load balance snapshots from disk."""
+        if not os.path.exists(BALANCE_SNAPSHOTS_FILE):
+            return []
+        try:
+            with open(BALANCE_SNAPSHOTS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _get_24h_balance_change(self, current_total: float):
+        """Find snapshot closest to 24h ago and compute change.
+
+        Returns (change_usd, change_pct, found).
+        """
+        snapshots = self._load_balance_snapshots()
+        if not snapshots:
+            return 0.0, 0.0, False
+
+        target_ts = time.time() - 86400
+        closest = min(snapshots, key=lambda s: abs(s["timestamp"] - target_ts))
+
+        # Only use if within 6 hours of the 24h mark
+        if abs(closest["timestamp"] - target_ts) > 6 * 3600:
+            return 0.0, 0.0, False
+
+        old_total = closest["total_portfolio"]
+        if old_total == 0:
+            return 0.0, 0.0, False
+
+        change_usd = current_total - old_total
+        change_pct = (change_usd / old_total) * 100
+        return change_usd, change_pct, True
 
     async def _fund_wallet(self, target_wid: int, amount_needed: float):
         """Pull USDC from other wallets into the target wallet.
@@ -644,6 +703,15 @@ class WalletMixin:
             total_portfolio = total_usdc + total_deployed + total_pnl
             collateral_per_trade = total_portfolio * cfg.portfolio_pct
             pnl_sign = "+" if total_pnl >= 0 else ""
+
+            # 24h change
+            change_usd, change_pct, has_24h = self._get_24h_balance_change(total_portfolio)
+            if has_24h:
+                c_sign = "+" if change_usd >= 0 else ""
+                change_str = f" ({c_sign}${change_usd:,.2f} / {c_sign}{change_pct:.1f}% in 24h)"
+            else:
+                change_str = ""
+
             msg = (
                 "**Wallet Balance**\n\n"
                 + "\n".join(wallet_lines)
@@ -651,7 +719,7 @@ class WalletMixin:
                 f"Free USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f}\n"
                 f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}\n"
-                f"**Total Portfolio: ${total_portfolio:,.2f}**\n"
+                f"**Total Portfolio: ${total_portfolio:,.2f}**{change_str}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of ${total_portfolio:,.2f})"
             )
             await self.send_message(chat_id, msg)

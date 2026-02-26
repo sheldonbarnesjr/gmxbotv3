@@ -271,13 +271,23 @@ async def run_e2e_sltp_test(num_tps: int):
     eth_bal = w3.eth.get_balance(wallet) / 10**18
     log.info(f"BTC: ${btc_price:,.2f} | Wallet: {wallet} | ETH: {eth_bal:.6f}")
 
-    # ─── STEP 0: Cleanup stale orders ───
+    # ─── STEP 0: Cleanup stale BTC orders only (preserve other positions) ───
     log.info("\n" + "-" * 60)
-    log.info("STEP 0: Cleaning stale orders")
+    log.info("STEP 0: Cleaning stale BTC orders only")
     log.info("-" * 60)
     try:
-        cancelled = cancel_all_orders(w3, acct, exchange, dry_run=False)
-        log.info(f"  Stale orders cancelled: {cancelled}")
+        all_orders = fetch_open_orders(w3, acct.address)
+        market_lower = market.lower()
+        btc_orders = [o for o in all_orders if o["market"].lower() == market_lower and o.get("key_hex")]
+        cancelled = 0
+        for o in btc_orders:
+            try:
+                cancel_order_by_key(w3, acct, exchange, o["key_hex"])
+                cancelled += 1
+                time.sleep(2)
+            except Exception as e:
+                log.warning(f"  Failed to cancel order: {e}")
+        log.info(f"  BTC orders cancelled: {cancelled} (preserved {len(all_orders) - cancelled} other orders)")
         time.sleep(3)
     except Exception as e:
         log.warning(f"  Stale order cleanup: {e}")
@@ -583,8 +593,18 @@ async def run_e2e_sltp_test(num_tps: int):
     log.info("=" * 60)
 
     try:
-        cancelled = cancel_all_orders(w3, acct, exchange, dry_run=False)
-        log.info(f"  Remaining orders cancelled: {cancelled}")
+        all_orders = fetch_open_orders(w3, acct.address)
+        market_lower = market.lower()
+        btc_orders = [o for o in all_orders if o["market"].lower() == market_lower and o.get("key_hex")]
+        cancelled = 0
+        for o in btc_orders:
+            try:
+                cancel_order_by_key(w3, acct, exchange, o["key_hex"])
+                cancelled += 1
+                time.sleep(2)
+            except Exception:
+                pass
+        log.info(f"  BTC orders cancelled: {cancelled} (preserved other positions)")
         time.sleep(3)
     except Exception as e:
         log.warning(f"  Order cleanup: {e}")

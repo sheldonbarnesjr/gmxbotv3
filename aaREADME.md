@@ -9,9 +9,22 @@ Automated on-chain trading bot for [GMX V2](https://gmx.io) on Arbitrum. Listens
 - **On-Chain Execution** — MarketIncrease orders via GMX V2 Exchange Router with automatic TP (LimitDecrease) and SL (StopLossDecrease) placement
 - **Configurable TP Splits** — Per-TP-count distributions in `.env` (e.g., 3 TPs: 10%/35%/55%). Separate scalp and swing split profiles
 - **Swing vs Scalp Classification** — Signals are classified by keyword matching first (swing, long term, daily, scalp, short, intraday, etc.). No keywords? Leverage decides: under 10x = swing, 10x+ = scalp
-- **Progressive Trailing Stop Loss** — After TP1 hits, SL moves to entry (breakeven). After TP2, SL moves to TP1 price. Continues for all levels
-- **Position Close Detection** — Monitors on-chain state to detect when positions close via SL, liquidation, or final TP
+- **Signal Deduplication** — MD5-based dedup with configurable time window (default 5 min) prevents double-opens from repeated messages
+- **Failed Order Retry Queue** — TP/SL orders that fail on-chain are queued for automatic retry (up to 5 attempts with backoff)
+- **Position Close Detection** — Monitors on-chain state to detect when positions close via SL, liquidation, or final TP. Classifies exit reason automatically
 - **Update Message Filtering** — Ignores TP hit announcements, SL moved notifications, PnL updates, and other non-signal messages from channels
+
+### Progressive Trailing Stop Loss
+After take profits are hit, the SL is moved to lock in gains while letting the position run:
+
+| TP Hit | SL Moves To | Purpose |
+|--------|-------------|---------|
+| TP1 | Entry price | Breakeven protection |
+| TP2 | No move (stays at Entry) | Let the position run |
+| TP3 | TP1 price | Lock in TP1 profit |
+| TP4+ | TP2 price | Lock in TP2 profit |
+
+SL moves are pre-validated via gas estimation before executing, avoiding stale order key failures.
 
 ### Multi-Wallet Architecture (Up to 4 Wallets)
 - **W1 = Swing Trades** — Long-term / swing keyword signals route exclusively to Wallet 1
@@ -19,6 +32,7 @@ Automated on-chain trading bot for [GMX V2](https://gmx.io) on Arbitrum. Listens
 - **On-Chain Routing** — Queries live on-chain positions (not just internal tracking) to determine wallet assignment
 - **Combined Pool Sizing** — All wallets act as one pool. Trade size = `PORTFOLIO_PCT` of total portfolio value (free USDC + deployed collateral + unrealized PnL)
 - **Auto-Rebalance** — After each trade open/close, USDC is equalized across all wallets using above/below-average transfer pairing
+- **Consolidate** — `/consolidate` moves all free USDC from W2-W4 into W1 for easy withdrawals
 
 ### Gas Management
 - **Auto ETH Top-Up** — If any wallet's ETH balance drops below $2, automatically swaps $5 USDC to ETH via Uniswap V3 on Arbitrum
@@ -28,41 +42,58 @@ Automated on-chain trading bot for [GMX V2](https://gmx.io) on Arbitrum. Listens
 ### Price Feeds
 - **GMX Reader (Primary)** — Reads prices directly from GMX V2 Reader contract for open positions (same prices GMX uses for SL/TP execution)
 - **Chainlink On-Chain Fallback** — Reads from Chainlink price feed contracts on Arbitrum (BTC, ETH, SOL, LINK)
+- **Staleness Protection** — Prices older than 15s are considered stale; bot auto-halts if prices are stale for 120s+
+
+### Analytics & Reporting
+- **Trade History** — All closed trades recorded to `trade_history.json` with entry/exit, PnL, wallet, reason
+- **PDF Export** — `/pdf` generates a PDF document of all closed trades with color-coded PnL, sent as a Telegram file
+- **Win Rate** — `/winrate` shows stats filterable by symbol and last N trades
+- **PnL Breakdown** — `/pnl` shows today / 30-day / all-time PnL for BTC, ETH, SOL with realized + unrealized
+- **Hourly PnL Alerts** — Automated hourly PnL snapshot sent between 9 AM - 11 PM ET
+- **24h Balance Tracking** — `/balance` shows portfolio change over the last 24 hours (hourly snapshots saved to `balance_snapshots.json`)
 
 ### Admin Commands (via Telegram)
 | Command | Description |
 |---------|-------------|
-| `/status` | Bot status, wallets, uptime, trade stats |
-| `/balance` | Per-wallet USDC/deployed breakdown + combined totals |
-| `/positions` | All on-chain positions with TP/SL orders, PnL, wallet labels |
+| `/addorder` | Manually add a SL or TP to an open position |
+| `/balance` | Per-wallet USDC/deployed breakdown + 24h change |
+| `/balance-wallets` | Manually rebalance USDC between wallets (W1-W4) |
+| `/cancelorder` | List & cancel individual SL/TP orders by number |
 | `/close` | Interactive close flow — select positions to close |
 | `/close all` | Close all positions + cancel all orders across all wallets |
 | `/close BTC` | Close all BTC positions |
-| `/sl` | Move SL to entry or TP level (e.g., `/sl 1 entry`, `/sl 1 tp2`) |
-| `/prices` | Live GMX & Chainlink prices for all tracked assets |
+| `/confirm` | Confirm pending close |
+| `/consolidate` | Move all free USDC from W2-W4 into W1 (for withdrawals) |
 | `/gas` | ETH gas balances for all wallets with low-balance warnings |
-| `/tradesize` | View or change trade size % (e.g., `/tradesize 20` for 20%) |
-| `/topup` | Manual ETH top-up — per wallet or all (e.g., `/topup 3 10`) |
-| `/rebalance` | Manually rebalance USDC between wallets |
-| `/increase` | Add collateral to an open position |
-| `/cancelorder` | List & cancel individual SL/TP orders by number |
-| `/addorder` | Manually add a SL or TP to an open position |
-| `/winrate` | Win rate stats, filterable by symbol and last N trades |
-| `/pnl` | PnL breakdown (today / 30d / all-time) for BTC, ETH, SOL |
-| `/summary` | Send daily summary now |
-| `/halt` / `/resume` | Emergency trading pause/resume |
-| `/reset` | Clear all trade history & PnL stats |
-| `/lastmsg` | Print last message from monitored channel(s) |
+| `/halt [reason]` | Halt trading |
 | `/health` | System health metrics |
 | `/help` | Show all commands |
+| `/increase` | Add collateral to an open position |
+| `/lastmsg` | Print last message from monitored channel(s) |
+| `/lastsignal` | Re-run the last parsed signal |
+| `/pdf` | Download trade history as PDF |
+| `/pnl` | PnL summary (today / 30d / all time) for BTC, SOL, ETH |
+| `/positions` | Show on-chain positions with TP/SL orders and PnL |
+| `/prices` | Live GMX & Chainlink prices for all tracked assets |
+| `/reset` | Clear all trade history & PnL stats |
+| `/resume [reason]` | Resume trading |
+| `/retryqueue` | Show pending failed order retries |
+| `/sl` | Move SL to entry or TP level (e.g., `/sl 1 entry`, `/sl 1 tp2`) |
+| `/status` | Bot status, wallets, uptime, trade stats |
+| `/sync` | Force re-sync positions from on-chain |
+| `/summary` | Send daily summary now |
+| `/topup` | Manual ETH top-up — per wallet or all (e.g., `/topup 3 10`) |
+| `/tradesize` | View or change trade size % (e.g., `/tradesize 20` for 20%) |
+| `/winrate [SYMBOL] [N]` | Win rate stats |
 
 ### Safety
 - Configurable max leverage, max position size, min position size
 - Signal validation (SL/TP sanity, price deviation from current, direction check)
 - Require TP and SL on every trade (configurable)
 - DRY_RUN mode for testing without real execution
-- Halting mechanism for emergency trading pause
+- Halting mechanism for emergency trading pause with auto-resume
 - SL order pre-validation via gas estimate before cancel attempts (avoids stale key failures)
+- Duplicate position blocking — checks all wallets on-chain before opening
 
 ## Supported Markets
 
@@ -76,12 +107,26 @@ Automated on-chain trading bot for [GMX V2](https://gmx.io) on Arbitrum. Listens
 ## Project Structure
 
 ```
-gmx.py    — Main bot engine (Telegram handlers, signal processing, wallet routing,
-             TP/SL monitoring, admin commands, rebalance, ETH top-up)
-open.py   — Signal execution (parse signals, classify swing/scalp, build GMX V2
-             orders, place TP/SL, cancel orders, Chainlink price feeds)
-close.py  — Position management (fetch on-chain positions, create close orders,
-             position data structures)
+gmx.py           — Main bot engine: GMXBot class, position tracking, signal processing,
+                   TP hit detection, trailing SL, on-chain sync, startup/shutdown
+telegram.py      — Telegram integration: command routing, event handlers, hourly PnL loop,
+                   signal channel monitoring, close flow
+open.py          — Signal execution: parse signals, classify swing/scalp, build GMX V2
+                   orders, place TP/SL, cancel orders, Chainlink price feeds
+close.py         — Position management: fetch on-chain positions via Reader contract,
+                   create close orders, GMXPosition data structure
+risk.py          — Risk management: signal validation, SL/TP direction checks,
+                   trailing SL strategy (determine_new_sl_target), exit classification
+sl_tp.py         — SL/TP mixin: move_sl, cmd_sl, cmd_addorder, cmd_cancelorder
+wallet_mgmt.py   — Multi-wallet mixin: balance, gas, rebalance, consolidate, topup,
+                   balance snapshots for 24h tracking
+analytics.py     — Analytics mixin: trade recording, winrate, PnL, PDF export, health
+notifications.py — Notification mixin: Telegram message sending, position open alerts,
+                   startup notification
+price_feeds.py   — Price feeds mixin: GMX Reader + Chainlink prices, cmd_prices
+config.py        — Configuration loading from .env with defaults
+test.py          — On-chain E2E test (BTC SHORT open/close/TP cycle)
+test_trailing_sl.py — Unit tests for trailing SL strategy (30 tests)
 ```
 
 ## Setup
@@ -94,7 +139,7 @@ cd gmxbotv3
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install python-dotenv telethon web3 eth-account
+pip install python-dotenv telethon web3 eth-account fpdf2
 ```
 
 ### 2. Configure
@@ -180,27 +225,27 @@ python3 gmx.py
 ### Signal Flow
 
 ```
-Telegram Channel → Parse Signal → Classify (swing/scalp) → Validate
-                                                              ↓
-                                          Pick Wallet (W1 swing / W2-W4 scalp)
-                                                              ↓
-                                                    Execute On-Chain
-                                                      ├── MarketIncrease (open)
-                                                      ├── LimitDecrease × N (TPs)
-                                                      └── StopLossDecrease (SL)
+Telegram Channel → Parse Signal → Dedup Check → Classify (swing/scalp) → Validate
+                                                                            |
+                                                    Pick Wallet (W1 swing / W2-W4 scalp)
+                                                                            |
+                                                                  Execute On-Chain
+                                                                    +-- MarketIncrease (open)
+                                                                    +-- LimitDecrease x N (TPs)
+                                                                    +-- StopLossDecrease (SL)
 ```
 
 ### Wallet Routing
 
 ```
 New BTC LONG signal arrives (classified as scalp):
-  1. Check W2 on-chain — has BTC position? → Skip
-  2. Check W3 on-chain — has BTC position? → Skip
-  3. Check W4 on-chain — has BTC position? → Skip
+  1. Check W2 on-chain — has BTC position? -> Skip
+  2. Check W3 on-chain — has BTC position? -> Skip
+  3. Check W4 on-chain — has BTC position? -> Skip
   4. First free scalp wallet gets the trade
-  5. If all busy → Reject signal
+  5. If all busy -> Reject signal
 
-Swing signal → always routes to W1 only
+Swing signal -> always routes to W1 only
 ```
 
 ### TP Hit Detection & Trailing SL
@@ -208,12 +253,22 @@ Swing signal → always routes to W1 only
 ```
 Every 30s:
   1. Count TP orders on-chain for each position
-  2. If count decreased → TP was executed by GMX keepers
+  2. If count decreased -> TP was executed by GMX keepers
   3. Verify with price check (avoid false positives)
-  4. Move SL (pre-validate order keys with gas estimate):
-     - TP1 hit → SL to Entry (breakeven)
-     - TP2 hit → SL to TP1 price
-     - TP3 hit → SL to TP2 price
+  4. Move SL based on trailing strategy:
+     - TP1 hit -> SL to Entry (breakeven)
+     - TP2 hit -> No SL move (stay at Entry, let it run)
+     - TP3 hit -> SL to TP1 price
+     - TP4+ hit -> SL to TP2 price
+```
+
+### Hourly Sync & Monitoring
+
+```
+Every hour:
+  1. Save balance snapshot (for /balance 24h tracking)
+  2. Re-sync positions from on-chain (under signal lock)
+  3. Send hourly PnL alert (9 AM - 11 PM ET)
 ```
 
 ### Auto-Rebalance

@@ -299,6 +299,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
         self.hourly_pnl_task = asyncio.create_task(self.hourly_pnl_loop())
 
+        # Record initial balance snapshot for 24h tracking
+        try:
+            initial_portfolio = await self._get_total_portfolio_value()
+            self._save_balance_snapshot(initial_portfolio)
+        except Exception as e:
+            self.logger.debug(f"Initial balance snapshot failed: {e}")
+
         self.logger.info("GMX Bot started successfully")
 
         # Send startup notification to admin
@@ -1077,6 +1084,42 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             )
         await self.send_message(chat_id, msg)
 
+    async def cmd_sync(self, chat_id: int):
+        """Telegram /sync command — force re-sync internal state from on-chain.
+
+        Clears all internal position tracking and rebuilds from on-chain data.
+        This fixes stale state without requiring a full bot restart.
+        """
+        await self.send_message(chat_id, "Syncing positions from on-chain...")
+
+        try:
+            old_count = sum(1 for p in self.positions.values() if p.is_open)
+            self.positions.clear()
+            await self._sync_on_chain_positions()
+            new_count = sum(1 for p in self.positions.values() if p.is_open)
+
+            lines = []
+            for pos in self.positions.values():
+                if pos.is_open:
+                    tp_count = len(pos.take_profits)
+                    hits = pos.tp_hits_count
+                    sl_str = f"SL ${pos.stop_loss:,.2f}" if pos.stop_loss else "no SL"
+                    lines.append(
+                        f"  {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                        f"${pos.size_usd:,.2f} @ {pos.leverage:.0f}x — "
+                        f"{tp_count} TPs, {hits} hit(s), {sl_str}"
+                    )
+
+            msg = f"Sync complete: {new_count} position(s) (was {old_count})\n\n"
+            if lines:
+                msg += "\n".join(lines)
+            else:
+                msg += "No open positions found on-chain."
+            await self.send_message(chat_id, msg)
+        except Exception as e:
+            self.logger.error(f"Sync failed: {e}")
+            await self.send_message(chat_id, f"Sync failed: {e}")
+
     # ──────────────────────────────────────────────────────────────────────
     # Signal Processing
     # ──────────────────────────────────────────────────────────────────────
@@ -1248,9 +1291,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
             # Execute on-chain with the selected wallet
             signal_tp_count = len(signal.take_profits)
-            position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd)
+            position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
             if position:
-                position.wallet_id = wallet_id
                 self.positions[position.id] = position
                 self.health_stats["trades_executed"] += 1
                 await self.notify_position_opened(position, order_type, signal_tp_count=signal_tp_count)
@@ -1434,7 +1476,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # ──────────────────────────────────────────────────────────────────────
     # OPEN — Real on-chain execution via open.py
     # ──────────────────────────────────────────────────────────────────────
-    async def execute_open(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None) -> tuple:
+    async def execute_open(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None, wallet_id: int = 1) -> tuple:
         """Execute a full open signal on-chain: MarketIncrease/LimitIncrease + TPs + SL.
 
         Returns (Position, order_type) where order_type is "market" or "limit", or (None, None) on failure."""
@@ -1468,6 +1510,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 ],
                 market_addr=market_addr,
                 opened_at=time.time(),
+                wallet_id=wallet_id,
             )
 
             # Try to execute on-chain
@@ -1885,6 +1928,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     # Update pos so _record_trade and pnl_percentage use correct values
                     pos.current_price = exit_price
                     pos.unrealized_pnl = total_pnl
+
+                    # Final guard: re-check that no other coroutine closed this
+                    # position while we were classifying the exit.
+                    if pos.closed_at is not None:
+                        continue
 
                     pos.is_open = False
                     pos.closed_at = time.time()

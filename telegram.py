@@ -74,6 +74,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /increase — Add collateral to an open position
 /lastmsg — Print last message from monitored channel(s)
 /lastsignal — Re-run the last parsed signal
+/pdf — Download trade history as PDF
 /pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
 /positions — Show on-chain positions
 /prices — Live GMX & Chainlink prices for all tracked assets
@@ -84,6 +85,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /sl 1 entry — Move #1 SL to entry (breakeven)
 /sl 1 tp2 — Move #1 SL to TP2 price
 /status — Bot status & mode
+/sync — Force re-sync positions from on-chain
 /summary — Send daily summary now
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
 /tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
@@ -276,6 +278,10 @@ class CoreTelegramMixin:
                 await self.cmd_tradesize(chat_id, arg)
             elif cmd == "/retryqueue":
                 await self.cmd_retryqueue(chat_id)
+            elif cmd == "/pdf":
+                await self.cmd_pdf(chat_id)
+            elif cmd == "/sync":
+                await self.cmd_sync(chat_id)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -1102,10 +1108,29 @@ class CoreTelegramMixin:
                 await asyncio.sleep(3600)
 
     async def hourly_pnl_loop(self):
-        """Send an hourly PnL snapshot between 9 AM and 11 PM ET."""
+        """Send an hourly PnL snapshot between 9 AM and 11 PM ET.
+
+        Also records a balance snapshot every hour for 24h tracking.
+        """
         while True:
             try:
                 await asyncio.sleep(3600)  # 1 hour
+
+                # Record balance snapshot every hour (for /balance 24h change)
+                try:
+                    total_portfolio = await self._get_total_portfolio_value()
+                    self._save_balance_snapshot(total_portfolio)
+                except Exception as e:
+                    self.logger.debug(f"Balance snapshot failed: {e}")
+
+                # Silent hourly re-sync from on-chain (under signal lock to avoid races)
+                try:
+                    async with self._signal_lock:
+                        await self._sync_on_chain_positions()
+                    self.logger.debug("Hourly position sync complete")
+                except Exception as e:
+                    self.logger.debug(f"Hourly position sync failed: {e}")
+
                 ET = ZoneInfo("America/New_York")
                 hour = datetime.now(ET).hour
                 if 9 <= hour <= 22:  # 9 AM to 11 PM ET (22:xx is the last alert)
