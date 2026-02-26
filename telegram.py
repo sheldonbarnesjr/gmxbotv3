@@ -1229,20 +1229,43 @@ class CoreTelegramMixin:
                 await asyncio.sleep(3600)
 
     async def send_hourly_pnl(self):
-        """Build and send the hourly PnL alert."""
+        """Build and send the hourly PnL alert.
+
+        Uses GMX subsquid for realized trade history (all wallets combined)
+        and on-chain data for open position unrealized PnL.
+        """
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_cutoff = today_start.timestamp()
+        today_cutoff = int(today_start.timestamp())
 
         PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
 
-        # Today's realized trades
-        todays_trades = [t for t in self.trade_history if t.closed_at >= today_cutoff and t.symbol in PNL_SYMBOLS]
-        realized_pnl = sum(t.pnl_usd for t in todays_trades)
-        realized_count = len(todays_trades)
+        # Build reverse map: market_address (lower) → symbol
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
 
-        # Open positions on-chain (unrealized + realized from partial TP closes)
+        # ── Today's realized trades from on-chain (all wallets, stored locally) ──
+        reset_ts = self._get_pnl_reset_ts()
+        since = max(today_cutoff, reset_ts) if reset_ts else today_cutoff
+
+        all_stored = await self._fetch_and_store_trades()
+        today_trades = [t for t in all_stored if t.get("timestamp", 0) >= since]
+
+        # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum
+        realized_pnl = 0.0
+        realized_count = 0
+        for t in today_trades:
+            if abs(t.get("pnl_usd", 0)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                realized_pnl += t["pnl_usd"]
+                realized_count += 1
+
+        # ── Open positions on-chain (unrealized + realized from partial TP closes) ──
         unrealized_pnl = 0.0
         tp_realized_pnl = 0.0
         open_count = 0
@@ -1257,14 +1280,19 @@ class CoreTelegramMixin:
                     unrealized_pnl += cp.unrealized_pnl
                     open_count += 1
                     side = "LONG" if cp.is_long else "SHORT"
-                    # Add realized PnL from executed TPs on this open position
+                    # Realized PnL from executed TPs (calculate from TP data)
                     pos_realized = 0.0
                     for ip in self.positions.values():
                         if (ip.is_open and ip.market_addr
                                 and ip.market_addr.lower() == cp.market.lower()
-                                and ip.side == side and ip.wallet_id == wid
-                                and ip.realized_pnl):
-                            pos_realized = ip.realized_pnl
+                                and ip.side == side and ip.wallet_id == wid):
+                            for tp in ip.take_profits:
+                                if tp.executed and cp.entry_price and cp.entry_price > 0:
+                                    tp_size = ip.size_usd * tp.percentage
+                                    if cp.is_long:
+                                        pos_realized += ((tp.price - cp.entry_price) / cp.entry_price) * tp_size
+                                    else:
+                                        pos_realized += ((cp.entry_price - tp.price) / cp.entry_price) * tp_size
                             tp_realized_pnl += pos_realized
                             break
                     total_pos = cp.unrealized_pnl + pos_realized
@@ -1283,19 +1311,13 @@ class CoreTelegramMixin:
         # Today's total = closed trades + open unrealized + open TP realized
         today_total = realized_pnl + unrealized_pnl + tp_realized_pnl
 
-        # All-time realized
-        all_trades = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
-        alltime_pnl = sum(t.pnl_usd for t in all_trades)
-        alltime_count = len(all_trades)
-
         # Build message
         r_sign = "+" if realized_pnl >= 0 else ""
         u_sign = "+" if unrealized_pnl >= 0 else ""
         tp_sign = "+" if tp_realized_pnl >= 0 else ""
         t_sign = "+" if today_total >= 0 else ""
-        a_sign = "+" if alltime_pnl >= 0 else ""
 
-        msg = f"📈 Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
+        msg = f"Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
 
         msg += f"**Today ({realized_count} closed)**\n"
         msg += f"  Closed:     {r_sign}${realized_pnl:,.2f}\n"
@@ -1304,13 +1326,10 @@ class CoreTelegramMixin:
         msg += f"  Unrealized: {u_sign}${unrealized_pnl:,.2f} ({open_count} open)\n"
         if open_lines:
             msg += "\n".join(open_lines) + "\n"
-        msg += f"  Today Total: {t_sign}${today_total:,.2f}\n"
-
-        msg += f"\n**All Time ({alltime_count} trades)**\n"
-        msg += f"  Realized: {a_sign}${alltime_pnl:,.2f}"
+        msg += f"  Today Total: {t_sign}${today_total:,.2f}"
 
         await self.notify(msg)
-        self.logger.info(f"Hourly PnL sent: today={t_sign}${today_total:,.2f}, alltime={a_sign}${alltime_pnl:,.2f}")
+        self.logger.info(f"Hourly PnL sent: today={t_sign}${today_total:,.2f}")
 
     async def send_daily_summary(self):
         cfg = self.cfg

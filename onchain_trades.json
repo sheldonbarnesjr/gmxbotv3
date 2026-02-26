@@ -1,0 +1,740 @@
+[
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 10.0,
+    "pnl_usd": -0.10344291948899619,
+    "timestamp": 1771274353,
+    "tx_hash": "8816a054690236f2e7f08b371a3d57e36b125a3a798a9d907d1b2b77ac5a30e0",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 10.0,
+    "pnl_usd": 0.0018632583534970927,
+    "timestamp": 1771275016,
+    "tx_hash": "07d398a562f1019ddbb45267134beb2f4a6b3f95e0d7dd3113bd0eebfe03089b",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 10.0,
+    "pnl_usd": -0.23589943110888306,
+    "timestamp": 1771342517,
+    "tx_hash": "4b239c8ee6adf3c6d32e1b63cd1136219383db114d0031747fce306faca39fa1",
+    "log_index": 35
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0020066232058939732,
+    "timestamp": 1771347216,
+    "tx_hash": "d5518601ff649c4a1dcea53c73be55f3aa13748cec827578c3d195cde643e2e9",
+    "log_index": 86
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.0040636424669517526,
+    "timestamp": 1771373123,
+    "tx_hash": "cda131bbcedd79069275e0225e1da267aec74f97ecd598de32c579db4514028d",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.004588408869561653,
+    "timestamp": 1771373301,
+    "tx_hash": "53f177f6d7d65862c899f7211d5b2a526c3c309685348ebeb4448e07cb12a256",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.008841973633732531,
+    "timestamp": 1771439803,
+    "tx_hash": "7b2606793d62f021e7a8e831b95ba0de888e2e0be595c1003bf4335801b28981",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.022048110649707405,
+    "timestamp": 1771463897,
+    "tx_hash": "e3b5841ba201a701a14dc9615922c1960dc718d5dfdadf96ca040e8d090a8877",
+    "log_index": 33
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 35.9060575,
+    "pnl_usd": -0.012131996719168158,
+    "timestamp": 1771464906,
+    "tx_hash": "e5b4472b7289a1088a03a7022fd1b7dbbde4fb4282bb022df81b6b1f8d5a3fde",
+    "log_index": 60
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 35.84215625,
+    "pnl_usd": 0.019378282118507253,
+    "timestamp": 1771465737,
+    "tx_hash": "f643755f030c023d2645a86690765b49ca427efb51274b0f2a09d1f1175808c4",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 5.0,
+    "pnl_usd": -0.00012787421185669429,
+    "timestamp": 1771466236,
+    "tx_hash": "c245ed17d733e07ddaccafd1ecd8c7cd7442629f5f6691d1ebd1f6f695f69c6b",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 5.0,
+    "pnl_usd": -0.00046209356654683506,
+    "timestamp": 1771466237,
+    "tx_hash": "7c1e55bedef62b34f5b1dff2ab8e57fa1cd0a0bbfdeb7b5dc5c164a971359f51",
+    "log_index": 28
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 10.0,
+    "pnl_usd": 0.016446727145073045,
+    "timestamp": 1771466843,
+    "tx_hash": "ceac05bae81f47dd08aef0f6ece4221cfce35584f8b648258b2afc6287f63e3f",
+    "log_index": 32
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 79.1985325,
+    "pnl_usd": 0.03722124246008795,
+    "timestamp": 1771467219,
+    "tx_hash": "505bcbd68f25d9a8d0f49be9e2e80c18050ccf28b053d29b79e05fb1ca691e8f",
+    "log_index": 58
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 79.09384625,
+    "pnl_usd": 0.031708445742911213,
+    "timestamp": 1771467832,
+    "tx_hash": "2d1cf74f45df0f1f6d7edb2f8b52d7fca31a15def7a259f8e85bce0b8bd8c598",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 59.2425625,
+    "pnl_usd": 0.013772275356660577,
+    "timestamp": 1771469577,
+    "tx_hash": "98506b8dea4242d349a36bff8c7368c850f27035d45a3c2ba1df80a34d27756b",
+    "log_index": 28
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 78.9900825,
+    "pnl_usd": 0.08315422960074109,
+    "timestamp": 1771470063,
+    "tx_hash": "6de429a752dc60ffd2aec59cef2ed06adadc88a33b7032f63767cfbdcfcb40ae",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 59.166777499999995,
+    "pnl_usd": -0.05287991058074391,
+    "timestamp": 1771470201,
+    "tx_hash": "a608686e896fcf724dadb180972808dda4887c8dbef270c9b127bd2b467cc233",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 64.0187125,
+    "pnl_usd": 0.07671236483683211,
+    "timestamp": 1771471088,
+    "tx_hash": "ba59c58b2c36071afe3664a3f0e2b9c0c75969a8e8513a7336fe2195e539eb92",
+    "log_index": 37
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 100.0,
+    "pnl_usd": 0.01630608345654187,
+    "timestamp": 1771472148,
+    "tx_hash": "897f2ef3975c41d80c1bf20f7ae58605a75a07c52f1f181df45a019effd2178e",
+    "log_index": 28
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 78.58393125,
+    "pnl_usd": -0.023043638416913058,
+    "timestamp": 1771472388,
+    "tx_hash": "b5cc0477fc81970607aa47adeaf9ff534d7b7257164c38c2ac316a013d133684",
+    "log_index": 33
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 58.787273750000004,
+    "pnl_usd": -0.08702753668818505,
+    "timestamp": 1771472395,
+    "tx_hash": "0539022dbf322ca6d367cf681ca9123d5147055563fa4162e92fa7d02b108029",
+    "log_index": 28
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0013969355413322292,
+    "timestamp": 1771570324,
+    "tx_hash": "a72c960e61e9fc7a826cb78b829f16a03c026962dc80f7b07787b0ad4737c066",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0005065422262497455,
+    "timestamp": 1771570648,
+    "tx_hash": "93d116c2a49badcf55ce5632c1761a49833c7faf0e0ccc921a76b54d6c808088",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0009701586983866512,
+    "timestamp": 1771570800,
+    "tx_hash": "2bb5682c7190fc2f27f8c41be7c9fd03aa7e02abd214cb9cc62fbba6ee8ea53c",
+    "log_index": 36
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.008070998902724067,
+    "timestamp": 1771570997,
+    "tx_hash": "2d342af031279b4b864face8abab8d96953c8a75b49801972eac0b2f0983d721",
+    "log_index": 49
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0020014917062028204,
+    "timestamp": 1771571120,
+    "tx_hash": "5a17258f1da9825b5289f6f2a3ef3974960d8e6fb267f3f2b505485fb6103dfc",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0013578131338434134,
+    "timestamp": 1771571466,
+    "tx_hash": "969baa4c9eda1c5e5cd23e61f002c850557143eb9f8455f2d5a2ec2c34137386",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.013509556971292658,
+    "timestamp": 1771571761,
+    "tx_hash": "7a4a2eecf8bf31b521ea6c404040267573cbbb9bc240266152671789fc21ab49",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.006420650243136141,
+    "timestamp": 1771571764,
+    "tx_hash": "eaf2f6580dba1e3cb3710cdbd0dd6d89258682e411946a2440188354db476257",
+    "log_index": 48
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.02853072214635196,
+    "timestamp": 1771574459,
+    "tx_hash": "9da8e39c3598897f9cdfc6490f58e3cd615bd9110b8a91e8b44847bc72a1b4e4",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.02414486974240398,
+    "timestamp": 1771574462,
+    "tx_hash": "99fdbe28bd9a2d340d69b60413bb513de769a710f8222575d9b34c5d85bb15fd",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.02652248425088519,
+    "timestamp": 1771574465,
+    "tx_hash": "1680d8f148ac60a7d4b88bc4c928756c4b45dfa698fe3c429106c00233ff9bce",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.009982884974289069,
+    "timestamp": 1771574918,
+    "tx_hash": "4db7977faf8e0cf4acf321b4fceb1ea814653547b36be3bc6d49fd53d4a6d7b7",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.011273657864492486,
+    "timestamp": 1771574920,
+    "tx_hash": "9db3cdcf462bf7d1ec21856f5c8f9d5810a3157b13458b1d1955b9f0c6cd75d5",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.01157687037364698,
+    "timestamp": 1771575340,
+    "tx_hash": "586da9e80ee0eb681d019445e8b06b5a810b0e72114788951d8ae09caad7e4a3",
+    "log_index": 35
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0034368323322810242,
+    "timestamp": 1771575342,
+    "tx_hash": "c87c52ebbd23f92c21c08618b605e95b2b1f1488e239f551ef29a499ddad9f48",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.013634423328366273,
+    "timestamp": 1771575835,
+    "tx_hash": "41e5b4b0c7829f0fdb42fe6d7b23a25959213800bc265ae7516b3d3cc332cb72",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.015761333558762934,
+    "timestamp": 1771575837,
+    "tx_hash": "e1faac0375f608e0b4ac7add00ced86995c657672ee5c6b0eb907e366c9048e7",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.014540384141446837,
+    "timestamp": 1771575840,
+    "tx_hash": "4c911134e6279f524bc1f980305b9208c7d0469ec3b695732a109f69d1d93ada",
+    "log_index": 127
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.001686472579444352,
+    "timestamp": 1771575841,
+    "tx_hash": "ddf51a6ca4651ff6505654bb0aa465796c906ee33cc955ada65f09c77554aa61",
+    "log_index": 45
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.01411553507519609,
+    "timestamp": 1771575843,
+    "tx_hash": "b1cd182f5509a1e9e636aa3bd89b5392b1651ea9fa34934afda2291a12f217ca",
+    "log_index": 112
+  },
+  {
+    "market_address": "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9",
+    "is_long": true,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.013186826743110074,
+    "timestamp": 1771575846,
+    "tx_hash": "6fc892e3a2ad5d3d89e1200924230dc1ca65e607662e56b1e1537271fc0d7ce2",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 100.0,
+    "pnl_usd": 0.012559747864604781,
+    "timestamp": 1771653294,
+    "tx_hash": "dd4753b193386b2ba4c75ec34b3912f96a877304bc8879308b391739b5f368f1",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 100.0,
+    "pnl_usd": -0.014581110647879422,
+    "timestamp": 1771653803,
+    "tx_hash": "4a1cd675456a7e4a7a02b7cd7fc9dca7c38e9f36bbbe1916f1ed5e0f3b4867de",
+    "log_index": 33
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": true,
+    "size_delta_usd": 100.0,
+    "pnl_usd": 0.010709908604231023,
+    "timestamp": 1771743052,
+    "tx_hash": "7d046f0d819251ae5618de092959f4172b341d024b6abf8c25c281597a520b08",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 10.0,
+    "pnl_usd": 0.06814998417157786,
+    "timestamp": 1771808858,
+    "tx_hash": "d98ec2e7a39640cb136db2db3e9a229475e6f2e7643619953cdefb1645e1d26c",
+    "log_index": 47
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 192.68960507229326,
+    "pnl_usd": 0.8280790404637475,
+    "timestamp": 1771835105,
+    "tx_hash": "bf4ad83e9f925d44adbb0c9b7a8b289b0f0cde17ebf85c562ac5bc794fb2b736",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 1091.9077620763285,
+    "pnl_usd": 4.037635051694247,
+    "timestamp": 1771835216,
+    "tx_hash": "8ea10439da3c7a8a4dc44dcd4355bd7f309b33aaedb7d33aaedb8055d20d5e83",
+    "log_index": 32
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 454.37269091458967,
+    "pnl_usd": -0.121221574812805,
+    "timestamp": 1771981963,
+    "tx_hash": "c2daa7faa786863bd43bf6417f0dc90f8297e9cf467adc7c182da4c215918092",
+    "log_index": 36
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 40.0,
+    "pnl_usd": 0.001684029631171888,
+    "timestamp": 1771988866,
+    "tx_hash": "bdc5b73c2e6b289c62bbadac0349e49596d63ce1d9e113a613bc004487dd8450",
+    "log_index": 30
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.0009074132418398352,
+    "timestamp": 1771989200,
+    "tx_hash": "feef896cbc3945b6a1aad33f1bf22c93bbe5ba24bf71c59ec71bffc79df01b3d",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 667.80529,
+    "pnl_usd": 4.358839081197604,
+    "timestamp": 1771989377,
+    "tx_hash": "8553e80ee27d8f83c8499c856b81dfbc9022157599e1736bc7d15fe1cd617dd1",
+    "log_index": 73
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.004512376143978136,
+    "timestamp": 1771989521,
+    "tx_hash": "f5648787cdff145395acbf2fbf1493362332ce0f025cb412814daf5246ca46fa",
+    "log_index": 47
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.015290872964072293,
+    "timestamp": 1771989741,
+    "tx_hash": "230bf3b52a73e4bf390826a8669e7bb4b143141b78195e92af58f86b9586017e",
+    "log_index": 37
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.002926194564959634,
+    "timestamp": 1771990043,
+    "tx_hash": "ef62142dae9bd8d1a35a1b231dcb2e9cf19033fab304e890635293fa2027213a",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -1.9728616778008808e-05,
+    "timestamp": 1771991141,
+    "tx_hash": "e55238a49e3caa20fc60638766fa52376f33fb279a23189e05bd090532f8f025",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.024253588437432947,
+    "timestamp": 1771991508,
+    "tx_hash": "02d666dd67f4bdfc9972e66036819ef6d8e24b8e86a126b979194da02cf6f153",
+    "log_index": 33
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.00019526406931952357,
+    "timestamp": 1771991736,
+    "tx_hash": "b06684121c7fb33fdcaba8196daff0264b07ec4b38b4e504d65aa6595b38ecf4",
+    "log_index": 52
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 500.8539675,
+    "pnl_usd": 7.823091873630779,
+    "timestamp": 1771992189,
+    "tx_hash": "5f0073b733be2f9693de9e70df7056541b35a90533bf6b29d8613025e71e933d",
+    "log_index": 77
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 40.0,
+    "pnl_usd": 0.007824918104178059,
+    "timestamp": 1771992654,
+    "tx_hash": "6474945330ab7d082173d89b3570414719aeeb1227262ab3827c8dc853672168",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.015143533298831332,
+    "timestamp": 1771993060,
+    "tx_hash": "04dae6399ee95ac438a1be14f38078e6c9fe4e3cae3aef590a50f3ad7879e044",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.012221245009974615,
+    "timestamp": 1771993659,
+    "tx_hash": "138e74094e30d1e1191da6aff12ac56a103e2f2e98be894c61fd89d2783832c7",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.011439109457827749,
+    "timestamp": 1771994217,
+    "tx_hash": "3b8f396b141e85e98383d000b4f96898ee705304afc6951f62031e28786bbee4",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.02770212023143005,
+    "timestamp": 1771995286,
+    "tx_hash": "58329a7aa2cd05b3bd3f756e8505a2365e26880fa2316d3457d35a13d308df04",
+    "log_index": 34
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.0006363242360871873,
+    "timestamp": 1771996762,
+    "tx_hash": "e56552990071942cb3fde1d7ca2b66ff0867368d46480d4c3cc6409a896511c9",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 500.8539675000001,
+    "pnl_usd": -0.2345603055975479,
+    "timestamp": 1772024063,
+    "tx_hash": "66d67aff779d5ba12133e73852c55fb0ce0776f1ced123ca739d9c0be73682e7",
+    "log_index": 90
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": -0.05237683298834563,
+    "timestamp": 1772036376,
+    "tx_hash": "284f2ad3776fbbd44ad454b0896cdd67cdcbacce950c151b81eb6d468bcd0c47",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.03426228552417649,
+    "timestamp": 1772037279,
+    "tx_hash": "e0c055cd51775e89f20e6e7952039848c4ba72d8570e4e99807771d42d2f86d9",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 126.34253000000002,
+    "pnl_usd": 0.33796041168489127,
+    "timestamp": 1772050714,
+    "tx_hash": "f3567590d1365cc300cdee4b7f8c75c532244622c5da55f4d41b029bc15f0503",
+    "log_index": 28
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 842.1068212699987,
+    "pnl_usd": 3.404946456534107,
+    "timestamp": 1772051111,
+    "tx_hash": "34b983cdfa8e56d0cd0600afcb0ff6ae60282e8adb72e9d26c67a59aab1ec0cd",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 842.239348,
+    "pnl_usd": 3.5843316212560294,
+    "timestamp": 1772051308,
+    "tx_hash": "446c9474a1d6760c28e9a36ac6f73fee4b19f71c0e2184f682b0fbc9d6d1bc0c",
+    "log_index": 43
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 1000.0000000000001,
+    "pnl_usd": -2.459791409215349,
+    "timestamp": 1772051957,
+    "tx_hash": "3790d9829d0b6eca0512179a66c5caa91f45dd9cb1208f797dc6cd8bab10dc91",
+    "log_index": 33
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 850.0,
+    "pnl_usd": 0.3393867937475975,
+    "timestamp": 1772052092,
+    "tx_hash": "c3b4d40c3d6a48df1c93c449932e2721f48436aaf2e76145809164bf84452954",
+    "log_index": 29
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 80.0,
+    "pnl_usd": 0.9604863946206663,
+    "timestamp": 1772059233,
+    "tx_hash": "d90afba2b8f7647306e2f5f7c31724612beddedd8153b09df350222394c8294e",
+    "log_index": 31
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 80.0,
+    "pnl_usd": 1.7180941215115748,
+    "timestamp": 1772062978,
+    "tx_hash": "67f22f7729a4f6581da86ceb1bc567726727e3fee98a283f14533454097bda70",
+    "log_index": 111
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 20.0,
+    "pnl_usd": 0.014042876471847496,
+    "timestamp": 1772069053,
+    "tx_hash": "a3d9fbb56fe1386555857f9f1bf0e6bf154b0e9a2c944b880afe6f05cf86348a",
+    "log_index": 36
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 850.0,
+    "pnl_usd": 7.752879599360459,
+    "timestamp": 1772069615,
+    "tx_hash": "5203535f1a025e2a6d62478fb225c6c29044c075e9ad5388cf82b557cdc44dbd",
+    "log_index": 49
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 85.0,
+    "pnl_usd": 1.0482193771555064,
+    "timestamp": 1772118983,
+    "tx_hash": "29f83442c37d0aecb6fc7aa1a3cb1f8ec29ec471a6b1d10291e3d2b8d3dff36e",
+    "log_index": 179
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 560.0,
+    "pnl_usd": 17.714053704806496,
+    "timestamp": 1772119172,
+    "tx_hash": "2b6c81e692fcde75659f966883ff5f9a998d90f4249aea092fb7cf0f2ef15ca1",
+    "log_index": 66
+  },
+  {
+    "market_address": "0x70d95587d40a2caf56bd97485ab3eec10bee6336",
+    "is_long": false,
+    "size_delta_usd": 85.0,
+    "pnl_usd": 2.610239271101456,
+    "timestamp": 1772124380,
+    "tx_hash": "256f33be2a92585d094b9cc1d473d3bbc2a5f5286b4878e7798e9d2da3c040a0",
+    "log_index": 70
+  },
+  {
+    "market_address": "0x47c031236e19d024b42f8ae6780e44a573170703",
+    "is_long": false,
+    "size_delta_usd": 80.00000000000003,
+    "pnl_usd": 2.258495785685049,
+    "timestamp": 1772131292,
+    "tx_hash": "cb512eb462516297b7e990453bb8b6c51d4b0e120de65ee1de7032ea95e7aa27",
+    "log_index": 30
+  }
+]

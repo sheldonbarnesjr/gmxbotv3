@@ -39,6 +39,7 @@ from risk import calculate_unrealized_pnl, calculate_pnl_percentage
 logger = logging.getLogger("GMXBot.analytics")
 
 TRADE_HISTORY_FILE = "trade_history.json"
+ONCHAIN_TRADES_FILE = "onchain_trades.json"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -76,7 +77,8 @@ class AnalyticsMixin:
         Returns:
             Dict with keys: win_rate, wins, losses, total, avg_win, avg_loss, pnl
         """
-        trades = self.trade_history
+        # Exclude dust trades (< $1 PnL)
+        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
 
         if symbol:
             trades = [t for t in trades if t.symbol == symbol]
@@ -235,111 +237,205 @@ class AnalyticsMixin:
     # Telegram command: /pnl
     # ──────────────────────────────────────────────────────────────────────
 
+    # ── PnL reset timestamp persistence ──
+
+    PNL_RESET_FILE = "pnl_reset.json"
+
+    def _get_pnl_reset_ts(self) -> int:
+        """Load the PnL reset timestamp. Returns 0 if never reset."""
+        try:
+            with open(self.PNL_RESET_FILE, "r") as f:
+                data = json.load(f)
+                return int(data.get("reset_ts", 0))
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return 0
+
+    def _set_pnl_reset_ts(self, ts: int):
+        """Save the PnL reset timestamp."""
+        with open(self.PNL_RESET_FILE, "w") as f:
+            json.dump({"reset_ts": ts}, f)
+
+    # ── On-chain trade local storage ──
+
+    def _load_onchain_trades(self) -> List[Dict[str, Any]]:
+        """Load locally-stored on-chain trades."""
+        if not os.path.exists(ONCHAIN_TRADES_FILE):
+            return []
+        try:
+            with open(ONCHAIN_TRADES_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    def _save_onchain_trades(self, trades: List[Dict[str, Any]]):
+        """Persist on-chain trades to disk."""
+        try:
+            with open(ONCHAIN_TRADES_FILE, "w") as f:
+                json.dump(trades, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save onchain trades: {e}")
+
+    async def _fetch_and_store_trades(self) -> List[Dict[str, Any]]:
+        """Fetch on-chain trades, merge with local store, save, and return all.
+
+        Fresh RPC data covers the last 30 days. Local store keeps everything
+        older than that so trades are never lost.
+        """
+        from history import fetch_trade_history
+
+        # Fetch fresh on-chain trades across all wallets
+        fresh = []
+        try:
+            for wid, acct in self._all_wallets():
+                trades = await asyncio.to_thread(
+                    fetch_trade_history, self.w3, acct.address
+                )
+                fresh.extend(trades)
+        except Exception as e:
+            self.logger.warning(f"On-chain trade fetch failed: {e}")
+
+        # Load existing local store
+        stored = self._load_onchain_trades()
+
+        # Merge: use tx_hash:log_index as unique key.
+        # Fresh data (with log_index) replaces old stored data (without log_index).
+        by_key = {}
+        stored_tx_only = set()  # track old-format entries to remove when fresh arrives
+        for t in stored:
+            tx = t.get("tx_hash", "")
+            li = t.get("log_index")
+            if tx and li is not None:
+                by_key[f"{tx}:{li}"] = t
+            elif tx:
+                by_key[tx] = t
+                stored_tx_only.add(tx)
+        for t in fresh:
+            tx = t.get("tx_hash", "")
+            li = t.get("log_index", 0)
+            if tx:
+                # Remove old-format entry if fresh has log_index
+                if tx in stored_tx_only and tx in by_key:
+                    del by_key[tx]
+                    stored_tx_only.discard(tx)
+                by_key[f"{tx}:{li}"] = t
+
+        merged = sorted(by_key.values(), key=lambda x: x.get("timestamp", 0))
+        self._save_onchain_trades(merged)
+        self.logger.info(f"On-chain trades: {len(fresh)} fetched, {len(merged)} total stored")
+        return merged
+
     async def cmd_pnl(self, chat_id: int):
         """Telegram /pnl command handler.
 
-        Shows PnL summary for BTC, ETH, SOL by time periods:
-          - Today (24h)
-          - 30 Days
-          - All Time
-          - Open (unrealized)
+        Queries on-chain event logs for trade history across all wallets
+        (combined), plus current open position unrealized PnL from chain.
+
+        Shows:
+          - Today: realized + unrealized + combined total
+          - 30 Days / All Time: realized with win rate
         """
         PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
-        now = time.time()
-        today_cutoff = now - 86400
-        month_cutoff = now - 30 * 86400
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_cutoff = int(today_start.timestamp())
+        reset_ts = self._get_pnl_reset_ts()
 
-        def pnl_stats(trades):
-            if not trades:
+        # Build reverse map: market_address (lower) → symbol
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
+
+        # ── Fetch on-chain trades (merged with local store) ──
+        all_stored = await self._fetch_and_store_trades()
+        # Apply reset timestamp filter
+        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+
+        def bucket_stats(trades_list):
+            if not trades_list:
                 return {"pnl": 0.0, "trades": 0, "wins": 0}
-            pnl = sum(t.pnl_usd for t in trades)
-            wins = sum(1 for t in trades if t.pnl_usd > 0)
-            return {"pnl": pnl, "trades": len(trades), "wins": wins}
+            pnl = sum(t["pnl_usd"] for t in trades_list)
+            wins = sum(1 for t in trades_list if t["pnl_usd"] > 0)
+            return {"pnl": pnl, "trades": len(trades_list), "wins": wins}
 
-        def format_section(label, symbol_stats):
-            lines = [f"**{label}**"]
-            total = 0.0
-            for sym in ("BTC", "ETH", "SOL"):
-                s = symbol_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
-                sign = "+" if s["pnl"] >= 0 else ""
-                wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
-                lines.append(f"  {sym}: {sign}${s['pnl']:,.2f}  ({wr})")
-                total += s["pnl"]
-            sign = "+" if total >= 0 else ""
-            lines.append(f"  Total: {sign}${total:,.2f}")
-            return "\n".join(lines)
+        # Tag each trade with symbol, exclude dust trades (< $1 PnL)
+        tagged = []
+        for t in all_trades:
+            if abs(t.get("pnl_usd", 0)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                entry = dict(t)  # copy to avoid mutating stored data
+                entry["_sym"] = sym
+                tagged.append(entry)
 
-        relevant = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
-        today_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym and t.closed_at >= today_cutoff]) for sym in PNL_SYMBOLS}
-        month_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym and t.closed_at >= month_cutoff]) for sym in PNL_SYMBOLS}
-        alltime_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym]) for sym in PNL_SYMBOLS}
+        now_ts = int(time.time())
+        month_cutoff = now_ts - 30 * 86400
 
+        today_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym and t["timestamp"] >= today_cutoff]) for sym in PNL_SYMBOLS}
+        month_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym and t["timestamp"] >= month_cutoff]) for sym in PNL_SYMBOLS}
+        alltime_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym]) for sym in PNL_SYMBOLS}
+
+        # ── Open positions: unrealized from chain ──
         open_unrealized = {sym: 0.0 for sym in PNL_SYMBOLS}
-        open_realized = {sym: 0.0 for sym in PNL_SYMBOLS}
-        open_fees = {sym: 0.0 for sym in PNL_SYMBOLS}
-        any_onchain = False
         try:
             for wid, acct in self._all_wallets():
                 cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
                 for cp in cps:
                     sym = cp.symbol.upper().split("/")[0]
-                    if sym not in PNL_SYMBOLS:
-                        continue
-                    open_unrealized[sym] = open_unrealized.get(sym, 0.0) + cp.unrealized_pnl
-                    if getattr(cp, 'pnl_source', 'local') == "onchain":
-                        any_onchain = True
-                        open_fees[sym] = open_fees.get(sym, 0.0) + (
-                            cp.borrowing_fee_usd + cp.funding_fee_usd + cp.closing_fee_usd
-                        )
-                    # Add realized PnL from executed TPs on this open position
-                    side = "LONG" if cp.is_long else "SHORT"
-                    for ip in self.positions.values():
-                        if (ip.is_open and ip.market_addr
-                                and ip.market_addr.lower() == cp.market.lower()
-                                and ip.side == side and ip.wallet_id == wid
-                                and ip.realized_pnl):
-                            open_realized[sym] = open_realized.get(sym, 0.0) + ip.realized_pnl
-                            break
+                    if sym in PNL_SYMBOLS:
+                        open_unrealized[sym] += cp.unrealized_pnl
         except Exception as e:
             self.logger.warning(f"/pnl: could not fetch chain positions: {e}")
 
-        onchain_tag = " (on-chain)" if any_onchain else ""
-        has_realized = any(v != 0 for v in open_realized.values())
-        open_lines = [f"**Open{onchain_tag}**"]
-        open_total = 0.0
-        total_fees = 0.0
+        # ── Format helpers ──
+        def _sign(v):
+            return "+" if v >= 0 else ""
+
+        def format_section(label, symbol_stats):
+            lines = [f"**{label}**"]
+            total_pnl = 0.0
+            total_trades = 0
+            total_wins = 0
+            for sym in ("BTC", "ETH", "SOL"):
+                s = symbol_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
+                wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
+                lines.append(f"  {sym}: {_sign(s['pnl'])}${s['pnl']:,.2f}  ({wr})")
+                total_pnl += s["pnl"]
+                total_trades += s["trades"]
+                total_wins += s["wins"]
+            wr_total = f"{total_wins}/{total_trades}" if total_trades else "—"
+            winrate = f"{total_wins / total_trades * 100:.0f}%" if total_trades else "—"
+            lines.append(f"  Total: {_sign(total_pnl)}${total_pnl:,.2f}  ({wr_total} | {winrate} WR)")
+            return "\n".join(lines)
+
+        # ── Build Today section with realized + unrealized ──
+        today_realized = sum(s["pnl"] for s in today_stats.values())
+        today_unrealized = sum(open_unrealized.values())
+        today_combined = today_realized + today_unrealized
+        today_trades = sum(s["trades"] for s in today_stats.values())
+        today_wins = sum(s["wins"] for s in today_stats.values())
+        today_wr = f"{today_wins / today_trades * 100:.0f}%" if today_trades else "—"
+
+        today_lines = ["**Today**"]
         for sym in ("BTC", "ETH", "SOL"):
+            s = today_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
             unr = open_unrealized.get(sym, 0.0)
-            rlz = open_realized.get(sym, 0.0)
-            fees = open_fees.get(sym, 0.0)
-            total = unr + rlz
-            sign = "+" if total >= 0 else ""
-            parts = []
-            if has_realized:
-                r_sign = "+" if rlz >= 0 else ""
-                u_sign = "+" if unr >= 0 else ""
-                parts.append(f"rlz: {r_sign}${rlz:,.2f}, unrlz: {u_sign}${unr:,.2f}")
-            if fees > 0:
-                parts.append(f"fees: -${fees:,.2f}")
-            detail = f"  ({', '.join(parts)})" if parts else ""
-            open_lines.append(f"  {sym}: {sign}${total:,.2f}{detail}")
-            open_total += total
-            total_fees += fees
-        sign = "+" if open_total >= 0 else ""
-        open_lines.append(f"  Total: {sign}${open_total:,.2f}")
-        if total_fees > 0:
-            open_lines.append(f"  Total Fees: -${total_fees:,.2f}")
+            wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
+            line = f"  {sym}: {_sign(s['pnl'])}${s['pnl']:,.2f}  ({wr})"
+            if unr != 0:
+                line += f"  |  open: {_sign(unr)}${unr:,.2f}"
+            today_lines.append(line)
+        today_lines.append(f"  Realized:   {_sign(today_realized)}${today_realized:,.2f}  ({today_wins}/{today_trades} | {today_wr} WR)")
+        today_lines.append(f"  Unrealized: {_sign(today_unrealized)}${today_unrealized:,.2f}")
+        today_lines.append(f"  **Total:    {_sign(today_combined)}${today_combined:,.2f}**")
 
-        if not relevant:
-            closed_section = "No closed trades recorded yet.\nTrades are saved when you use /close."
-        else:
-            closed_section = (
-                format_section("Today (24h)", today_stats) + "\n\n"
-                + format_section("30 Days", month_stats) + "\n\n"
-                + format_section("All Time", alltime_stats)
-            )
-
-        msg = "**PnL Summary — BTC / ETH / SOL**\n\n" + closed_section + "\n\n" + "\n".join(open_lines)
+        # ── Build message ──
+        msg = "**PnL Summary — BTC / ETH / SOL**\n\n"
+        msg += "\n".join(today_lines)
+        msg += "\n\n" + format_section("30 Days", month_stats)
+        msg += "\n\n" + format_section("All Time", alltime_stats)
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -349,18 +445,24 @@ class AnalyticsMixin:
     async def cmd_reset(self, chat_id: int):
         """Telegram /reset command handler.
 
-        Clears all trade history and resets PnL/win rate stats.
+        Saves a reset timestamp so /pnl only queries trades after this point.
+        Also clears local trade history and health stats.
         """
         count = len(self.trade_history)
         self.trade_history.clear()
         self._save_trade_history()
         self.health_stats["trades_executed"] = 0
         self.health_stats["signals_processed"] = 0
-        self.logger.info(f"Trade history reset: cleared {count} trade(s)")
+
+        # Save reset timestamp — /pnl will only show trades after this
+        reset_ts = int(time.time())
+        self._set_pnl_reset_ts(reset_ts)
+
+        self.logger.info(f"Trade history reset: cleared {count} trade(s), reset_ts={reset_ts}")
         await self.send_message(
             chat_id,
-            f"Trade history cleared ({count} trade records removed).\n"
-            "PnL and win rate stats have been reset to zero."
+            f"PnL reset. Only trades from now onward will appear in /pnl.\n"
+            f"(Cleared {count} local trade records)"
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -394,15 +496,29 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_pdf(self, chat_id: int):
-        """Generate and send a PDF of all closed trade history."""
-        if not self.trade_history:
-            await self.send_message(chat_id, "No closed trades to export.")
+        """Generate and send a PDF of all trade history (on-chain + local)."""
+        await self.send_message(chat_id, "Fetching on-chain trades & generating PDF...")
+
+        # Build market_address → symbol map
+        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
+
+        # Fetch on-chain trades (merged with local store)
+        all_stored = await self._fetch_and_store_trades()
+        reset_ts = self._get_pnl_reset_ts()
+        on_chain = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+
+        if not on_chain and not self.trade_history:
+            await self.send_message(chat_id, "No trades to export.")
             return
 
-        await self.send_message(chat_id, "Generating trade history PDF...")
-
         try:
-            pdf_path = await asyncio.to_thread(self._generate_trade_pdf)
+            pdf_path = await asyncio.to_thread(
+                self._generate_trade_pdf, on_chain, market_to_sym
+            )
             bot_api_chats = getattr(self, '_bot_api_chats', set())
             if chat_id in bot_api_chats:
                 import bot_api
@@ -417,10 +533,57 @@ class AnalyticsMixin:
             self.logger.error(f"PDF generation failed: {e}")
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
-    def _generate_trade_pdf(self) -> str:
-        """Build the PDF file and return its path."""
+    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict) -> str:
+        """Build the PDF file with all trades (on-chain + local) and return its path."""
         ET = ZoneInfo("America/New_York")
-        trades = self.trade_history
+
+        # ── Normalize on-chain trades into unified dicts ──
+        unified = []
+        seen_keys = set()
+        for t in on_chain_trades:
+            tx = t.get("tx_hash", "")
+            li = t.get("log_index", 0)
+            key = f"{tx}:{li}" if tx else ""
+            sym = market_to_sym.get((t.get("market_address") or "").lower(), "???")
+            side = "LONG" if t.get("is_long") else "SHORT"
+            pnl = t.get("pnl_usd", 0.0)
+            unified.append({
+                "symbol": sym,
+                "side": side,
+                "size_usd": t.get("size_delta_usd", 0.0),
+                "pnl_usd": pnl,
+                "timestamp": t.get("timestamp", 0),
+                "tx_hash": tx,
+                "source": "chain",
+            })
+            if key:
+                seen_keys.add(key)
+            if tx:
+                seen_keys.add(tx)  # also track bare tx_hash for local dedup
+
+        # Add local trades that aren't already in on-chain set
+        for t in self.trade_history:
+            tx = getattr(t, "tx_hash", "") or getattr(t, "id", "")
+            if tx in seen_keys:
+                continue
+            unified.append({
+                "symbol": t.symbol,
+                "side": t.side,
+                "size_usd": t.size_usd,
+                "pnl_usd": t.pnl_usd,
+                "timestamp": t.closed_at,
+                "tx_hash": tx,
+                "source": "local",
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "leverage": t.leverage,
+                "exit_reason": t.exit_reason,
+                "pnl_percentage": t.pnl_percentage,
+            })
+
+        # Exclude dust trades (< $1 PnL) and sort newest first
+        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1]
+        unified.sort(key=lambda x: x["timestamp"], reverse=True)
 
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
@@ -438,12 +601,12 @@ class AnalyticsMixin:
         pdf.ln(6)
 
         # ── Summary ──
-        total_pnl = sum(t.pnl_usd for t in trades)
-        wins = [t for t in trades if t.pnl_usd > 0]
-        losses = [t for t in trades if t.pnl_usd < 0]
-        win_rate = (len(wins) / len(trades) * 100) if trades else 0
-        avg_win = sum(t.pnl_usd for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t.pnl_usd for t in losses) / len(losses) if losses else 0
+        total_pnl = sum(t["pnl_usd"] for t in unified)
+        wins = [t for t in unified if t["pnl_usd"] > 0]
+        losses = [t for t in unified if t["pnl_usd"] < 0]
+        win_rate = (len(wins) / len(unified) * 100) if unified else 0
+        avg_win = sum(t["pnl_usd"] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0
 
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
@@ -451,7 +614,7 @@ class AnalyticsMixin:
 
         pnl_sign = "+" if total_pnl >= 0 else ""
         summary_lines = [
-            f"Total Trades: {len(trades)}",
+            f"Total Trades: {len(unified)}",
             f"Win Rate: {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)",
             f"Net PnL: {pnl_sign}${total_pnl:,.2f}",
             f"Avg Win: +${avg_win:,.2f}" if avg_win >= 0 else f"Avg Win: ${avg_win:,.2f}",
@@ -467,36 +630,53 @@ class AnalyticsMixin:
 
         # ── Trade List (newest first) ──
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "Trades", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 8, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
 
-        for i, t in enumerate(reversed(trades), 1):
-            closed_dt = datetime.fromtimestamp(t.closed_at, tz=ET)
-            date_str = closed_dt.strftime("%b %d, %Y %I:%M %p")
+        for i, t in enumerate(unified, 1):
+            ts = t["timestamp"]
+            if ts:
+                trade_dt = datetime.fromtimestamp(ts, tz=ET)
+                date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
+            else:
+                date_str = "Unknown"
 
-            wallet_str = f" [W{t.wallet_id}]" if t.wallet_id > 0 else ""
-            pnl_sign = "+" if t.pnl_usd >= 0 else ""
-            pct_sign = "+" if t.pnl_percentage >= 0 else ""
+            pnl = t["pnl_usd"]
+            pnl_sign = "+" if pnl >= 0 else ""
 
             # Green for wins, red for losses
-            if t.pnl_usd >= 0:
+            if pnl >= 0:
                 pdf.set_text_color(0, 128, 0)
             else:
                 pdf.set_text_color(200, 0, 0)
 
             pdf.set_font("Helvetica", "B", 10)
-            pdf.cell(0, 6, f"#{i}  {t.symbol} {t.side}{wallet_str}", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
 
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 9)
 
-            pdf.cell(0, 5, f"  Entry: ${t.entry_price:,.2f}  |  Exit: ${t.exit_price:,.2f}", new_x="LMARGIN", new_y="NEXT")
-            pdf.cell(
-                0, 5,
-                f"  Size: ${t.size_usd:,.2f} @ {t.leverage:.0f}x  |  "
-                f"PnL: {pnl_sign}${t.pnl_usd:,.2f} ({pct_sign}{t.pnl_percentage:.1f}%)",
-                new_x="LMARGIN", new_y="NEXT",
-            )
-            pdf.cell(0, 5, f"  Closed: {date_str}  |  Reason: {t.exit_reason}", new_x="LMARGIN", new_y="NEXT")
+            # Show entry/exit if available (local trades), otherwise just size + PnL
+            if t.get("entry_price") and t.get("exit_price"):
+                pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
+                lev = t.get("leverage", 0)
+                pct = t.get("pnl_percentage", 0)
+                pct_sign = "+" if pct >= 0 else ""
+                pdf.cell(
+                    0, 5,
+                    f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
+                    f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
+                    new_x="LMARGIN", new_y="NEXT",
+                )
+            else:
+                pdf.cell(
+                    0, 5,
+                    f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
+                    new_x="LMARGIN", new_y="NEXT",
+                )
+
+            reason = t.get("exit_reason", "")
+            reason_str = f"  |  Reason: {reason}" if reason else ""
+            pdf.cell(0, 5, f"  Date: {date_str}{reason_str}", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")

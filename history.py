@@ -1,0 +1,208 @@
+"""
+GMX V2 Trade History — fetch realized PnL from on-chain event logs.
+
+Queries the GMX EventEmitter for OrderExecuted events, then decodes
+the associated PositionDecrease events in the same transaction to
+extract realized PnL, size, and market data.
+
+Works for TPs, SLs, and manual closes — including those that happened
+while the bot was offline.
+"""
+
+import logging
+import time
+from typing import List, Dict, Any, Optional
+
+from web3 import Web3
+
+log = logging.getLogger("GMXBot.history")
+
+# GMX V2 EventEmitter on Arbitrum
+_EVENT_EMITTER = "0xC8ee91A54287DB53897056e12D9819156D3822Fb"
+
+# EventLog2 and EventLog1 selectors
+_EVENT_LOG2_TOPIC = "0x468a25a7ba624ceea6e540ad6f49171b52495b648417ae91bca21676d8a24dc5"
+_EVENT_LOG1_TOPIC = "0x137a44067c8961cd7e1d876f4754a5a3a75989b4552f1843fc69c3b372def160"
+
+# GMX V2 USD precision
+_P30 = 10 ** 30
+
+# Arbitrum ~4 blocks/sec
+_BLOCKS_PER_SECOND = 4
+
+
+def _get_event_log1_abi():
+    """Build EventLog1 ABI using the eventData components from open.py."""
+    from open import _EVENT_LOG2_ABI
+    eventdata_def = _EVENT_LOG2_ABI[0]["inputs"][5]
+    return [{
+        "anonymous": False,
+        "inputs": [
+            {"indexed": False, "name": "msgSender", "type": "address"},
+            {"indexed": False, "name": "eventName", "type": "string"},
+            {"indexed": True, "name": "eventNameHash", "type": "string"},
+            {"indexed": True, "name": "topic1", "type": "bytes32"},
+            {
+                "components": eventdata_def["components"],
+                "indexed": False,
+                "name": "eventData",
+                "type": "tuple",
+            },
+        ],
+        "name": "EventLog1",
+        "type": "event",
+    }]
+
+
+def fetch_trade_history(
+    w3: Web3,
+    account: str,
+    since_timestamp: Optional[int] = None,
+    lookback_seconds: int = 30 * 86400,
+) -> List[Dict[str, Any]]:
+    """Fetch historical position decrease events from on-chain logs.
+
+    Finds OrderExecuted events for the account, then decodes the
+    PositionDecrease EventLog1 in the same transaction to get PnL.
+
+    Args:
+        w3: Web3 instance connected to Arbitrum.
+        account: Wallet address.
+        since_timestamp: Unix timestamp — only return events after this.
+        lookback_seconds: How far back to search (default 30 days).
+
+    Returns:
+        List of trade dicts with: market_address, is_long, size_delta_usd,
+        pnl_usd, timestamp.
+    """
+    from open import _EVENT_LOG2_ABI
+
+    emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
+    wallet_topic = "0x" + "0" * 24 + account.lower().replace("0x", "")
+
+    # Calculate block range
+    current_block = w3.eth.block_number
+    if since_timestamp:
+        elapsed = int(time.time()) - since_timestamp
+        lookback_blocks = min(elapsed * _BLOCKS_PER_SECOND, lookback_seconds * _BLOCKS_PER_SECOND)
+    else:
+        lookback_blocks = lookback_seconds * _BLOCKS_PER_SECOND
+    from_block = max(0, current_block - int(lookback_blocks))
+
+    # OrderExecuted topic hash
+    order_executed_topic = "0x" + Web3.keccak(text="OrderExecuted").hex()
+
+    # Get all OrderExecuted events where this wallet is topic3
+    try:
+        exec_logs = w3.eth.get_logs({
+            "address": emitter_addr,
+            "fromBlock": from_block,
+            "toBlock": current_block,
+            "topics": [
+                _EVENT_LOG2_TOPIC,
+                order_executed_topic,
+                None,
+                wallet_topic,
+            ],
+        })
+    except Exception as e:
+        log.warning(f"fetch_trade_history: get_logs failed for {account[:10]}: {e}")
+        return []
+
+    if not exec_logs:
+        return []
+
+    # Build EventLog1 decoder
+    el1_abi = _get_event_log1_abi()
+    emitter1 = w3.eth.contract(address=emitter_addr, abi=el1_abi)
+
+    results = []
+    processed_receipts = {}  # tx_hash → receipt (avoid re-fetching batched txs)
+    account_lower = account.lower()
+
+    for exec_log in exec_logs:
+        tx_hash = exec_log["transactionHash"].hex()
+        block_num = exec_log["blockNumber"]
+
+        # Skip if we already scanned this receipt (keeper batched multiple orders)
+        if tx_hash in processed_receipts:
+            continue
+
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            continue
+        processed_receipts[tx_hash] = True
+
+        # Find PositionDecrease EventLog1 in same transaction
+        for rlog in receipt["logs"]:
+            topics = [t.hex() if isinstance(t, bytes) else t for t in rlog["topics"]]
+            if not (rlog["address"].lower() == emitter_addr.lower()
+                    and topics[0] == _EVENT_LOG1_TOPIC[2:]):
+                continue
+
+            try:
+                decoded = emitter1.events.EventLog1().process_log(rlog)
+                event_name = decoded["args"].get("eventName", "")
+                if event_name != "PositionDecrease":
+                    continue
+
+                ed = decoded["args"]["eventData"]
+
+                # Address items — extract market and verify account belongs to us
+                market_addr = None
+                event_account = None
+                for item in ed["addressItems"]["items"]:
+                    if item["key"] == "market":
+                        market_addr = item["value"].lower()
+                    elif item["key"] == "account":
+                        event_account = item["value"].lower()
+
+                # Skip events that belong to a different wallet
+                if event_account and event_account != account_lower:
+                    continue
+
+                # Uint items
+                size_delta = 0
+                for item in ed["uintItems"]["items"]:
+                    if item["key"] == "sizeDeltaUsd":
+                        size_delta = item["value"] / _P30
+
+                # Int items (PnL)
+                base_pnl = 0
+                for item in ed["intItems"]["items"]:
+                    if item["key"] == "basePnlUsd":
+                        base_pnl = item["value"] / _P30
+
+                # Bool items
+                is_long = None
+                for item in ed["boolItems"]["items"]:
+                    if item["key"] == "isLong":
+                        is_long = item["value"]
+
+                # Get block timestamp
+                blk = w3.eth.get_block(block_num)
+                ts = blk["timestamp"]
+
+                # Filter by since_timestamp
+                if since_timestamp and ts < since_timestamp:
+                    continue
+
+                # Use tx_hash:logIndex as unique ID to handle multi-event txs
+                log_idx = rlog.get("logIndex", 0)
+
+                results.append({
+                    "market_address": market_addr or "",
+                    "is_long": is_long,
+                    "size_delta_usd": size_delta,
+                    "pnl_usd": base_pnl,
+                    "timestamp": ts,
+                    "tx_hash": tx_hash,
+                    "log_index": log_idx,
+                })
+
+            except Exception:
+                continue
+
+    log.info(f"fetch_trade_history: {len(results)} trade(s) for {account[:10]}...")
+    return results

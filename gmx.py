@@ -351,7 +351,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self._load_trade_history()
 
         # Sync on-chain positions into internal tracking (survives reboots)
-        await self._sync_on_chain_positions()
+        # skip_sl_check=True: SL is already correct on-chain, don't infer & move
+        await self._sync_on_chain_positions(skip_sl_check=True)
 
         self.price_update_task = asyncio.create_task(self.price_update_loop())
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
@@ -449,7 +450,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.account4 = Account.from_key(self.cfg.private_key_4)
             self.logger.info(f"Wallet 4 (scalp): {self.account4.address[:10]}...")
 
-    async def _sync_on_chain_positions(self):
+    async def _sync_on_chain_positions(self, *, skip_sl_check: bool = False):
         """Scan on-chain positions for all wallets, sync state, and clean stale entries.
 
         On restart this:
@@ -579,7 +580,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 if saved:
                     pos.realized_pnl = saved.get("realized_pnl", 0.0)
                     pos.original_size_usd = saved.get("original_size_usd", pos.size_usd)
-                    pos.tp_hits_count = max(pos.tp_hits_count, saved.get("tp_hits_count", 0))
+                    # Persisted state is ground truth — prefer it over inference
+                    saved_hits = saved.get("tp_hits_count", 0)
+                    pos.tp_hits_count = saved_hits if saved_hits > 0 else pos.tp_hits_count
                     if saved.get("sl_move_label"):
                         pos.sl_move_label = saved["sl_move_label"]
                     if saved.get("sl_moved_to_entry"):
@@ -665,6 +668,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.logger.info("No untracked on-chain positions found")
 
         # ── Post-sync: verify SL is at the correct level for inferred TP hits ──
+        # Only on startup — skip when user runs /sync (SL is already on-chain)
+        if skip_sl_check:
+            return
+
         for pos in self.positions.values():
             if not pos.is_open or pos.tp_hits_count == 0 or not pos.take_profits:
                 continue
@@ -1198,7 +1205,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         try:
             old_count = sum(1 for p in self.positions.values() if p.is_open)
             self.positions.clear()
-            await self._sync_on_chain_positions()
+            await self._sync_on_chain_positions(skip_sl_check=True)
             new_count = sum(1 for p in self.positions.values() if p.is_open)
 
             lines = []

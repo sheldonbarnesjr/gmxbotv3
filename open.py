@@ -1987,7 +1987,10 @@ def create_tp_order(
     # remaining position.  Without this, GMX adds profit to collateral and
     # leverage drops (e.g. 10x → 1x).
     token = w3.eth.contract(address=collateral_token, abi=ERC20_ABI)
-    col_decimals = token.functions.decimals().call()
+    try:
+        col_decimals = token.functions.decimals().call()
+    except Exception:
+        col_decimals = 6  # USDC default
     close_collateral = collateral_usd * tp.close_pct
     collateral_delta = int(close_collateral * (10 ** col_decimals))
 
