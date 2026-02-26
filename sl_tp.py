@@ -278,6 +278,11 @@ class SLTPMixin:
                 )
                 new_sl_price, sl_label = determine_new_sl_target(pos.tp_hits_count, pos.entry_price, sorted_tps)
 
+            # None means no SL move needed for this TP hit (e.g. TP2 → stay at Entry)
+            if new_sl_price is None:
+                self.logger.info(f"{pos.symbol} {pos.side}: TP{pos.tp_hits_count} hit — no SL move (trailing strategy)")
+                return
+
             self.logger.info(f"{pos.symbol} {pos.side}: Moving SL to {sl_label} (${new_sl_price:,.0f})")
 
             cfg = self.cfg

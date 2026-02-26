@@ -464,11 +464,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 )
 
                 # ── Infer TP hits from SL position ──
-                # On restart we don't know the original TP count, but we can
-                # infer executed TPs by checking where the SL currently is:
-                #   SL at/near entry → at least 1 TP hit
-                #   SL at/near TP1 price → at least 2 TPs hit
-                #   SL at/near TP2 price → at least 3 TPs hit, etc.
+                # New trailing strategy:
+                #   SL at entry → 2 hits (TP1+TP2, both leave SL at entry)
+                #   SL past entry → 3+ hits (SL at TP1 or TP2)
                 if reconstructed_sl and cp.entry_price and cp.entry_price > 0 and take_profits:
                     inferred_hits = self._infer_tp_hits(
                         side, cp.entry_price, reconstructed_sl, take_profits
@@ -476,13 +474,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     if inferred_hits > 0:
                         pos.tp_hits_count = inferred_hits
                         pos.sl_moved_to_entry = True
-                        if inferred_hits == 1:
+                        # Label mapping for new trailing strategy:
+                        #   1-2 hits → SL at "Entry"
+                        #   3 hits → SL at "TP1"
+                        #   4+ hits → SL at "TP2"
+                        if inferred_hits <= 2:
                             pos.sl_move_label = "Entry"
+                        elif inferred_hits == 3:
+                            pos.sl_move_label = "TP1"
                         else:
-                            pos.sl_move_label = f"TP{inferred_hits - 1}"
+                            pos.sl_move_label = "TP2"
                         self.logger.info(
                             f"Sync: inferred {inferred_hits} TP hit(s) for {symbol} {side} [W{wid}] "
-                            f"(SL @ ${reconstructed_sl:,.2f})"
+                            f"(SL @ ${reconstructed_sl:,.2f}, label={pos.sl_move_label})"
                         )
 
                 self.positions[pos.id] = pos
@@ -569,6 +573,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 pos.tp_hits_count, pos.entry_price, sorted_tps,
             )
 
+            # None means no SL move for this TP hit count (trailing strategy: TP2 stays at Entry)
+            if target_sl is None:
+                continue
+
             # Check if current SL is already correct
             tolerance = pos.entry_price * 0.003
             sl_correct = (
@@ -607,46 +615,51 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     ) -> int:
         """Infer how many TPs have been hit based on current SL position.
 
-        Logic:
-          - If SL is at/past entry → at least 1 TP hit (SL moved to entry)
-          - If SL is at/past TP1 → at least 2 TPs hit (SL moved to TP1)
-          - If SL is at/past TP2 → at least 3 TPs hit, etc.
+        New trailing SL strategy:
+          TP1 hit → SL to Entry
+          TP2 hit → no move (SL stays at Entry)
+          TP3 hit → SL to TP1
+          TP4+ hit → SL to TP2
 
-        For SHORT: "at/past" means SL <= price (lower is tighter for shorts)
-        For LONG:  "at/past" means SL >= price (higher is tighter for longs)
+        Inference:
+          SL at original (not near entry) → 0 hits
+          SL at entry → 2 hits (stable state; both TP1 and TP2 leave SL at entry)
+          SL past entry (at a filled TP price) → 3+ hits
+
+        Note: take_profits only contains REMAINING on-chain TP orders (filled TPs
+        are removed). We use remaining count to disambiguate 3 vs 4+ hits.
         """
         tolerance = entry_price * 0.003  # 0.3% tolerance for rounding
 
-        # Sort TPs in execution order (nearest to entry first)
-        # LONG: ascending, SHORT: descending (nearest to current price)
-        sorted_tps = sorted(
-            take_profits,
-            key=lambda t: t.price,
-            reverse=(side == "SHORT"),
-        )
-
-        def sl_at_or_past(target):
+        def sl_at_or_past_entry():
             if side == "LONG":
-                return sl_price >= target - tolerance
-            else:
-                return sl_price <= target + tolerance
+                return sl_price >= entry_price - tolerance
+            return sl_price <= entry_price + tolerance
 
-        # Check from highest hit count down to find how many TPs were hit
-        # TP{N} hit → SL should be at TP{N-1} (or entry for TP1)
-        hits = 0
+        # SL not at/past entry → 0 hits
+        if not sl_at_or_past_entry():
+            return 0
 
-        # First check: is SL at/past entry? (at least 1 TP hit)
-        if sl_at_or_past(entry_price):
-            hits = 1
+        # Check if SL is strictly PAST entry (moved to a TP price)
+        if side == "LONG":
+            past_entry = sl_price > entry_price + tolerance
+        else:
+            past_entry = sl_price < entry_price - tolerance
 
-            # Now check if SL is at/past any TP price (meaning more TPs hit)
-            for i, tp in enumerate(sorted_tps):
-                if sl_at_or_past(tp.price):
-                    hits = i + 2  # SL at TP{i} means TP{i+1} was hit (i+2 total)
-                else:
-                    break
+        if not past_entry:
+            # SL is at entry (within tolerance) → default to 2 hits
+            # Both TP1 and TP2 leave SL at entry. 2 is the stable state.
+            return 2
 
-        return hits
+        # SL is past entry → moved to a TP price → at least 3 hits
+        # With new strategy: SL at TP1 → 3 hits, SL at TP2 → 4+ hits
+        # Use remaining TP count as heuristic (typical signals have 5 TPs):
+        #   2+ remaining → probably 3 hits (SL at TP1)
+        #   0-1 remaining → probably 4+ hits (SL at TP2)
+        num_remaining = len(take_profits)
+        if num_remaining <= 1:
+            return 4
+        return 3
 
     # ──────────────────────────────────────────────────────────────────────
     # Periodic On-Chain Reconciliation
@@ -879,6 +892,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 target_sl, target_label = determine_new_sl_target(
                     pos.tp_hits_count, pos.entry_price, sorted_tps,
                 )
+                # None means no SL move for this TP hit count (trailing strategy)
+                if target_sl is None:
+                    continue
+
                 # Only move if current SL is NOT already at/past the target
                 should_move = False
                 if pos.stop_loss is None:

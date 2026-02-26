@@ -426,6 +426,7 @@ async def run_e2e_sltp_test(num_tps: int):
     sorted_tp_prices = sorted(tp_prices, reverse=True)
 
     # ─── STEPS 5+: Progressive TP hit simulation via REAL check_tp_hits() ───
+    prev_tp_intended_count = 0  # Track SL order calls for TP2 skip verification
     for tp_idx in range(num_tps):
         tp_num = tp_idx + 1
         log.info(f"\n{'=' * 60}")
@@ -484,14 +485,30 @@ async def run_e2e_sltp_test(num_tps: int):
             fail(f"Executed TPs", f"expected {tp_num}, got {executed_count}")
 
         # (f) Verify the intended SL target from SafeSLPatch
-        if sl_patch.intended_prices:
+        # New trailing strategy:
+        #   TP1 → SL to Entry
+        #   TP2 → no move (SL stays at Entry)
+        #   TP3 → SL to TP1
+        #   TP4+ → SL to TP2
+        if tp_num == 2:
+            # TP2: NO SL move expected — move_sl should skip
+            new_intendeds = len(sl_patch.intended_prices) - prev_tp_intended_count
+            if new_intendeds == 0:
+                ok(f"TP2: move_sl correctly skipped (no SL move)")
+            else:
+                fail(f"TP2: move_sl should NOT have been called",
+                     f"got {new_intendeds} new SL order(s)")
+        elif sl_patch.intended_prices:
             intended = sl_patch.intended_prices[-1]
             if tp_num == 1:
                 expected_target = entry_price
                 expected_label = "Entry"
-            else:
-                expected_target = sorted_tp_prices[tp_idx - 1]
-                expected_label = f"TP{tp_num - 1}"
+            elif tp_num == 3:
+                expected_target = sorted_tp_prices[0]  # TP1 price
+                expected_label = "TP1"
+            else:  # tp_num >= 4
+                expected_target = sorted_tp_prices[1]  # TP2 price
+                expected_label = "TP2"
 
             tolerance = entry_price * 0.001
             if abs(intended - expected_target) < tolerance:
@@ -501,6 +518,9 @@ async def run_e2e_sltp_test(num_tps: int):
                      f"expected {expected_label} ${expected_target:,.0f}, got ${intended:,.0f}")
         else:
             fail(f"move_sl was not called after TP{tp_num}")
+
+        # Track intended count for TP2 comparison
+        prev_tp_intended_count = len(sl_patch.intended_prices)
 
         # (g) Verify sl_moved_to_entry and sl_move_label were set
         if production_pos.sl_moved_to_entry:

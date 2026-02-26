@@ -307,29 +307,40 @@ def determine_new_sl_target(
     tp_hits_count: int,
     entry_price: float,
     sorted_tps: list,
-) -> Tuple[float, str]:
+) -> Tuple[Optional[float], Optional[str]]:
     """Determine where SL should move after TP hit(s).
 
-    Progressive trailing:
-      TP1 hit → SL to entry (breakeven)
-      TP(N) hit (N>=2) → SL to TP(N-1) price
+    Trailing strategy (lets positions run):
+      TP1 hit → SL to Entry (breakeven)
+      TP2 hit → no move (stay at Entry)
+      TP3 hit → SL to TP1
+      TP4+ hit → SL stays at TP2
 
-    Returns (new_sl_price, sl_label).
+    Returns (new_sl_price, sl_label), or (None, None) if no move needed.
     """
-    if tp_hits_count <= 1:
+    def _tp_price(idx):
+        tp = sorted_tps[idx]
+        return tp.price if hasattr(tp, "price") else tp
+
+    if tp_hits_count <= 0:
+        return None, None
+
+    if tp_hits_count == 1:
         return entry_price, "Entry"
 
-    # SL moves to the TP level one below the latest hit
-    target_idx = tp_hits_count - 2  # e.g. 2 hits → index 0 = TP1
-    if target_idx < len(sorted_tps):
-        tp = sorted_tps[target_idx]
-        price = tp.price if hasattr(tp, "price") else tp
-        return price, f"TP{target_idx + 1}"
+    if tp_hits_count == 2:
+        # No move — let it run, SL stays at Entry
+        return None, None
 
-    # Fallback: use last TP if index out of range
-    if sorted_tps:
-        last = sorted_tps[-1]
-        price = last.price if hasattr(last, "price") else last
-        return price, f"TP{len(sorted_tps)}"
+    if tp_hits_count == 3:
+        # SL to TP1
+        if len(sorted_tps) >= 1:
+            return _tp_price(0), "TP1"
+        return entry_price, "Entry"
 
+    # TP4+ → SL to TP2 (and stays there)
+    if len(sorted_tps) >= 2:
+        return _tp_price(1), "TP2"
+    if len(sorted_tps) >= 1:
+        return _tp_price(0), "TP1"
     return entry_price, "Entry"
