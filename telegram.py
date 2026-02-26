@@ -82,6 +82,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
 /balance-wallets — Manually rebalance USDC between wallets (W1-W4)
+/consolidate — Move ALL free USDC from W2-W4 into W1 (for withdrawals)
 /lastmsg — Print last message from monitored channel(s)
 /lastsignal — Re-run the last parsed signal
 /retryqueue — Show pending failed order retries
@@ -266,6 +267,8 @@ class CoreTelegramMixin:
             elif cmd == "/sl":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_sl(chat_id, arg)
+            elif cmd == "/consolidate":
+                await self.cmd_consolidate(chat_id)
             elif cmd == "/gas":
                 await self.cmd_gas(chat_id)
             elif cmd == "/tradesize":
@@ -1091,6 +1094,86 @@ class CoreTelegramMixin:
             except Exception as e:
                 self.logger.error(f"Daily summary error: {e}")
                 await asyncio.sleep(3600)
+
+    async def hourly_pnl_loop(self):
+        """Send an hourly PnL snapshot between 9 AM and 11 PM ET."""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 1 hour
+                ET = ZoneInfo("America/New_York")
+                hour = datetime.now(ET).hour
+                if 9 <= hour <= 22:  # 9 AM to 11 PM ET (22:xx is the last alert)
+                    await self.send_hourly_pnl()
+                else:
+                    self.logger.debug(f"Hourly PnL skipped — outside 9AM-11PM ET (currently {hour}:00)")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Hourly PnL loop error: {e}")
+                await asyncio.sleep(3600)
+
+    async def send_hourly_pnl(self):
+        """Build and send the hourly PnL alert."""
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_cutoff = today_start.timestamp()
+
+        PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
+
+        # Today's realized trades
+        todays_trades = [t for t in self.trade_history if t.closed_at >= today_cutoff and t.symbol in PNL_SYMBOLS]
+        realized_pnl = sum(t.pnl_usd for t in todays_trades)
+        realized_count = len(todays_trades)
+
+        # Unrealized (open positions on-chain)
+        unrealized_pnl = 0.0
+        open_count = 0
+        open_lines = []
+        try:
+            for wid, acct in self._all_wallets():
+                cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
+                for cp in cps:
+                    sym = cp.symbol.upper().split("/")[0]
+                    if sym in PNL_SYMBOLS:
+                        unrealized_pnl += cp.unrealized_pnl
+                        open_count += 1
+                        u_sign = "+" if cp.unrealized_pnl >= 0 else ""
+                        side = "LONG" if cp.is_long else "SHORT"
+                        open_lines.append(
+                            f"  {sym} {side} [W{wid}]: {u_sign}${cp.unrealized_pnl:,.2f}"
+                        )
+        except Exception as e:
+            self.logger.warning(f"Hourly PnL: could not fetch positions: {e}")
+
+        # Today's total = realized + unrealized
+        today_total = realized_pnl + unrealized_pnl
+
+        # All-time realized
+        all_trades = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
+        alltime_pnl = sum(t.pnl_usd for t in all_trades)
+        alltime_count = len(all_trades)
+
+        # Build message
+        r_sign = "+" if realized_pnl >= 0 else ""
+        u_sign = "+" if unrealized_pnl >= 0 else ""
+        t_sign = "+" if today_total >= 0 else ""
+        a_sign = "+" if alltime_pnl >= 0 else ""
+
+        msg = f"📈 Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
+
+        msg += f"**Today ({realized_count} closed)**\n"
+        msg += f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
+        msg += f"  Unrealized: {u_sign}${unrealized_pnl:,.2f} ({open_count} open)\n"
+        if open_lines:
+            msg += "\n".join(open_lines) + "\n"
+        msg += f"  Today Total: {t_sign}${today_total:,.2f}\n"
+
+        msg += f"\n**All Time ({alltime_count} trades)**\n"
+        msg += f"  Realized: {a_sign}${alltime_pnl:,.2f}"
+
+        await self.notify(msg)
+        self.logger.info(f"Hourly PnL sent: today={t_sign}${today_total:,.2f}, alltime={a_sign}${alltime_pnl:,.2f}")
 
     async def send_daily_summary(self):
         cfg = self.cfg

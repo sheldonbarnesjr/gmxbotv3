@@ -296,6 +296,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.rebalance_task = asyncio.create_task(self.rebalance_loop())
         self.reconcile_task = asyncio.create_task(self.reconcile_loop())
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
+        self.gas_check_task = asyncio.create_task(self.gas_check_loop())
+        self.hourly_pnl_task = asyncio.create_task(self.hourly_pnl_loop())
 
         self.logger.info("GMX Bot started successfully")
 
@@ -365,12 +367,21 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.logger.info(f"Wallet 4 (scalp): {self.account4.address[:10]}...")
 
     async def _sync_on_chain_positions(self):
-        """Scan on-chain positions for all wallets and add any that aren't
-        already tracked internally. This makes the bot aware of positions
-        opened manually or before a reboot."""
+        """Scan on-chain positions for all wallets, sync state, and clean stale entries.
+
+        On restart this:
+          1. Adds any on-chain positions not already tracked internally
+          2. Infers executed TPs by comparing SL price vs entry/TP prices
+          3. Triggers SL move if TPs were hit but SL is stale
+          4. Removes internal positions that are no longer on-chain
+        """
         MARKET_TO_SYMBOL = {v.lower(): k for k, v in self.cfg.markets.items()}
 
         wallets = self._all_wallets()
+
+        # Collect all on-chain positions keyed by (wallet_id, market_lower, side)
+        on_chain_set = set()
+        wallet_chain_data = {}  # wid -> (chain_positions, chain_orders)
 
         synced = 0
         for wid, acct in wallets:
@@ -381,6 +392,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 chain_orders = await asyncio.to_thread(
                     fetch_open_orders, self.w3, acct.address
                 )
+                wallet_chain_data[wid] = (chain_positions, chain_orders)
             except Exception as e:
                 self.logger.warning(f"Sync: failed to fetch wallet {wid}: {e}")
                 continue
@@ -389,6 +401,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 market_lower = cp.market.lower()
                 symbol = MARKET_TO_SYMBOL.get(market_lower, cp.symbol)
                 side = "LONG" if cp.is_long else "SHORT"
+                on_chain_set.add((wid, market_lower, side))
 
                 # Check if we already track this position
                 already_tracked = any(
@@ -412,7 +425,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 take_profits = []
                 if tp_orders and cp.size_usd > 0:
-                    # Sort TPs by price (ascending for LONG, descending for SHORT)
                     tp_orders_sorted = sorted(
                         tp_orders,
                         key=lambda o: o["trigger_price"],
@@ -450,19 +462,191 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     last_known_tp_count=tp_count,
                     take_profits=take_profits,
                 )
+
+                # ── Infer TP hits from SL position ──
+                # On restart we don't know the original TP count, but we can
+                # infer executed TPs by checking where the SL currently is:
+                #   SL at/near entry → at least 1 TP hit
+                #   SL at/near TP1 price → at least 2 TPs hit
+                #   SL at/near TP2 price → at least 3 TPs hit, etc.
+                if reconstructed_sl and cp.entry_price and cp.entry_price > 0 and take_profits:
+                    inferred_hits = self._infer_tp_hits(
+                        side, cp.entry_price, reconstructed_sl, take_profits
+                    )
+                    if inferred_hits > 0:
+                        pos.tp_hits_count = inferred_hits
+                        pos.sl_moved_to_entry = True
+                        if inferred_hits == 1:
+                            pos.sl_move_label = "Entry"
+                        else:
+                            pos.sl_move_label = f"TP{inferred_hits - 1}"
+                        self.logger.info(
+                            f"Sync: inferred {inferred_hits} TP hit(s) for {symbol} {side} [W{wid}] "
+                            f"(SL @ ${reconstructed_sl:,.2f})"
+                        )
+
                 self.positions[pos.id] = pos
                 synced += 1
                 tp_str = f", {tp_count} TPs" if take_profits else ", no TPs"
                 sl_str = f", SL ${reconstructed_sl:,.2f}" if reconstructed_sl else ", no SL"
+                hits_str = f", {pos.tp_hits_count} TP hit(s)" if pos.tp_hits_count else ""
                 self.logger.info(
                     f"Synced on-chain position: {symbol} {side} "
-                    f"${cp.size_usd:,.2f} @ {cp.leverage:.1f}x [W{wid}]{tp_str}{sl_str}"
+                    f"${cp.size_usd:,.2f} @ {cp.leverage:.1f}x [W{wid}]{tp_str}{sl_str}{hits_str}"
                 )
+
+        # ── Clean up stale internal positions no longer on-chain ──
+        stale_count = 0
+        for pos_id, pos in list(self.positions.items()):
+            if not pos.is_open or not pos.market_addr:
+                continue
+            key = (pos.wallet_id, pos.market_addr.lower(), pos.side)
+            # If we successfully fetched this wallet's data but the position isn't there
+            if pos.wallet_id in wallet_chain_data and key not in on_chain_set:
+                self.logger.info(
+                    f"Sync: {pos.symbol} {pos.side} [W{pos.wallet_id}] no longer on-chain — marking closed"
+                )
+                pos.is_open = False
+                pos.closed_at = time.time()
+                pos.exit_reason = "closed_while_offline"
+                self._record_trade(pos, exit_reason="closed_while_offline")
+                stale_count += 1
+
+                # Cancel any orphaned orders for this market
+                try:
+                    _, chain_orders = wallet_chain_data[pos.wallet_id]
+                    orphaned = [
+                        o for o in chain_orders
+                        if o["market"].lower() == pos.market_addr.lower()
+                        and o["is_long"] == (pos.side == "LONG")
+                    ]
+                    if orphaned:
+                        acct = self._get_account(pos.wallet_id)
+                        exchange = self.w3.eth.contract(
+                            address=Web3.to_checksum_address(self.cfg.exchange_router),
+                            abi=EXCHANGE_ROUTER_ABI,
+                        )
+                        for o in orphaned:
+                            if o.get("key_hex"):
+                                try:
+                                    key_bytes = bytes.fromhex(o["key_hex"])
+                                    data = exchange.encode_abi("cancelOrder", [key_bytes])
+                                    txh = await asyncio.to_thread(
+                                        self._send_tx, exchange.address, data, 0, acct
+                                    )
+                                    self.logger.info(
+                                        f"Sync: cancelled orphaned order for closed {pos.symbol} "
+                                        f"{pos.side}: {o.get('order_type_name', 'order')}"
+                                    )
+                                except Exception as e:
+                                    self.logger.warning(f"Sync: failed to cancel orphaned order: {e}")
+                except Exception as e:
+                    self.logger.warning(f"Sync: orphan cleanup error: {e}")
+
+        if stale_count:
+            await self.notify(
+                f"🧹 Startup cleanup: {stale_count} position(s) were closed while bot was offline"
+            )
 
         if synced:
             self.logger.info(f"Synced {synced} on-chain position(s) into tracking")
         else:
             self.logger.info("No untracked on-chain positions found")
+
+        # ── Post-sync: verify SL is at the correct level for inferred TP hits ──
+        for pos in self.positions.values():
+            if not pos.is_open or pos.tp_hits_count == 0 or not pos.take_profits:
+                continue
+            if pos.wallet_id not in wallet_chain_data:
+                continue
+
+            sorted_tps = sorted(
+                pos.take_profits,
+                key=lambda t: t.price,
+                reverse=(pos.side == "SHORT"),
+            )
+            target_sl, target_label = determine_new_sl_target(
+                pos.tp_hits_count, pos.entry_price, sorted_tps,
+            )
+
+            # Check if current SL is already correct
+            tolerance = pos.entry_price * 0.003
+            sl_correct = (
+                pos.stop_loss is not None
+                and abs(pos.stop_loss - target_sl) < tolerance
+            )
+            if sl_correct:
+                continue
+
+            self.logger.info(
+                f"Sync: {pos.symbol} {pos.side} [W{pos.wallet_id}] SL stale after "
+                f"{pos.tp_hits_count} TP hit(s) — should be at {target_label} "
+                f"(${target_sl:,.2f}), currently ${pos.stop_loss or 0:,.2f}"
+            )
+            try:
+                acct = self._get_account(pos.wallet_id)
+                fresh_orders = await asyncio.to_thread(
+                    fetch_open_orders, self.w3, acct.address
+                )
+                await self.move_sl(pos, fresh_orders, target_sl, target_label)
+                await self.notify(
+                    f"🔧 Startup SL fix: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                    f"SL moved to {target_label} (${target_sl:,.2f}) after "
+                    f"{pos.tp_hits_count} TP hit(s) detected"
+                )
+            except Exception as e:
+                self.logger.error(f"Sync: failed to move SL for {pos.symbol}: {e}")
+                await self.notify(
+                    f"⚠️ Startup SL fix FAILED: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                    f"— manual /sl needed. Error: {e}"
+                )
+
+    def _infer_tp_hits(
+        self, side: str, entry_price: float, sl_price: float,
+        take_profits: List[TakeProfitLevel],
+    ) -> int:
+        """Infer how many TPs have been hit based on current SL position.
+
+        Logic:
+          - If SL is at/past entry → at least 1 TP hit (SL moved to entry)
+          - If SL is at/past TP1 → at least 2 TPs hit (SL moved to TP1)
+          - If SL is at/past TP2 → at least 3 TPs hit, etc.
+
+        For SHORT: "at/past" means SL <= price (lower is tighter for shorts)
+        For LONG:  "at/past" means SL >= price (higher is tighter for longs)
+        """
+        tolerance = entry_price * 0.003  # 0.3% tolerance for rounding
+
+        # Sort TPs in execution order (nearest to entry first)
+        # LONG: ascending, SHORT: descending (nearest to current price)
+        sorted_tps = sorted(
+            take_profits,
+            key=lambda t: t.price,
+            reverse=(side == "SHORT"),
+        )
+
+        def sl_at_or_past(target):
+            if side == "LONG":
+                return sl_price >= target - tolerance
+            else:
+                return sl_price <= target + tolerance
+
+        # Check from highest hit count down to find how many TPs were hit
+        # TP{N} hit → SL should be at TP{N-1} (or entry for TP1)
+        hits = 0
+
+        # First check: is SL at/past entry? (at least 1 TP hit)
+        if sl_at_or_past(entry_price):
+            hits = 1
+
+            # Now check if SL is at/past any TP price (meaning more TPs hit)
+            for i, tp in enumerate(sorted_tps):
+                if sl_at_or_past(tp.price):
+                    hits = i + 2  # SL at TP{i} means TP{i+1} was hit (i+2 total)
+                else:
+                    break
+
+        return hits
 
     # ──────────────────────────────────────────────────────────────────────
     # Periodic On-Chain Reconciliation
@@ -997,26 +1181,27 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             )
 
             # Check that the selected wallet has enough USDC for the collateral.
-            # If not, rebalance first and re-check.
+            # If not, pull USDC from other wallets directly into this one.
             wallet_usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
             required_collateral = size_usd / signal.leverage if signal.leverage else size_usd
             if wallet_usdc < required_collateral:
+                shortfall = required_collateral - wallet_usdc
                 self.logger.warning(
                     f"W{wallet_id} has ${wallet_usdc:.2f} USDC but needs "
-                    f"${required_collateral:.2f} collateral — rebalancing first"
+                    f"${required_collateral:.2f} collateral — auto-funding ${shortfall:.2f}"
                 )
                 await self.notify(
                     f"⚠️ W{wallet_id} low: ${wallet_usdc:.2f} USDC "
-                    f"(need ${required_collateral:.2f}) — auto-rebalancing..."
+                    f"(need ${required_collateral:.2f}) — pulling from other wallets..."
                 )
-                await self._rebalance_wallets()
+                await self._fund_wallet(wallet_id, shortfall)
 
-                # Re-check after rebalance
+                # Re-check after funding
                 wallet_usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
                 if wallet_usdc < required_collateral:
                     await self.notify(
                         f"Rejected {signal.symbol} {signal.side}: W{wallet_id} still only "
-                        f"${wallet_usdc:.2f} USDC after rebalance (need ${required_collateral:.2f})"
+                        f"${wallet_usdc:.2f} USDC after auto-fund (need ${required_collateral:.2f})"
                     )
                     return
 

@@ -191,6 +191,133 @@ class WalletMixin:
         )
         return total
 
+    async def _fund_wallet(self, target_wid: int, amount_needed: float):
+        """Pull USDC from other wallets into the target wallet.
+
+        Unlike _rebalance_wallets (which equalizes), this directly transfers
+        the needed amount from wallets with available USDC into target_wid.
+        """
+        if self.cfg.dry_run:
+            self.logger.info(f"[DRY_RUN] Would fund W{target_wid} with ${amount_needed:.2f}")
+            return
+
+        try:
+            target_acct = self._get_account(target_wid)
+            usdc_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(self.cfg.collateral_token),
+                abi=ERC20_ABI,
+            )
+            decimals = await asyncio.to_thread(lambda: usdc_contract.functions.decimals().call())
+
+            # Collect available balances from other wallets (sorted richest first)
+            donors = []
+            for wid, acct in self._all_wallets():
+                if wid == target_wid:
+                    continue
+                bal = await asyncio.to_thread(self._get_portfolio_value_for, acct)
+                if bal > 1.0:  # keep at least $1 dust in donor
+                    donors.append((wid, acct, bal))
+            donors.sort(key=lambda x: x[2], reverse=True)
+
+            still_needed = amount_needed + 1.0  # +$1 buffer
+            transferred = 0.0
+
+            for donor_wid, donor_acct, donor_bal in donors:
+                if still_needed <= 0:
+                    break
+                # Leave at least $1 in donor wallet
+                available = donor_bal - 1.0
+                send_amount = min(available, still_needed)
+                if send_amount < 0.50:
+                    continue
+
+                raw_amount = int(send_amount * (10 ** decimals))
+                transfer_data = usdc_contract.encode_abi(
+                    "transfer",
+                    [Web3.to_checksum_address(target_acct.address), raw_amount],
+                )
+                tx_hash = await asyncio.to_thread(
+                    self._send_tx, self.cfg.collateral_token, transfer_data, 0, donor_acct
+                )
+                receipt = await asyncio.to_thread(open_wait_receipt, self.w3, tx_hash)
+
+                if receipt.get("status") == 1:
+                    transferred += send_amount
+                    still_needed -= send_amount
+                    self.logger.info(f"Funded W{target_wid}: ${send_amount:.2f} from W{donor_wid}")
+                else:
+                    self.logger.error(f"Fund transfer reverted: W{donor_wid} → W{target_wid}")
+
+            if transferred > 0:
+                await self.notify(f"💰 Auto-funded W{target_wid} with ${transferred:.2f} USDC from other wallets")
+            else:
+                await self.notify(f"⚠️ Could not fund W{target_wid} — no wallets have enough spare USDC")
+
+        except Exception as e:
+            self.logger.error(f"_fund_wallet error: {e}")
+            await self.notify(f"⚠️ Auto-fund failed for W{target_wid}: {e}")
+
+    async def _consolidate_to_wallet(self, target_wid: int = 1):
+        """Move ALL free USDC from all other wallets into the target wallet."""
+        if self.cfg.dry_run:
+            self.logger.info(f"[DRY_RUN] Would consolidate all USDC to W{target_wid}")
+            return []
+
+        target_acct = self._get_account(target_wid)
+        usdc_contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(self.cfg.collateral_token),
+            abi=ERC20_ABI,
+        )
+        decimals = await asyncio.to_thread(lambda: usdc_contract.functions.decimals().call())
+
+        results = []
+        for wid, acct in self._all_wallets():
+            if wid == target_wid:
+                continue
+            try:
+                _addr = acct.address
+                bal_raw = await asyncio.to_thread(
+                    lambda w=_addr: usdc_contract.functions.balanceOf(w).call()
+                )
+                bal = bal_raw / (10 ** decimals)
+                if bal < 0.50:
+                    results.append(f"W{wid}: ${bal:.2f} (skipped — dust)")
+                    continue
+
+                transfer_data = usdc_contract.encode_abi(
+                    "transfer",
+                    [Web3.to_checksum_address(target_acct.address), bal_raw],
+                )
+                tx_hash = await asyncio.to_thread(
+                    self._send_tx, self.cfg.collateral_token, transfer_data, 0, acct
+                )
+                receipt = await asyncio.to_thread(open_wait_receipt, self.w3, tx_hash)
+
+                if receipt.get("status") == 1:
+                    results.append(f"W{wid} → W{target_wid}: ${bal:.2f}")
+                else:
+                    results.append(f"W{wid}: ${bal:.2f} FAILED (tx reverted)")
+            except Exception as e:
+                results.append(f"W{wid}: error — {e}")
+
+        return results
+
+    async def cmd_consolidate(self, chat_id: int):
+        """Move all free USDC from W2-W4 into W1."""
+        await self.send_message(chat_id, "Consolidating all USDC into W1...")
+
+        results = await self._consolidate_to_wallet(1)
+
+        # Show final W1 balance
+        try:
+            w1_bal = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
+            results.append(f"\nW1 balance: ${w1_bal:,.2f}")
+        except Exception:
+            pass
+
+        msg = "**Consolidate → W1**\n\n" + "\n".join(results) if results else "No wallets to consolidate."
+        await self.send_message(chat_id, msg)
+
     async def _rebalance_wallets(self):
         """Equalize USDC across all configured wallets (up to 4).
 
@@ -345,24 +472,41 @@ class WalletMixin:
                 self.logger.error(f"Rebalance loop error: {e}")
                 await asyncio.sleep(3600)
 
+    async def gas_check_loop(self):
+        """Check ETH gas balance every hour and auto top-up if needed."""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 1 hour
+                self.logger.debug("Hourly gas check running...")
+                await self.topup_eth_if_needed()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Gas check loop error: {e}")
+                await asyncio.sleep(3600)
+
     async def topup_eth_if_needed(self):
         """Check ETH balance for all wallets and auto-topup if low.
 
-        Swaps a small amount of USDC → ETH via Uniswap if any wallet's ETH
-        balance drops below ~$2 worth (enough for ~5-10 GMX transactions).
-        Only tops up the wallet that just traded (caller's context), but checks all.
+        Swaps USDC → ETH via Uniswap V3 SwapRouter02 if any wallet's ETH
+        balance drops below ~$2 worth. Sends Telegram notification for low
+        balances and insufficient USDC.
         """
         MIN_ETH_USD = 2.0     # trigger topup below this
         TOPUP_USD = 5.0       # swap this much USDC → ETH
+        WARN_ETH_USD = 3.0    # notify user below this (even if above topup threshold)
 
         UNISWAP_ROUTER = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
         WETH_ARBITRUM = Web3.to_checksum_address("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
         USDC_ARBITRUM = Web3.to_checksum_address("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
         POOL_FEE = 500
 
+        # SwapRouter02 multicall signature: multicall(uint256 deadline, bytes[] data)
         UNISWAP_ABI = [
             {"name": "multicall", "type": "function", "stateMutability": "payable",
-             "inputs": [{"name": "data", "type": "bytes[]"}], "outputs": [{"name": "", "type": "bytes[]"}]},
+             "inputs": [{"name": "deadline", "type": "uint256"},
+                        {"name": "data", "type": "bytes[]"}],
+             "outputs": [{"name": "", "type": "bytes[]"}]},
             {"name": "exactInputSingle", "type": "function", "stateMutability": "payable",
              "inputs": [{"name": "params", "type": "tuple", "components": [
                  {"name": "tokenIn", "type": "address"}, {"name": "tokenOut", "type": "address"},
@@ -386,9 +530,14 @@ class WalletMixin:
             for wid, acct in self._all_wallets():
                 if not acct:
                     continue
-                wallet = acct.address
-                eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+                wallet_addr = acct.address
+                eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet_addr)
                 eth_usd = (eth_bal / 10**18) * eth_price
+
+                # Notify if gas is getting low (even if not yet critical)
+                if eth_usd < WARN_ETH_USD and eth_usd >= MIN_ETH_USD:
+                    await self.notify(f"⚠️ W{wid} gas getting low: ${eth_usd:.2f} ETH")
+                    continue
 
                 if eth_usd >= MIN_ETH_USD:
                     continue
@@ -397,49 +546,59 @@ class WalletMixin:
                     f"W{wid} ETH low: ${eth_usd:.2f} (< ${MIN_ETH_USD}) — "
                     f"auto-swapping ${TOPUP_USD:.0f} USDC → ETH"
                 )
+                await self.notify(f"⛽ W{wid} ETH critically low: ${eth_usd:.2f} — attempting auto top-up...")
 
                 usdc_token = self.w3.eth.contract(address=USDC_ARBITRUM, abi=ERC20_ABI)
+                # Bind wallet_addr early to avoid lambda closure bug
+                _wallet = wallet_addr
                 usdc_decimals = await asyncio.to_thread(lambda: usdc_token.functions.decimals().call())
-                usdc_bal_raw = await asyncio.to_thread(lambda: usdc_token.functions.balanceOf(wallet).call())
+                usdc_bal_raw = await asyncio.to_thread(lambda w=_wallet: usdc_token.functions.balanceOf(w).call())
                 usdc_bal = usdc_bal_raw / (10 ** usdc_decimals)
 
                 if usdc_bal < TOPUP_USD:
                     self.logger.warning(f"W{wid} insufficient USDC for auto-topup (${usdc_bal:.2f} < ${TOPUP_USD})")
+                    await self.notify(
+                        f"🚨 W{wid} ETH critically low (${eth_usd:.2f}) and insufficient USDC "
+                        f"(${usdc_bal:.2f}) for auto top-up! Manual /topup needed."
+                    )
                     continue
 
                 usdc_amount_in = int(TOPUP_USD * (10 ** usdc_decimals))
 
                 # Approve if needed
                 allowance = await asyncio.to_thread(
-                    lambda: usdc_token.functions.allowance(wallet, UNISWAP_ROUTER).call()
+                    lambda w=_wallet: usdc_token.functions.allowance(w, UNISWAP_ROUTER).call()
                 )
                 if allowance < usdc_amount_in:
                     approve_data = usdc_token.encode_abi("approve", [UNISWAP_ROUTER, 2**256 - 1])
                     approve_txh = await asyncio.to_thread(self._send_tx, USDC_ARBITRUM, approve_data, 0, acct)
                     await asyncio.to_thread(open_wait_receipt, self.w3, approve_txh)
 
-                # Swap with slippage protection
+                # Swap USDC → WETH → unwrap to ETH
                 router = self.w3.eth.contract(address=UNISWAP_ROUTER, abi=UNISWAP_ABI)
                 expected_eth = TOPUP_USD / eth_price
-                min_eth_out = int(expected_eth * 0.95 * 10**18)  # 5% slippage for auto
+                min_eth_out = int(expected_eth * 0.95 * 10**18)  # 5% slippage
                 swap_params = (USDC_ARBITRUM, WETH_ARBITRUM, POOL_FEE, UNISWAP_ROUTER, usdc_amount_in, min_eth_out, 0)
                 swap_data = router.encode_abi("exactInputSingle", [swap_params])
-                unwrap_data = router.encode_abi("unwrapWETH9", [min_eth_out, Web3.to_checksum_address(wallet)])
-                call_data = router.encode_abi("multicall", [[swap_data, unwrap_data]])
+                unwrap_data = router.encode_abi("unwrapWETH9", [min_eth_out, Web3.to_checksum_address(wallet_addr)])
+                deadline = int(time.time()) + 300  # 5 min deadline
+                call_data = router.encode_abi("multicall", [deadline, [swap_data, unwrap_data]])
 
                 txh = await asyncio.to_thread(self._send_tx, UNISWAP_ROUTER, call_data, 0, acct)
                 receipt = await asyncio.to_thread(open_wait_receipt, self.w3, txh)
 
                 if receipt.get("status") == 1:
-                    new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+                    new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet_addr)
                     new_eth_usd = (new_eth_bal / 10**18) * eth_price
                     self.logger.info(f"W{wid} auto-topup OK: ${TOPUP_USD:.0f} USDC → ETH (now ${new_eth_usd:.2f})")
                     await self.notify(f"⛽ W{wid} auto-topped up: ${TOPUP_USD:.0f} USDC → ETH (balance: ${new_eth_usd:.2f})")
                 else:
                     self.logger.error(f"W{wid} auto-topup swap reverted: {txh}")
+                    await self.notify(f"❌ W{wid} auto top-up swap REVERTED. Manual /topup needed.")
 
         except Exception as e:
             self.logger.warning(f"topup_eth_if_needed error: {e}")
+            await self.notify(f"⚠️ Auto top-up error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command handlers
@@ -577,9 +736,12 @@ class WalletMixin:
         USDC_ARBITRUM = Web3.to_checksum_address("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
         POOL_FEE = 500
 
+        # SwapRouter02 multicall signature: multicall(uint256 deadline, bytes[] data)
         UNISWAP_ABI = [
             {"name": "multicall", "type": "function", "stateMutability": "payable",
-             "inputs": [{"name": "data", "type": "bytes[]"}], "outputs": [{"name": "", "type": "bytes[]"}]},
+             "inputs": [{"name": "deadline", "type": "uint256"},
+                        {"name": "data", "type": "bytes[]"}],
+             "outputs": [{"name": "", "type": "bytes[]"}]},
             {"name": "exactInputSingle", "type": "function", "stateMutability": "payable",
              "inputs": [{"name": "params", "type": "tuple", "components": [
                  {"name": "tokenIn", "type": "address"}, {"name": "tokenOut", "type": "address"},
@@ -657,10 +819,10 @@ class WalletMixin:
         for wid, acct in targets:
             label = f"W{wid}"
             try:
-                wallet = acct.address
+                _wallet = acct.address  # bind early to avoid lambda closure bug
                 usdc_token = self.w3.eth.contract(address=USDC_ARBITRUM, abi=ERC20_ABI)
                 usdc_decimals = await asyncio.to_thread(lambda: usdc_token.functions.decimals().call())
-                usdc_bal_raw = await asyncio.to_thread(lambda: usdc_token.functions.balanceOf(wallet).call())
+                usdc_bal_raw = await asyncio.to_thread(lambda w=_wallet: usdc_token.functions.balanceOf(w).call())
                 usdc_bal = usdc_bal_raw / (10 ** usdc_decimals)
 
                 if usdc_bal < topup_usd:
@@ -670,7 +832,7 @@ class WalletMixin:
                 usdc_amount_in = int(topup_usd * (10 ** usdc_decimals))
 
                 allowance = await asyncio.to_thread(
-                    lambda: usdc_token.functions.allowance(wallet, UNISWAP_ROUTER).call()
+                    lambda w=_wallet: usdc_token.functions.allowance(w, UNISWAP_ROUTER).call()
                 )
                 if allowance < usdc_amount_in:
                     approve_data = usdc_token.encode_abi("approve", [UNISWAP_ROUTER, 2**256 - 1])
@@ -678,7 +840,6 @@ class WalletMixin:
                     await asyncio.to_thread(open_wait_receipt, self.w3, approve_txh)
 
                 router = self.w3.eth.contract(address=UNISWAP_ROUTER, abi=UNISWAP_ABI)
-                # Calculate minimum ETH output with 3% slippage protection
                 min_eth_out = 0
                 if eth_price and eth_price > 0:
                     expected_eth = topup_usd / eth_price
@@ -686,14 +847,15 @@ class WalletMixin:
                 swap_params = (USDC_ARBITRUM, WETH_ARBITRUM, POOL_FEE, UNISWAP_ROUTER, usdc_amount_in, min_eth_out, 0)
                 swap_data = router.encode_abi("exactInputSingle", [swap_params])
                 unwrap_min = min_eth_out if min_eth_out > 0 else 0
-                unwrap_data = router.encode_abi("unwrapWETH9", [unwrap_min, Web3.to_checksum_address(wallet)])
-                call_data = router.encode_abi("multicall", [[swap_data, unwrap_data]])
+                unwrap_data = router.encode_abi("unwrapWETH9", [unwrap_min, Web3.to_checksum_address(_wallet)])
+                deadline = int(time.time()) + 300  # 5 min deadline
+                call_data = router.encode_abi("multicall", [deadline, [swap_data, unwrap_data]])
 
                 txh = await asyncio.to_thread(self._send_tx, UNISWAP_ROUTER, call_data, 0, acct)
                 receipt = await asyncio.to_thread(open_wait_receipt, self.w3, txh)
 
                 if receipt.get("status") == 1:
-                    new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet)
+                    new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, _wallet)
                     new_eth_usd = (new_eth_bal / 10**18) * (eth_price or 0)
                     results.append(f"{label}: swapped ${topup_usd:.0f} USDC → ETH (balance: ${new_eth_usd:.2f})")
                 else:
