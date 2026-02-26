@@ -1119,6 +1119,9 @@ class WalletMixin:
                     f"TX: {tx_hash}\n"
                     f"{arb_url}{bal_line}"
                 )
+
+                # Rebalance remaining USDC across wallets
+                await self._rebalance_wallets()
             else:
                 await self.send_message(
                     chat_id,

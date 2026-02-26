@@ -33,6 +33,7 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 - **Combined Pool Sizing** — All wallets act as one pool. Trade size = `PORTFOLIO_PCT` of total portfolio value (free USDC + deployed collateral + unrealized PnL)
 - **Auto-Rebalance** — After each trade open/close, USDC is equalized across all wallets using above/below-average transfer pairing
 - **Consolidate** — `/consolidate` moves all free USDC from W2-W4 into W1 for easy withdrawals
+- **Withdraw** — `/withdraw <amount>` sends USDC to an external Arbitrum address with consolidation (only if needed), address validation, and confirmation flow
 
 ### Gas Management
 - **Auto ETH Top-Up** — If any wallet's ETH balance drops below $2, automatically swaps $5 USDC to ETH via Uniswap V3 on Arbitrum
@@ -45,10 +46,14 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 - **Staleness Protection** — Prices older than 15s are considered stale; bot auto-halts if prices are stale for 120s+
 
 ### Analytics & Reporting
+- **On-Chain Trade History** — Fetches realized PnL directly from GMX V2 EventEmitter logs (OrderExecuted + PositionDecrease events). Works for TPs, SLs, and manual closes — including those that happened while the bot was offline
+- **Local Trade Storage** — On-chain trades are persisted to `onchain_trades.json` with `tx_hash:log_index` composite keys, so data survives beyond the 30-day RPC lookback window
+- **PnL Reset** — `pnl_reset.json` stores a timestamp to permanently exclude old test/dust trades from all analytics
+- **Dust Filtering** — Trades with PnL under $1 are excluded from `/pnl`, `/winrate`, `/pdf`, and hourly alerts
 - **Trade History** — All closed trades recorded to `trade_history.json` with entry/exit, PnL, wallet, reason
-- **PDF Export** — `/pdf` generates a PDF document of all closed trades with color-coded PnL, sent as a Telegram file
-- **Win Rate** — `/winrate` shows stats filterable by symbol and last N trades
-- **PnL Breakdown** — `/pnl` shows today / 30-day / all-time PnL for BTC, ETH, SOL with realized + unrealized
+- **PDF Export** — `/pdf` generates a PDF of all on-chain + local trades with color-coded PnL, sent as a Telegram file
+- **Win Rate** — `/winrate` shows stats from on-chain data, filterable by symbol and last N trades
+- **PnL Breakdown** — `/pnl` shows today / 30-day / all-time PnL for BTC, ETH, SOL from on-chain data with realized + unrealized
 - **Hourly PnL Alerts** — Automated hourly PnL snapshot sent between 9 AM - 11 PM ET
 - **24h Balance Tracking** — `/balance` shows portfolio change over the last 24 hours (hourly snapshots saved to `balance_snapshots.json`)
 
@@ -58,11 +63,12 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 | `/addorder` | Manually add a SL or TP to an open position |
 | `/balance` | Per-wallet USDC/deployed breakdown + 24h change |
 | `/balance-wallets` | Manually rebalance USDC between wallets (W1-W4) |
+| `/cancel` | Cancel a pending withdraw or close |
 | `/cancelorder` | List & cancel individual SL/TP orders by number |
 | `/close` | Interactive close flow — select positions to close |
 | `/close all` | Close all positions + cancel all orders across all wallets |
 | `/close BTC` | Close all BTC positions |
-| `/confirm` | Confirm pending close |
+| `/confirm` | Confirm pending close or withdraw |
 | `/consolidate` | Move all free USDC from W2-W4 into W1 (for withdrawals) |
 | `/gas` | ETH gas balances for all wallets with low-balance warnings |
 | `/halt [reason]` | Halt trading |
@@ -71,8 +77,8 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 | `/increase` | Add collateral to an open position |
 | `/lastmsg` | Print last message from monitored channel(s) |
 | `/lastsignal` | Re-run the last parsed signal |
-| `/pdf` | Download trade history as PDF |
-| `/pnl` | PnL summary (today / 30d / all time) for BTC, SOL, ETH |
+| `/pdf` | Download on-chain + local trade history as PDF |
+| `/pnl` | PnL summary (today / 30d / all time) from on-chain data |
 | `/positions` | Show on-chain positions with TP/SL orders and PnL |
 | `/prices` | Live GMX & Chainlink prices for all tracked assets |
 | `/reset` | Clear all trade history & PnL stats |
@@ -84,7 +90,8 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 | `/summary` | Send daily summary now |
 | `/topup` | Manual ETH top-up — per wallet or all (e.g., `/topup 3 10`) |
 | `/tradesize` | View or change trade size % (e.g., `/tradesize 20` for 20%) |
-| `/winrate [SYMBOL] [N]` | Win rate stats |
+| `/withdraw <amount>` | Withdraw USDC to an external Arbitrum address |
+| `/winrate [SYMBOL] [N]` | Win rate stats (on-chain data) |
 
 ### Safety
 - Configurable max leverage, max position size, min position size
@@ -94,6 +101,8 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 - Halting mechanism for emergency trading pause with auto-resume
 - SL order pre-validation via gas estimate before cancel attempts (avoids stale key failures)
 - Duplicate position blocking — checks all wallets on-chain before opening
+- **Safe startup** — Positions sync with `skip_sl_check=True` on restart to prevent unwanted SL moves. TP hit count prefers persisted state over inference
+- **Withdraw safety** — Address validation (checksum, not zero, not bot wallet), 2-minute expiry, confirmation required
 
 ## Supported Markets
 
@@ -110,23 +119,33 @@ SL moves are pre-validated via gas estimation before executing, avoiding stale o
 gmx.py           — Main bot engine: GMXBot class, position tracking, signal processing,
                    TP hit detection, trailing SL, on-chain sync, startup/shutdown
 telegram.py      — Telegram integration: command routing, event handlers, hourly PnL loop,
-                   signal channel monitoring, close flow
+                   signal channel monitoring, close/withdraw flows
 open.py          — Signal execution: parse signals, classify swing/scalp, build GMX V2
                    orders, place TP/SL, cancel orders, Chainlink price feeds
 close.py         — Position management: fetch on-chain positions via Reader contract,
                    create close orders, GMXPosition data structure
+history.py       — On-chain trade history: fetch realized PnL from GMX EventEmitter logs
+                   (OrderExecuted + PositionDecrease events), wallet-filtered, deduped
 risk.py          — Risk management: signal validation, SL/TP direction checks,
                    trailing SL strategy (determine_new_sl_target), exit classification
 sl_tp.py         — SL/TP mixin: move_sl, cmd_sl, cmd_addorder, cmd_cancelorder
 wallet_mgmt.py   — Multi-wallet mixin: balance, gas, rebalance, consolidate, topup,
-                   balance snapshots for 24h tracking
-analytics.py     — Analytics mixin: trade recording, winrate, PnL, PDF export, health
+                   withdraw, balance snapshots for 24h tracking
+analytics.py     — Analytics mixin: trade recording, winrate, PnL, PDF export, health,
+                   on-chain trade fetching & local storage
 notifications.py — Notification mixin: Telegram message sending, position open alerts,
                    startup notification
 price_feeds.py   — Price feeds mixin: GMX Reader + Chainlink prices, cmd_prices
 config.py        — Configuration loading from .env with defaults
 test.py          — On-chain E2E test (BTC SHORT open/close/TP cycle)
 test_trailing_sl.py — Unit tests for trailing SL strategy (30 tests)
+
+Data files (auto-generated):
+onchain_trades.json   — Persistent local copy of on-chain trades (tx_hash:log_index keyed)
+pnl_reset.json        — PnL reset timestamp (filters out trades before this time)
+trade_history.json    — Bot-recorded trade history (entry/exit, PnL, wallet, reason)
+position_state.json   — Persisted position state (TP hits, realized PnL, SL labels)
+balance_snapshots.json — Hourly balance snapshots for 24h tracking
 ```
 
 ## Setup
