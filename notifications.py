@@ -46,8 +46,10 @@ class NotificationsMixin:
             elif not self._notify_chat_warned:
                 self.logger.warning("Telegram client not initialised — Telethon notification dropped")
 
-        # Bot API path — send to every DM chat that has interacted with the bot
-        bot_api_chats = getattr(self, '_bot_api_chats', set())
+        # Bot API path — send to DM chats + the configured admin chat
+        bot_api_chats = set(getattr(self, '_bot_api_chats', set()))
+        if self.cfg.bot_admin_chat_id:
+            bot_api_chats.add(int(self.cfg.bot_admin_chat_id))
         for chat_id in bot_api_chats:
             try:
                 ok = await bot_api.send_admin_message(
@@ -131,7 +133,6 @@ class NotificationsMixin:
         if order_type == "limit":
             msg += "\n\nLimit order placed — waiting for price to reach entry."
         await self.notify(msg)
-        await self.notify_admin(msg)
 
     async def send_startup_notification(self):
         """Send status update to admin when bot comes online."""
@@ -179,6 +180,5 @@ class NotificationsMixin:
                 f"Channels: {', '.join(cfg.telegram_channels)}"
             )
             await self.notify(msg)
-            await self.notify_admin(msg)
         except Exception as e:
             self.logger.error(f"Startup notification error: {e}")

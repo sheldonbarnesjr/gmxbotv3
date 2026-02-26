@@ -1349,5 +1349,4 @@ class CoreTelegramMixin:
         msg += f"  Total USDC: ${total_usdc:,.2f}\n  Deployed: ${total_deployed:,.2f}"
 
         await self.notify(msg)
-        await self.notify_admin(msg)
         self.logger.info(f"Daily summary sent: daily PnL={d_sign}${daily_pnl:,.2f}")

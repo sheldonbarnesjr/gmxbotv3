@@ -1322,8 +1322,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         except Exception as e:
             self.logger.error(f"Error processing signal: {e}\n{traceback.format_exc()}")
             self.health_stats["errors"] += 1
-            await self.notify(f"Error processing signal: {e}")
-            await self.notify_admin(f"⚠️ Error processing signal: {e}")
+            await self.notify(f"⚠️ Error processing signal: {e}")
 
     async def _close_existing_position(self, pos: 'Position', new_signal: Signal) -> bool:
         """Close an existing position + cancel its orders to make room for a new signal.
