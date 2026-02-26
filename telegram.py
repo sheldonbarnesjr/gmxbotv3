@@ -58,36 +58,36 @@ logger = logging.getLogger("GMXBot.telegram")
 
 HELP_TEXT = """**GMX V2 Bot Commands**
 
-/status — Bot status & mode
-/positions — Show on-chain positions
+/addorder — Manually add a SL or TP to an open position
+/balance — Wallet ETH & token balance
+/balance-wallets — Manually rebalance USDC between wallets (W1-W4)
+/cancelorder — List & cancel individual SL/TP orders by number
 /close — Show positions + open orders
 /close all — Close all positions + cancel all orders
 /close BTC — Close by symbol
 /confirm — Confirm pending close
+/consolidate — Move ALL free USDC from W2-W4 into W1 (for withdrawals)
+/gas — ETH gas balances for all wallets
+/halt [reason] — Halt trading
+/health — System health
+/help — This message
+/increase — Add collateral to an open position
+/lastmsg — Print last message from monitored channel(s)
+/lastsignal — Re-run the last parsed signal
+/pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
+/positions — Show on-chain positions
+/prices — Live GMX & Chainlink prices for all tracked assets
+/reset — Clear all trade history & PnL stats
+/resume [reason] — Resume trading
+/retryqueue — Show pending failed order retries
 /sl — Move SL to entry or TP level
 /sl 1 entry — Move #1 SL to entry (breakeven)
 /sl 1 tp2 — Move #1 SL to TP2 price
-/balance — Wallet ETH & token balance
-/halt [reason] — Halt trading
-/resume [reason] — Resume trading
-/winrate [SYMBOL] [N] — Win rate stats
-/pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
+/status — Bot status & mode
 /summary — Send daily summary now
-/reset — Clear all trade history & PnL stats
-/increase — Add collateral to an open position
-/cancelorder — List & cancel individual SL/TP orders by number
-/addorder — Manually add a SL or TP to an open position
-/prices — Live GMX & Chainlink prices for all tracked assets
-/gas — ETH gas balances for all wallets
-/tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
-/balance-wallets — Manually rebalance USDC between wallets (W1-W4)
-/consolidate — Move ALL free USDC from W2-W4 into W1 (for withdrawals)
-/lastmsg — Print last message from monitored channel(s)
-/lastsignal — Re-run the last parsed signal
-/retryqueue — Show pending failed order retries
-/health — System health
-/help — This message
+/tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
+/winrate [SYMBOL] [N] — Win rate stats
 
 **Wallets:** W1=swing, W2-W4=scalps"""
 
@@ -521,7 +521,7 @@ class CoreTelegramMixin:
                                 close_pct_str = f" ({remaining_tps_sorted[j-1].percentage:.0%})"
 
                         if tp_price and pos.entry_price and pos.entry_price > 0:
-                            # Price change % — always raw direction (negative for shorts)
+                            # Token price change % — raw direction (negative for shorts)
                             price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
 
                             # Projected PnL — only for the portion closing at this TP
@@ -530,13 +530,19 @@ class CoreTelegramMixin:
                             else:
                                 pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
 
-                            # Use on-chain close size if available, else derive from close_pct_str
                             tp_close_size = tp_size if tp_size > 0 else pos.size_usd
                             proj = pnl_per_dollar * tp_close_size
 
+                            # PnL % on collateral for this TP portion
+                            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                            tp_collateral = collateral * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else collateral
+                            pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
+                            pnl_pct_sign = "+" if pnl_pct >= 0 else ""
+
                             proj_sign = "+" if proj >= 0 else ""
                             chg_sign = "+" if price_chg >= 0 else ""
-                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected, {chg_sign}{price_chg:.2f}%)\n"
+                            sym = pos.symbol or ""
+                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}  ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
                         elif tp_price:
                             msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
                         else:
