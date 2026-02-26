@@ -63,6 +63,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /addorder — Manually add a SL or TP to an open position
 /balance — Wallet ETH & token balance
 /balance-wallets — Manually rebalance USDC between wallets (W1-W4)
+/cancel — Cancel a pending withdraw or close
 /cancelorder — List & cancel individual SL/TP orders by number
 /close — Show positions + open orders
 /close all — Close all positions + cancel all orders
@@ -91,6 +92,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /summary — Send daily summary now
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
 /tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
+/withdraw <amount> — Withdraw USDC to an external Arbitrum address
 /winrate [SYMBOL] [N] — Win rate stats
 
 **Wallets:** W1=swing, W2-W4=scalps"""

@@ -955,28 +955,39 @@ class WalletMixin:
             await self.send_message(chat_id, "Amount must be greater than 0.")
             return
 
-        await self.send_message(chat_id, f"Consolidating USDC into W1 for withdrawal...")
-
-        # Consolidate all USDC into W1
-        try:
-            results = await self._consolidate_to_wallet(1)
-        except Exception as e:
-            await self.send_message(chat_id, f"Consolidation failed: {e}")
-            return
-
-        # Check W1 balance
+        # Check W1 balance first
         try:
             w1_balance = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
         except Exception as e:
             await self.send_message(chat_id, f"Failed to check W1 balance: {e}")
             return
 
+        # Only consolidate if W1 doesn't have enough on its own
+        consolidation_info = ""
         if w1_balance < amount:
-            msg = f"Insufficient balance.\n\nW1 balance: ${w1_balance:,.2f}\nRequested: ${amount:,.2f}"
-            if results:
-                msg = "\n".join(results) + "\n\n" + msg
-            await self.send_message(chat_id, msg)
-            return
+            await self.send_message(chat_id, "W1 balance insufficient, consolidating from other wallets...")
+            try:
+                results = await self._consolidate_to_wallet(1)
+                if results:
+                    consolidation_info = "\n".join(results) + "\n\n"
+            except Exception as e:
+                await self.send_message(chat_id, f"Consolidation failed: {e}")
+                return
+
+            # Re-check W1 balance after consolidation
+            try:
+                w1_balance = await asyncio.to_thread(self._get_portfolio_value_for, self.account)
+            except Exception as e:
+                await self.send_message(chat_id, f"Failed to check W1 balance: {e}")
+                return
+
+            if w1_balance < amount:
+                await self.send_message(
+                    chat_id,
+                    f"{consolidation_info}"
+                    f"Insufficient balance.\n\nW1 balance: ${w1_balance:,.2f}\nRequested: ${amount:,.2f}"
+                )
+                return
 
         # Store pending state
         self.pending_withdraw[chat_id] = {
@@ -985,7 +996,6 @@ class WalletMixin:
             "created_at": time.time(),
         }
 
-        consolidation_info = "\n".join(results) + "\n\n" if results else ""
         await self.send_message(
             chat_id,
             f"{consolidation_info}"
