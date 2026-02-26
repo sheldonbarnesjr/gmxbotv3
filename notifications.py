@@ -36,7 +36,7 @@ class NotificationsMixin:
         sent = False
 
         # Telethon path (existing)
-        if self.cfg.notify_chat or self.cfg.notify_chat == "me":
+        if self.cfg.notify_chat:
             if self.client:
                 try:
                     await self.client.send_message(self.cfg.notify_chat, message)

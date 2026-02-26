@@ -1542,6 +1542,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 chain_fetch_positions, self.w3, pos_acct.address
             )
             market_addr = self.cfg.markets.get(pos.symbol)
+            if not market_addr:
+                self.logger.error(f"No market address configured for {pos.symbol} — cannot close override")
+                return False
             gmx_pos = None
             for p in positions:
                 if p.market.lower() == market_addr.lower():
@@ -1738,7 +1741,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
             # Try to execute on-chain
             try:
-                actual_collateral = collateral_usd if collateral_usd else size_usd / signal.leverage
+                actual_collateral = collateral_usd if collateral_usd else (size_usd / signal.leverage if signal.leverage else size_usd)
                 results = await asyncio.to_thread(
                     execute_signal,
                     w3=self.w3,

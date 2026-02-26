@@ -493,6 +493,10 @@ def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
     if total <= 0:
         return take_profits
 
+    if len(env_pcts) < len(take_profits):
+        log.warning(f"TP distribution mismatch: {len(env_pcts)} pcts for {len(take_profits)} TPs — using signal defaults")
+        return take_profits
+
     for i, tp in enumerate(take_profits):
         tp.close_pct = env_pcts[i] / total  # normalize to sum to 1.0
 

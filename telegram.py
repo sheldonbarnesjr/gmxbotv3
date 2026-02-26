@@ -312,7 +312,13 @@ class CoreTelegramMixin:
                 await self.resume_trading(reason)
             elif cmd == "/winrate":
                 sym = parts[1].upper() if len(parts) > 1 else None
-                n = int(parts[2]) if len(parts) > 2 else None
+                n = None
+                if len(parts) > 2:
+                    try:
+                        n = int(parts[2])
+                    except ValueError:
+                        await self.send_message(chat_id, "Invalid count. Usage: /winrate [SYMBOL] [N]")
+                        return
                 await self.cmd_winrate(chat_id, sym, n)
             elif cmd == "/health":
                 await self.cmd_health(chat_id)

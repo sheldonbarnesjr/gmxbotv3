@@ -75,8 +75,6 @@ def fetch_trade_history(
         List of trade dicts with: market_address, is_long, size_delta_usd,
         pnl_usd, timestamp.
     """
-    from open import _EVENT_LOG2_ABI
-
     emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
     wallet_topic = "0x" + "0" * 24 + account.lower().replace("0x", "")
 
@@ -130,7 +128,8 @@ def fetch_trade_history(
 
         try:
             receipt = w3.eth.get_transaction_receipt(tx_hash)
-        except Exception:
+        except Exception as e:
+            log.debug(f"Failed to fetch receipt for {tx_hash}: {e}")
             continue
         processed_receipts[tx_hash] = True
 
@@ -201,7 +200,8 @@ def fetch_trade_history(
                     "log_index": log_idx,
                 })
 
-            except Exception:
+            except Exception as e:
+                log.debug(f"Failed to decode event log: {e}")
                 continue
 
     log.info(f"fetch_trade_history: {len(results)} trade(s) for {account[:10]}...")

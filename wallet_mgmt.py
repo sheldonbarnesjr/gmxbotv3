@@ -438,9 +438,8 @@ class WalletMixin:
 
                 if send_amount >= 0.50:  # minimum $0.50 transfer to avoid dust
                     transfers.append((sender_wid, receiver_wid, send_amount))
-
-                above_remaining[sender_wid] -= send_amount
-                below_remaining[receiver_wid] -= send_amount
+                    above_remaining[sender_wid] -= send_amount
+                    below_remaining[receiver_wid] -= send_amount
 
                 if above_remaining[sender_wid] < 0.50:
                     ai += 1
