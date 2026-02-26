@@ -232,6 +232,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Increase position state: chat_id -> pending increase info
         self.pending_increase: Dict[int, Dict[str, Any]] = {}
 
+        # Withdraw state: chat_id -> pending withdraw info
+        self.pending_withdraw: Dict[int, Dict[str, Any]] = {}
+
         # Last signal text for /lastsignal replay
         self.last_signal_text: Optional[str] = None
 

@@ -199,7 +199,9 @@ class CoreTelegramMixin:
                 username = (getattr(sender, "username", "") or "").lower()
                 if cfg.admin_usernames and username not in cfg.admin_usernames:
                     return
-                if event.chat_id in self.pending_increase:
+                if event.chat_id in self.pending_withdraw:
+                    await self.handle_withdraw_reply(event.chat_id, text)
+                elif event.chat_id in self.pending_increase:
                     await self.handle_increase_reply(event.chat_id, text)
                 else:
                     await self.handle_close_confirmation(event.chat_id, text)
@@ -263,6 +265,8 @@ class CoreTelegramMixin:
 
                     if text.startswith("/"):
                         await self.process_admin_command(text, chat_id)
+                    elif chat_id in self.pending_withdraw:
+                        await self.handle_withdraw_reply(chat_id, text)
                     elif chat_id in self.pending_increase:
                         await self.handle_increase_reply(chat_id, text)
                     else:
@@ -294,7 +298,10 @@ class CoreTelegramMixin:
                 arg = parts[1] if len(parts) > 1 else None
                 await self.cmd_close(chat_id, arg)
             elif cmd == "/confirm":
-                await self.handle_close_confirmation(chat_id, "YES")
+                if chat_id in self.pending_withdraw:
+                    await self.handle_withdraw_reply(chat_id, "CONFIRM")
+                else:
+                    await self.handle_close_confirmation(chat_id, "YES")
             elif cmd == "/halt":
                 reason = " ".join(parts[1:]) if len(parts) > 1 else "Manual halt"
                 await self.halt_trading(reason)
@@ -351,6 +358,18 @@ class CoreTelegramMixin:
                 await self.cmd_pdf(chat_id)
             elif cmd == "/sync":
                 await self.cmd_sync(chat_id)
+            elif cmd == "/withdraw":
+                arg = " ".join(parts[1:]) if len(parts) > 1 else None
+                await self.cmd_withdraw(chat_id, arg)
+            elif cmd == "/cancel":
+                if chat_id in self.pending_withdraw:
+                    del self.pending_withdraw[chat_id]
+                    await self.send_message(chat_id, "Withdrawal cancelled.")
+                elif chat_id in self.pending_closes:
+                    del self.pending_closes[chat_id]
+                    await self.send_message(chat_id, "Close cancelled.")
+                else:
+                    await self.send_message(chat_id, "Nothing to cancel.")
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
