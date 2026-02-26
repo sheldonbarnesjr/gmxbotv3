@@ -29,7 +29,7 @@ from web3 import Web3
 from open import (
     fetch_open_orders, create_sl_order, create_tp_order, TakeProfit,
     EXCHANGE_ROUTER_ABI, ORDER_TYPE_STOP_LOSS_DECREASE, ORDER_TYPE_LIMIT_DECREASE,
-    fetch_current_price
+    fetch_current_price, fetch_price_touched_in_window,
 )
 import open as _open_mod
 from close import fetch_positions as chain_fetch_positions, GMXPosition
@@ -105,54 +105,86 @@ class SLTPMixin:
                     f"(remaining: {current_tp_count})"
                 )
 
-                # Identify which TPs were hit using price verification
+                # ── Identify which TPs were hit ──
+                # Three-layer verification:
+                #   1. Current price check (fastest)
+                #   2. Historical Chainlink price check (catches bounces)
+                #   3. Trust on-chain state (keeper wouldn't execute without price hit)
+                #
+                # On-chain TP disappearance IS the strongest proof: GMX keepers
+                # only execute LimitDecrease orders when the oracle price reaches
+                # the trigger. If the order is gone, the TP was hit — period.
+                # We verify price only to log WHICH specific TP was hit.
+
                 if pos.side == "LONG":
                     sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price)
                 else:
                     sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price, reverse=True)
 
                 new_hits = 0
+
+                # Layer 1: Current price verification
                 for i, tp in enumerate(sorted_tps):
                     if new_hits >= on_chain_hits:
-                        break  # matched all on-chain hits
+                        break
                     if not tp.executed and verify_tp_hit_by_price(pos.side == "LONG", tp.price, current_price):
                         tp.executed = True
                         tp.executed_at = time.time()
                         new_hits += 1
-                        self.logger.info(f"{pos.symbol} TP{i+1} HIT @ ${current_price:,.0f} (on-chain confirmed)")
+                        self.logger.info(f"{pos.symbol} TP{i+1} HIT @ ${current_price:,.0f} (current price confirmed)")
 
-                # Implied hits: if a later TP was verified, all earlier TPs
-                # (closer to entry) must have been hit too — price has to pass
-                # through them. This handles price-bounce scenarios where the
-                # keeper executed multiple TPs but price bounced back before
-                # our check ran.
-                if new_hits > 0 and new_hits < on_chain_hits:
-                    farthest_idx = -1
+                # Layer 2: Historical Chainlink price check (10-min window)
+                # Catches cases where price wicked through TP and bounced back
+                if new_hits < on_chain_hits:
                     for i, tp in enumerate(sorted_tps):
-                        if tp.executed:
-                            farthest_idx = i
-                    for i in range(farthest_idx):
-                        if not sorted_tps[i].executed:
-                            sorted_tps[i].executed = True
-                            sorted_tps[i].executed_at = time.time()
-                            new_hits += 1
-                            self.logger.info(
-                                f"{pos.symbol} TP{i+1} HIT (implied — price passed through)"
-                            )
+                        if new_hits >= on_chain_hits:
+                            break
+                        if not tp.executed:
+                            try:
+                                touched = await asyncio.to_thread(
+                                    fetch_price_touched_in_window,
+                                    pos.symbol, tp.price, pos.side == "LONG",
+                                    self.w3, 600, 0.003,
+                                )
+                                if touched:
+                                    tp.executed = True
+                                    tp.executed_at = time.time()
+                                    new_hits += 1
+                                    self.logger.info(
+                                        f"{pos.symbol} TP{i+1} HIT @ ${tp.price:,.0f} "
+                                        f"(historical Chainlink confirmed, current=${current_price:,.0f})"
+                                    )
+                            except Exception as e:
+                                self.logger.debug(f"Historical price check failed for TP{i+1}: {e}")
 
-                # If on-chain TP count decreased but NO price verified at all,
-                # this may be manual cancellation — don't move SL.
-                if new_hits == 0 and on_chain_hits > 0:
+                # Layer 3: Trust on-chain state (final fallback)
+                # If on-chain TP orders disappeared but neither current nor historical
+                # price verified, STILL mark TPs as hit. The GMX keeper executed them
+                # — that's on-chain proof. NOT moving SL would leave the position
+                # unprotected, which is far worse than a false positive.
+                if new_hits < on_chain_hits:
+                    remaining_to_match = on_chain_hits - new_hits
                     self.logger.warning(
-                        f"{pos.symbol}: {on_chain_hits} on-chain TP order(s) disappeared "
-                        f"but price ${current_price:,.0f} didn't verify any. "
-                        f"Possible manual cancellation — NOT moving SL."
+                        f"{pos.symbol}: {remaining_to_match} TP(s) confirmed by on-chain state "
+                        f"(keeper executed) but price ${current_price:,.0f} bounced. "
+                        f"Trusting on-chain — marking as hit and moving SL."
                     )
+                    for i, tp in enumerate(sorted_tps):
+                        if remaining_to_match <= 0:
+                            break
+                        if not tp.executed:
+                            tp.executed = True
+                            tp.executed_at = time.time()
+                            new_hits += 1
+                            remaining_to_match -= 1
+                            self.logger.info(
+                                f"{pos.symbol} TP{i+1} HIT @ ${tp.price:,.0f} "
+                                f"(on-chain keeper confirmed, price bounced to ${current_price:,.0f})"
+                            )
                     await self.notify(
-                        f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                        f"{on_chain_hits} TP order(s) disappeared on-chain but "
-                        f"price ${current_price:,.0f} didn't reach any TP level.\n"
-                        f"SL NOT moved — may have been manually cancelled."
+                        f"🎯 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                        f"TP executed on-chain by keeper (price bounced to ${current_price:,.0f})\n"
+                        f"On-chain state is source of truth — moving SL as planned."
                     )
 
                 if new_hits > 0:
@@ -314,13 +346,43 @@ class SLTPMixin:
                 )
                 return
 
-            # 3. Update in-memory state
+            # 3. Post-creation duplicate check: verify only 1 SL remains
+            await asyncio.sleep(1)
+            try:
+                verify_orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
+                remaining_sls = [
+                    o for o in verify_orders
+                    if o["market"].lower() == market_lower
+                    and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                    and o.get("key_hex")
+                ]
+                if len(remaining_sls) > 1:
+                    self.logger.warning(
+                        f"{pos.symbol}: {len(remaining_sls)} SL orders after move — "
+                        f"cleaning up {len(remaining_sls) - 1} stale order(s)"
+                    )
+                    # Keep the newest (last in list), cancel others
+                    for stale_sl in remaining_sls[:-1]:
+                        try:
+                            key_bytes = bytes.fromhex(stale_sl["key_hex"])
+                            data = exchange.encode_abi("cancelOrder", [key_bytes])
+                            tx = _open_mod.build_tx(self.w3, wallet, exchange.address, data, value=0)
+                            txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=cfg.dry_run)
+                            if not cfg.dry_run:
+                                _open_mod.wait_receipt(self.w3, txh)
+                            self.logger.info(f"Cleaned up stale SL: {txh}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to clean up stale SL: {e}")
+            except Exception as e:
+                self.logger.debug(f"Post-creation SL verify failed: {e}")
+
+            # 4. Update in-memory state
             pos.sl_moved_to_entry = True
             pos.sl_move_label = sl_label
             pos.stop_loss = new_sl_price
             pos.sl_move_failed = False
 
-            # 4. Notify admin (auto mode only — manual callers send their own)
+            # 5. Notify admin (auto mode only — manual callers send their own)
             if not manual:
                 await self.notify(
                     f"🎯 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
@@ -548,8 +610,10 @@ class SLTPMixin:
                     f"  Entry: ${pos.entry_price:,.2f}  |  Current: ${pos.current_price:,.2f}\n"
                 )
                 if sl_orders:
-                    for o in sl_orders:
-                        msg += f"  SL @ ${o['trigger_price']:,.2f}\n"
+                    # Show only one SL; warn if duplicates exist on-chain
+                    if len(sl_orders) > 1:
+                        msg += f"  ⚠️ {len(sl_orders)} SL orders (duplicates)\n"
+                    msg += f"  SL @ ${sl_orders[0]['trigger_price']:,.2f}\n"
                 if tp_orders:
                     for j, o in enumerate(tp_orders, 1):
                         msg += f"  TP{j} @ ${o['trigger_price']:,.2f}  (${o['size_usd']:,.2f})\n"
@@ -854,3 +918,131 @@ class SLTPMixin:
 
         msg = f"**Cancel Orders: {summary}**\n" + "\n".join(detail_lines)
         await self.send_message(chat_id, msg)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Channel-based TP confirmation (fallback Layer 3)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def check_channel_tp_confirmation(self, text: str):
+        """Check if a channel update message confirms a TP hit for any tracked position.
+
+        Called when the signal handler detects an update message (not a new signal).
+        Parses the message for target-hit patterns and matches against tracked positions
+        that have unexecuted TPs where SL hasn't been moved yet.
+
+        This is a safety net: if on-chain detection AND historical price check both
+        miss a TP hit (extremely unlikely), the channel announcement catches it.
+        """
+        import re
+        lower = text.lower()
+
+        # Extract which target number was hit (if mentioned)
+        tp_num_match = re.search(
+            r"(?:target|tp)\s*(\d+)\s*(?:was\s+)?(?:hit|reached|smashed|done|achieved|✅)",
+            lower,
+        )
+        # Also detect "all targets hit"
+        all_hit = bool(re.search(r"all\s*(?:tp|targets?)\s*(?:hit|reached|done|smashed)", lower))
+
+        if not tp_num_match and not all_hit:
+            return
+
+        # Try to identify which symbol this is about
+        symbol_found = None
+        for sym in ("BTC", "ETH", "SOL", "LINK"):
+            if sym.lower() in lower or f"${sym.lower()}" in lower:
+                symbol_found = sym
+                break
+        # Also check for full names
+        sym_aliases = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL"}
+        if not symbol_found:
+            for alias, sym in sym_aliases.items():
+                if alias in lower:
+                    symbol_found = sym
+                    break
+
+        # Build list of candidate positions
+        candidates = [
+            (pid, p) for pid, p in self.positions.items()
+            if p.is_open and p.take_profits
+            and any(not tp.executed for tp in p.take_profits)
+        ]
+
+        # If symbol identified, filter to that symbol
+        if symbol_found:
+            candidates = [(pid, p) for pid, p in candidates if p.symbol == symbol_found]
+        elif len(candidates) > 1:
+            # Without symbol identification, only act if there's exactly one
+            # open position with unexecuted TPs to avoid false positives
+            self.logger.debug(
+                f"Channel TP confirmation: can't determine symbol from message, "
+                f"and {len(candidates)} positions open — skipping to avoid false match"
+            )
+            return
+
+        for pos_id, pos in candidates:
+
+            if pos.side == "LONG":
+                sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price)
+            else:
+                sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price, reverse=True)
+
+            if all_hit:
+                # Mark all remaining TPs as hit
+                hits = 0
+                for tp in sorted_tps:
+                    if not tp.executed:
+                        tp.executed = True
+                        tp.executed_at = time.time()
+                        hits += 1
+                if hits > 0:
+                    pos.tp_hits_count += hits
+                    self.logger.info(
+                        f"{pos.symbol}: Channel confirmed ALL targets hit — "
+                        f"marked {hits} TP(s), moving SL"
+                    )
+                    await self.notify(
+                        f"📢 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                        f"Channel confirmed all targets hit — moving SL"
+                    )
+                    try:
+                        acct = self._get_account(pos.wallet_id)
+                        orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
+                        await self.move_sl(pos, orders)
+                    except Exception as e:
+                        self.logger.warning(f"Channel TP confirm: failed to move SL: {e}")
+                        await self.notify(
+                            f"⚠️ {pos.symbol}: Channel confirmed TPs but SL move failed: {e}"
+                        )
+
+            elif tp_num_match:
+                tp_num = int(tp_num_match.group(1))
+                # Mark all TPs up to and including tp_num
+                hits = 0
+                for i, tp in enumerate(sorted_tps):
+                    if i + 1 > tp_num:
+                        break
+                    if not tp.executed:
+                        tp.executed = True
+                        tp.executed_at = time.time()
+                        hits += 1
+
+                if hits > 0:
+                    pos.tp_hits_count += hits
+                    self.logger.info(
+                        f"{pos.symbol}: Channel confirmed TP{tp_num} hit — "
+                        f"marked {hits} TP(s), moving SL"
+                    )
+                    await self.notify(
+                        f"📢 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                        f"Channel confirmed TP{tp_num} hit — moving SL"
+                    )
+                    try:
+                        acct = self._get_account(pos.wallet_id)
+                        orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
+                        await self.move_sl(pos, orders)
+                    except Exception as e:
+                        self.logger.warning(f"Channel TP confirm: failed to move SL: {e}")
+                        await self.notify(
+                            f"⚠️ {pos.symbol}: Channel confirmed TP{tp_num} but SL move failed: {e}"
+                        )

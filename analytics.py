@@ -270,6 +270,8 @@ class AnalyticsMixin:
         alltime_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym]) for sym in PNL_SYMBOLS}
 
         open_pnl = {sym: 0.0 for sym in PNL_SYMBOLS}
+        open_fees = {sym: 0.0 for sym in PNL_SYMBOLS}
+        any_onchain = False
         try:
             for _, acct in self._all_wallets():
                 cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
@@ -277,18 +279,30 @@ class AnalyticsMixin:
                     sym = cp.symbol.upper().split("/")[0]
                     if sym in PNL_SYMBOLS:
                         open_pnl[sym] = open_pnl.get(sym, 0.0) + cp.unrealized_pnl
+                        if getattr(cp, 'pnl_source', 'local') == "onchain":
+                            any_onchain = True
+                            open_fees[sym] = open_fees.get(sym, 0.0) + (
+                                cp.borrowing_fee_usd + cp.funding_fee_usd + cp.closing_fee_usd
+                            )
         except Exception as e:
             self.logger.warning(f"/pnl: could not fetch chain positions: {e}")
 
-        open_lines = ["**Open (Unrealized)**"]
+        onchain_tag = " (on-chain)" if any_onchain else ""
+        open_lines = [f"**Open (Unrealized){onchain_tag}**"]
         open_total = 0.0
+        total_fees = 0.0
         for sym in ("BTC", "ETH", "SOL"):
             pnl = open_pnl.get(sym, 0.0)
+            fees = open_fees.get(sym, 0.0)
             sign = "+" if pnl >= 0 else ""
-            open_lines.append(f"  {sym}: {sign}${pnl:,.2f}")
+            fee_str = f"  (fees: -${fees:,.2f})" if fees > 0 else ""
+            open_lines.append(f"  {sym}: {sign}${pnl:,.2f}{fee_str}")
             open_total += pnl
+            total_fees += fees
         sign = "+" if open_total >= 0 else ""
         open_lines.append(f"  Total: {sign}${open_total:,.2f}")
+        if total_fees > 0:
+            open_lines.append(f"  Total Fees: -${total_fees:,.2f}")
 
         if not relevant:
             closed_section = "No closed trades recorded yet.\nTrades are saved when you use /close."

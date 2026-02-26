@@ -30,6 +30,7 @@ from web3 import Web3
 
 # ── Imports from sibling modules ──
 from config import ALLOWED_SYMBOLS
+from risk import is_update_message
 from open import (  # type: ignore[assignment]  # noqa: A004
     fetch_current_price,
     fetch_open_orders,
@@ -83,6 +84,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /balance-wallets — Manually rebalance USDC between wallets (W1-W4)
 /lastmsg — Print last message from monitored channel(s)
 /lastsignal — Re-run the last parsed signal
+/retryqueue — Show pending failed order retries
 /health — System health
 /help — This message
 
@@ -152,7 +154,18 @@ class CoreTelegramMixin:
         # Signal handler — messages from monitored channels
         @self.client.on(events.NewMessage(chats=resolved_channels))
         async def handle_signal(event):
-            await self.process_signal(event.message.text)
+            text = event.message.text
+            if not text:
+                return
+            # Check if this is an update message (TP hit, SL triggered, etc.)
+            # Route through channel TP confirmation before discarding
+            if is_update_message(text):
+                try:
+                    await self.check_channel_tp_confirmation(text)
+                except Exception as e:
+                    self.logger.debug(f"Channel TP confirmation check failed: {e}")
+                return
+            await self.process_signal(text)
 
         # Resolve admin_chat — must be a valid int for Telethon event matching
         admin_chat_id = cfg.admin_chat
@@ -258,6 +271,8 @@ class CoreTelegramMixin:
             elif cmd == "/tradesize":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_tradesize(chat_id, arg)
+            elif cmd == "/retryqueue":
+                await self.cmd_retryqueue(chat_id)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -366,7 +381,11 @@ class CoreTelegramMixin:
                 side = "LONG" if pos.is_long else "SHORT"
                 display_price = pos.current_price
 
-                if display_price and pos.entry_price and pos.entry_price > 0:
+                # Use on-chain PnL when available, otherwise calculate locally
+                if getattr(pos, 'pnl_source', 'local') == "onchain":
+                    pnl = pos.unrealized_pnl
+                    pnl_pct = pos.pnl_percentage
+                elif display_price and pos.entry_price and pos.entry_price > 0:
                     if pos.is_long:
                         price_diff = display_price - pos.entry_price
                     else:
@@ -427,6 +446,13 @@ class CoreTelegramMixin:
                     f"  Current: {current_str}\n"
                 )
 
+                # On-chain fee breakdown (when available)
+                is_onchain = getattr(pos, 'pnl_source', 'local') == "onchain"
+                fee_line = ""
+                if is_onchain:
+                    total_fees = pos.borrowing_fee_usd + pos.funding_fee_usd + pos.closing_fee_usd
+                    fee_line = f"  Fees:    -${total_fees:,.2f} (borrow: ${pos.borrowing_fee_usd:,.2f}, fund: ${pos.funding_fee_usd:,.2f}, close: ${pos.closing_fee_usd:,.2f})\n"
+
                 if tp_hits > 0:
                     total_pnl_combined = realized_pnl + pnl
                     r_sign = "+" if realized_pnl >= 0 else ""
@@ -437,14 +463,25 @@ class CoreTelegramMixin:
                         + "\n"
                         f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
                         f"  Unrealized: {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
-                        f"  **Total PnL: {t_sign}${total_pnl_combined:,.2f}**\n"
                     )
+                    if fee_line:
+                        msg += fee_line
+                    msg += f"  **Total PnL: {t_sign}${total_pnl_combined:,.2f}**\n"
                 else:
                     msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                    if fee_line:
+                        msg += fee_line
 
                 if sl_orders or tp_orders:
                     msg += "  SL & TP:\n"
-                    for o in sl_orders:
+                    # Deduplicate SL orders: show only the active one
+                    # If multiple SL orders exist on-chain (stale + new), show one + warning
+                    if len(sl_orders) > 1:
+                        msg += f"    ⚠️ {len(sl_orders)} SL orders found (cleaning up duplicates)\n"
+                        # Schedule async cleanup of duplicate SL orders
+                        asyncio.create_task(self._cleanup_duplicate_sl_orders(pos, sl_orders, orders))
+                    shown_sl = sl_orders[:1]  # show only the first SL
+                    for o in shown_sl:
                         tp_price = o.get("trigger_price", 0) or 0
                         if tp_price and pos.entry_price and pos.entry_price > 0:
                             if pos.is_long:
@@ -459,15 +496,32 @@ class CoreTelegramMixin:
                             msg += f"    SL  @ unknown\n"
                     for j, o in enumerate(tp_orders, 1):
                         tp_price = o.get("trigger_price", 0) or 0
+
+                        # % of position closing at this TP
+                        tp_size = o.get("size_usd", 0) or 0
+                        close_pct_str = ""
+                        if tp_size > 0 and pos.size_usd > 0:
+                            close_pct = (tp_size / pos.size_usd) * 100
+                            close_pct_str = f" ({close_pct:.0f}%)"
+                        elif internal:
+                            # Fall back to internal TP percentage if available
+                            remaining_tps = [t for t in internal.take_profits if not t.executed]
+                            remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
+                            if j - 1 < len(remaining_tps_sorted):
+                                close_pct_str = f" ({remaining_tps_sorted[j-1].percentage:.0%})"
+
                         if tp_price and pos.entry_price and pos.entry_price > 0:
                             if pos.is_long:
                                 proj = ((tp_price - pos.entry_price) / pos.entry_price) * pos.size_usd
+                                price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
                             else:
                                 proj = ((pos.entry_price - tp_price) / pos.entry_price) * pos.size_usd
+                                price_chg = ((pos.entry_price - tp_price) / pos.entry_price) * 100
                             proj_sign = "+" if proj >= 0 else ""
-                            msg += f"    TP{j} @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected)\n"
+                            chg_sign = "+" if price_chg >= 0 else ""
+                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected, {chg_sign}{price_chg:.2f}%)\n"
                         elif tp_price:
-                            msg += f"    TP{j} @ ${tp_price:,.2f}\n"
+                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
                         else:
                             msg += f"    TP{j} @ unknown\n"
 
@@ -481,7 +535,9 @@ class CoreTelegramMixin:
 
             total_pnl = sum(p.unrealized_pnl for p in positions)
             total_size = sum(p.size_usd for p in positions)
-            msg += f"\nTotal Size: ${total_size:,.2f}  |  Total PnL: ${total_pnl:+.2f}\n"
+            any_onchain = any(getattr(p, 'pnl_source', 'local') == "onchain" for p in positions)
+            pnl_tag = " (on-chain)" if any_onchain else ""
+            msg += f"\nTotal Size: ${total_size:,.2f}  |  Total PnL: ${total_pnl:+.2f}{pnl_tag}\n"
 
         # Pending limit entry orders
         pending_entries = [
@@ -498,6 +554,62 @@ class CoreTelegramMixin:
                 msg += f"  {o['symbol']} {side} @ {price_str}  (${o['size_usd']:,.2f})\n"
 
         await self.send_message(chat_id, msg)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Duplicate SL cleanup
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _cleanup_duplicate_sl_orders(self, chain_pos, sl_orders: list, all_orders: list):
+        """Cancel duplicate SL orders for a position, keeping only the most recent one.
+
+        This can happen when move_sl partially fails or when the bot restarts
+        and re-places an SL that already exists on-chain.
+        """
+        if len(sl_orders) <= 1:
+            return
+
+        cfg = self.cfg
+        if cfg.dry_run:
+            self.logger.info(f"[DRY_RUN] Would clean up {len(sl_orders) - 1} duplicate SL order(s)")
+            return
+
+        # Keep the last SL order (most recently created), cancel the rest
+        to_cancel = sl_orders[:-1]
+        kept = sl_orders[-1]
+
+        wid = getattr(chain_pos, '_wallet_id', 1)
+        acct = self._get_account(wid)
+        exchange = self.w3.eth.contract(
+            address=Web3.to_checksum_address(cfg.exchange_router),
+            abi=EXCHANGE_ROUTER_ABI,
+        )
+        wallet = Web3.to_checksum_address(acct.address)
+
+        cancelled = 0
+        for o in to_cancel:
+            key_hex = o.get("key_hex")
+            if not key_hex:
+                continue
+            try:
+                key_bytes = bytes.fromhex(key_hex)
+                data = exchange.encode_abi("cancelOrder", [key_bytes])
+                tx = _open_mod.build_tx(self.w3, wallet, exchange.address, data, value=0)
+                txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=False)
+                _open_mod.wait_receipt(self.w3, txh)
+                cancelled += 1
+                self.logger.info(
+                    f"Cleaned up duplicate SL for {chain_pos.symbol}: "
+                    f"cancelled @ ${o['trigger_price']:,.2f} (key=0x{key_hex[:12]}...)"
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to cancel duplicate SL: {e}")
+
+        if cancelled > 0:
+            kept_price = kept.get('trigger_price', 0)
+            await self.notify(
+                f"🧹 {chain_pos.symbol}: Cleaned up {cancelled} duplicate SL order(s). "
+                f"Kept SL @ ${kept_price:,.2f}"
+            )
 
     # ──────────────────────────────────────────────────────────────────────
     # /close + confirmation handler

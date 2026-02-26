@@ -183,11 +183,39 @@ def classify_exit_reason(
     last_known_tp_count: int,
     sl_moved_to_entry: bool,
     sl_move_label: Optional[str],
+    sl_orders_remaining: int = -1,
+    tp_orders_remaining: int = -1,
 ) -> str:
-    """Determine exit reason from position state. Pure function."""
+    """Determine exit reason from position state. Pure function.
+
+    When sl_orders_remaining / tp_orders_remaining are provided (>= 0),
+    we can distinguish liquidation from SL/TP fills:
+      - If SL and TP orders are STILL on-chain when position disappears,
+        neither was triggered -> liquidation.
+      - If SL orders are gone but TPs remain -> SL triggered.
+      - If all TP orders are gone -> all TPs filled.
+    """
 
     if tp_hits_count > 0 and last_known_tp_count == 0:
         return "All TPs filled"
+
+    # ── Liquidation detection ──
+    # If we have on-chain order counts AND both SL + TP orders still exist,
+    # neither was triggered — the position was forcibly closed (liquidated).
+    if sl_orders_remaining >= 0 and tp_orders_remaining >= 0:
+        if sl_orders_remaining > 0 and tp_orders_remaining > 0 and tp_hits_count == 0:
+            return "Liquidation"
+        # SL orders still present but no TPs -> all TPs filled (orders may lag)
+        if sl_orders_remaining > 0 and tp_orders_remaining == 0 and tp_hits_count > 0:
+            return "All TPs filled"
+        # No SL orders remain and TPs still present -> SL was triggered
+        if sl_orders_remaining == 0 and tp_orders_remaining > 0:
+            if sl_moved_to_entry and stop_loss:
+                sl_label = sl_move_label or "Entry"
+                if sl_label == "Entry":
+                    return "SL (breakeven)"
+                return f"SL at {sl_label} (${stop_loss:,.2f})"
+            return "SL triggered"
 
     if sl_moved_to_entry and stop_loss:
         sl_label = sl_move_label or "Entry"

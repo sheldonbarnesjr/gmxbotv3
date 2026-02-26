@@ -194,6 +194,20 @@ READER_ABI = [
 # Default GMX v2 addresses (Arbitrum)
 GMX_V2_READER = "0xf60becbba223EEA9495Da3f606753867eC10d139"
 GMX_V2_DATASTORE = "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8"
+GMX_V2_READER_PNL = "0x22199a49A999c351eF7927602CFB187ec3cae489"
+GMX_V2_REFERRAL_STORAGE = "0xe6fab3F0c7199b0d34d7FbE83394fc0e0D06e99d"
+
+# Token decimal info per market (for building MarketPrices structs)
+# {market_addr_lower: (index_token_decimals, long_token_decimals, short_token_decimals)}
+MARKET_TOKEN_DECIMALS = {
+    "0x47c031236e19d024b42f8ae6780e44a573170703": (8, 8, 6),    # BTC
+    "0x70d95587d40a2caf56bd97485ab3eec10bee6336": (18, 18, 6),   # ETH
+    "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": (9, 9, 6),     # SOL
+    "0x7f1fa204bb700853d36994da19f830b6ad18455c": (18, 18, 6),   # LINK
+    "0xc25cef6061cf5de5eb761b50e4743c1f5d7e5407": (18, 18, 6),   # ARB
+    "0x6853ea96ff216fab11d2d930ce3c508556a4bdc4": (8, 8, 6),     # DOGE
+    "0x7bbbf946883a5701350007320f525c5379b8178a": (18, 18, 6),   # AVAX
+}
 
 # Market symbols for better display (all keys stored lowercase for safe lookup)
 MARKET_SYMBOLS = {
@@ -344,6 +358,294 @@ def fetch_current_price(symbol_pair: str, w3=None) -> float:
     except Exception:
         return 0.0
 
+# ── Reader getPositionInfo ABI (for accurate PnL with fees) ──
+# The return type is a deeply nested struct. We define the full ABI
+# so web3.py can decode it properly.
+_POSITION_INFO_ABI = {
+    "name": "getPositionInfo",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+        {"name": "dataStore", "type": "address"},
+        {"name": "referralStorage", "type": "address"},
+        {"name": "positionKey", "type": "bytes32"},
+        {"name": "prices", "type": "tuple", "components": [
+            {"name": "indexTokenPrice", "type": "tuple", "components": [
+                {"name": "min", "type": "uint256"},
+                {"name": "max", "type": "uint256"},
+            ]},
+            {"name": "longTokenPrice", "type": "tuple", "components": [
+                {"name": "min", "type": "uint256"},
+                {"name": "max", "type": "uint256"},
+            ]},
+            {"name": "shortTokenPrice", "type": "tuple", "components": [
+                {"name": "min", "type": "uint256"},
+                {"name": "max", "type": "uint256"},
+            ]},
+        ]},
+        {"name": "sizeDeltaUsd", "type": "uint256"},
+        {"name": "uiFeeReceiver", "type": "address"},
+        {"name": "usePositionSizeAsSizeDeltaUsd", "type": "bool"},
+    ],
+    "outputs": [
+        {"name": "", "type": "tuple", "components": [
+            {"name": "positionKey", "type": "bytes32"},
+            {"name": "position", "type": "tuple", "components": [
+                {"name": "addresses", "type": "tuple", "components": [
+                    {"name": "account", "type": "address"},
+                    {"name": "market", "type": "address"},
+                    {"name": "collateralToken", "type": "address"},
+                ]},
+                {"name": "numbers", "type": "tuple", "components": [
+                    {"name": "sizeInUsd", "type": "uint256"},
+                    {"name": "sizeInTokens", "type": "uint256"},
+                    {"name": "collateralAmount", "type": "uint256"},
+                    {"name": "borrowingFactor", "type": "uint256"},
+                    {"name": "fundingFeeAmountPerSize", "type": "uint256"},
+                    {"name": "longTokenClaimableFundingAmountPerSize", "type": "uint256"},
+                    {"name": "shortTokenClaimableFundingAmountPerSize", "type": "uint256"},
+                    {"name": "increasedAtTime", "type": "uint256"},
+                    {"name": "decreasedAtTime", "type": "uint256"},
+                ]},
+                {"name": "flags", "type": "tuple", "components": [
+                    {"name": "isLong", "type": "bool"},
+                ]},
+            ]},
+            {"name": "fees", "type": "tuple", "components": [
+                {"name": "referral", "type": "tuple", "components": [
+                    {"name": "referralCode", "type": "bytes32"},
+                    {"name": "affiliate", "type": "address"},
+                    {"name": "trader", "type": "address"},
+                    {"name": "totalRebateFactor", "type": "uint256"},
+                    {"name": "affiliateRewardFactor", "type": "uint256"},
+                    {"name": "traderDiscountFactor", "type": "uint256"},
+                    {"name": "totalRebateAmount", "type": "uint256"},
+                    {"name": "traderDiscountAmount", "type": "uint256"},
+                    {"name": "affiliateRewardAmount", "type": "uint256"},
+                ]},
+                {"name": "funding", "type": "tuple", "components": [
+                    {"name": "fundingFeeAmount", "type": "uint256"},
+                    {"name": "claimableLongTokenAmount", "type": "uint256"},
+                    {"name": "claimableShortTokenAmount", "type": "uint256"},
+                    {"name": "latestFundingFeeAmountPerSize", "type": "uint256"},
+                    {"name": "latestLongTokenClaimableFundingAmountPerSize", "type": "uint256"},
+                    {"name": "latestShortTokenClaimableFundingAmountPerSize", "type": "uint256"},
+                ]},
+                {"name": "borrowing", "type": "tuple", "components": [
+                    {"name": "borrowingFeeUsd", "type": "uint256"},
+                    {"name": "borrowingFeeAmount", "type": "uint256"},
+                    {"name": "borrowingFeeReceiverFactor", "type": "uint256"},
+                    {"name": "borrowingFeeAmountForFeeReceiver", "type": "uint256"},
+                ]},
+                {"name": "ui", "type": "tuple", "components": [
+                    {"name": "uiFeeReceiver", "type": "address"},
+                    {"name": "uiFeeReceiverFactor", "type": "uint256"},
+                    {"name": "uiFeeAmount", "type": "uint256"},
+                ]},
+                {"name": "collateralTokenPrice", "type": "tuple", "components": [
+                    {"name": "min", "type": "uint256"},
+                    {"name": "max", "type": "uint256"},
+                ]},
+                {"name": "positionFeeFactor", "type": "uint256"},
+                {"name": "protocolFeeAmount", "type": "uint256"},
+                {"name": "positionFeeReceiverFactor", "type": "uint256"},
+                {"name": "feeReceiverAmount", "type": "uint256"},
+                {"name": "feeAmountForPool", "type": "uint256"},
+                {"name": "positionFeeAmountForPool", "type": "uint256"},
+                {"name": "positionFeeAmount", "type": "uint256"},
+                {"name": "totalCostAmountExcludingFunding", "type": "uint256"},
+                {"name": "totalCostAmount", "type": "uint256"},
+                {"name": "totalDiscountAmount", "type": "uint256"},
+            ]},
+            {"name": "executionPriceResult", "type": "tuple", "components": [
+                {"name": "priceImpactUsd", "type": "int256"},
+                {"name": "priceImpactDiffUsd", "type": "uint256"},
+                {"name": "executionPrice", "type": "uint256"},
+            ]},
+            {"name": "basePnlUsd", "type": "int256"},
+            {"name": "uncappedBasePnlUsd", "type": "int256"},
+            {"name": "pnlAfterPriceImpactUsd", "type": "int256"},
+        ]},
+    ],
+}
+
+_READER_GET_MARKET_ABI = {
+    "name": "getMarket",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+        {"name": "dataStore", "type": "address"},
+        {"name": "key", "type": "address"},
+    ],
+    "outputs": [
+        {"name": "", "type": "tuple", "components": [
+            {"name": "marketToken", "type": "address"},
+            {"name": "indexToken", "type": "address"},
+            {"name": "longToken", "type": "address"},
+            {"name": "shortToken", "type": "address"},
+        ]},
+    ],
+}
+
+READER_PNL_ABI = [_POSITION_INFO_ABI, _READER_GET_MARKET_ABI]
+
+# Cache market token info (marketAddr -> (indexToken, longToken, shortToken))
+_market_tokens_cache: dict = {}
+
+
+def _get_market_tokens(w3, market_addr: str) -> tuple:
+    """Get (indexToken, longToken, shortToken) for a market from the Reader."""
+    key = market_addr.lower()
+    if key in _market_tokens_cache:
+        return _market_tokens_cache[key]
+
+    reader_addr = os.getenv("GMX_V2_READER_PNL", GMX_V2_READER_PNL)
+    datastore = os.getenv("GMX_V2_DATASTORE", GMX_V2_DATASTORE)
+    reader = w3.eth.contract(
+        address=Web3.to_checksum_address(reader_addr),
+        abi=READER_PNL_ABI,
+    )
+    result = reader.functions.getMarket(
+        Web3.to_checksum_address(datastore),
+        Web3.to_checksum_address(market_addr),
+    ).call()
+    # result = (marketToken, indexToken, longToken, shortToken)
+    tokens = (result[1], result[2], result[3])
+    _market_tokens_cache[key] = tokens
+    return tokens
+
+
+def _build_market_prices(index_price_usd: float, market_addr: str) -> tuple:
+    """Build the MarketPrices tuple for getPositionInfo.
+
+    Prices in GMX format: price_usd * 10^(30 - tokenDecimals).
+    For query (not trade), min = max = current price.
+    """
+    key = market_addr.lower()
+    decimals = MARKET_TOKEN_DECIMALS.get(key)
+    if not decimals:
+        raise ValueError(f"Unknown market {market_addr}")
+
+    idx_dec, long_dec, short_dec = decimals
+
+    # Index/long token price (e.g., BTC at $95k with 8 dec → 95000 * 10^22)
+    index_price = int(index_price_usd * (10 ** (30 - idx_dec)))
+    long_price = int(index_price_usd * (10 ** (30 - long_dec)))
+    # Short token (USDC) price = $1
+    short_price = int(1 * (10 ** (30 - short_dec)))
+
+    return (
+        (index_price, index_price),  # indexTokenPrice (min, max)
+        (long_price, long_price),    # longTokenPrice (min, max)
+        (short_price, short_price),  # shortTokenPrice (min, max)
+    )
+
+
+def _compute_position_key(w3, account: str, market: str, collateral_token: str, is_long: bool) -> bytes:
+    """Compute GMX V2 position key: keccak256(abi.encode(account, market, collateralToken, isLong))."""
+    from eth_abi import encode
+    encoded = encode(
+        ['address', 'address', 'address', 'bool'],
+        [
+            Web3.to_checksum_address(account),
+            Web3.to_checksum_address(market),
+            Web3.to_checksum_address(collateral_token),
+            is_long,
+        ]
+    )
+    return w3.keccak(encoded)
+
+
+def fetch_position_pnl(
+    w3,
+    account: str,
+    market: str,
+    collateral_token: str,
+    is_long: bool,
+    current_price_usd: float,
+) -> dict:
+    """Fetch accurate PnL from the GMX V2 Reader contract.
+
+    Returns dict with:
+        base_pnl_usd: raw PnL from price movement
+        borrowing_fee_usd: accumulated borrowing fees
+        funding_fee_usd: accumulated funding fees (in collateral token units * price)
+        closing_fee_usd: position fee to close
+        net_pnl_usd: PnL after all fees
+        success: True if the on-chain call worked
+
+    Falls back to empty dict with success=False on any error.
+    """
+    try:
+        reader_addr = os.getenv("GMX_V2_READER_PNL", GMX_V2_READER_PNL)
+        datastore = os.getenv("GMX_V2_DATASTORE", GMX_V2_DATASTORE)
+        referral_storage = os.getenv("GMX_V2_REFERRAL_STORAGE", GMX_V2_REFERRAL_STORAGE)
+
+        reader = w3.eth.contract(
+            address=Web3.to_checksum_address(reader_addr),
+            abi=READER_PNL_ABI,
+        )
+
+        # Compute position key
+        pos_key = _compute_position_key(w3, account, market, collateral_token, is_long)
+
+        # Build market prices
+        prices = _build_market_prices(current_price_usd, market)
+
+        # Call getPositionInfo with usePositionSizeAsSizeDeltaUsd=True
+        # to get PnL as if closing the entire position
+        result = reader.functions.getPositionInfo(
+            Web3.to_checksum_address(datastore),
+            Web3.to_checksum_address(referral_storage),
+            pos_key,
+            prices,
+            0,  # sizeDeltaUsd (0 since we use the flag below)
+            "0x0000000000000000000000000000000000000000",  # uiFeeReceiver
+            True,  # usePositionSizeAsSizeDeltaUsd
+        ).call()
+
+        # Parse the PositionInfo struct
+        # result = (positionKey, position, fees, executionPriceResult, basePnlUsd, uncappedBasePnlUsd, pnlAfterPriceImpactUsd)
+        fees = result[2]
+        base_pnl_usd = result[4] / (10 ** 30)  # int256 scaled by 10^30
+
+        # fees.borrowing.borrowingFeeUsd (fees[2][0]) — scaled by 10^30
+        borrowing_fee_usd = fees[2][0] / (10 ** 30)
+
+        # fees.funding.fundingFeeAmount (fees[1][0]) — in collateral token units
+        # Need to convert to USD. For USDC (6 dec), divide by 10^6 to get USD.
+        collateral_decimals = MARKET_TOKEN_DECIMALS.get(market.lower(), (18, 18, 6))[2]
+        funding_fee_amount = fees[1][0] / (10 ** collateral_decimals)
+        # funding fee is always denominated in USD for USDC collateral
+        funding_fee_usd = funding_fee_amount
+
+        # fees.positionFeeAmount (fees[4+6] = index 11 in the flat tuple? No...)
+        # The totalCostAmountExcludingFunding includes borrowing + position fee
+        # totalCostAmount includes everything
+        # Position fee = totalCostAmountExcludingFunding - borrowing fee amount
+        total_cost_excl_funding = fees[12] / (10 ** collateral_decimals)  # totalCostAmountExcludingFunding
+        total_cost = fees[13] / (10 ** collateral_decimals)  # totalCostAmount
+
+        # Closing/position fee = total cost excl funding - borrowing fee amount
+        borrowing_fee_in_token = fees[2][1] / (10 ** collateral_decimals)
+        closing_fee_usd = max(0, total_cost_excl_funding - borrowing_fee_in_token)
+
+        # Net PnL = basePnL - all fees
+        net_pnl_usd = base_pnl_usd - borrowing_fee_usd - funding_fee_usd - closing_fee_usd
+
+        return {
+            "base_pnl_usd": base_pnl_usd,
+            "borrowing_fee_usd": borrowing_fee_usd,
+            "funding_fee_usd": funding_fee_usd,
+            "closing_fee_usd": closing_fee_usd,
+            "net_pnl_usd": net_pnl_usd,
+            "success": True,
+        }
+    except Exception as e:
+        log.debug(f"fetch_position_pnl failed for {market}: {e}")
+        return {"success": False}
+
+
 @dataclass
 class GMXPosition:
     """Represents a GMX v2 position"""
@@ -359,6 +661,13 @@ class GMXPosition:
     leverage: float
     unrealized_pnl: float
     pnl_percentage: float
+    # On-chain PnL breakdown (from Reader.getPositionInfo)
+    base_pnl_usd: float = 0.0         # raw PnL from price movement
+    borrowing_fee_usd: float = 0.0     # accumulated borrowing fees
+    funding_fee_usd: float = 0.0       # accumulated funding fees (can be negative = earned)
+    closing_fee_usd: float = 0.0       # fee to close the position
+    net_pnl_usd: float = 0.0          # PnL after all fees (what you'd actually receive)
+    pnl_source: str = "local"          # "local" or "onchain"
 
 def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
     """Fetch all open GMX v2 positions (enhanced from open.py)"""
@@ -452,7 +761,7 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
             unrealized_pnl = 0
             pnl_percentage = 0
         
-        parsed_positions.append(GMXPosition(
+        gpos = GMXPosition(
             market=market,
             symbol=symbol,
             collateral_token=collateral_token,
@@ -464,8 +773,28 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
             current_price=current_price,
             leverage=leverage,
             unrealized_pnl=unrealized_pnl,
-            pnl_percentage=pnl_percentage
-        ))
+            pnl_percentage=pnl_percentage,
+        )
+
+        # Enrich with on-chain PnL from GMX Reader contract
+        try:
+            pnl_data = fetch_position_pnl(
+                w3, wallet, market, collateral_token, is_long, current_price
+            )
+            if pnl_data.get("success"):
+                gpos.base_pnl_usd = pnl_data["base_pnl_usd"]
+                gpos.borrowing_fee_usd = pnl_data["borrowing_fee_usd"]
+                gpos.funding_fee_usd = pnl_data["funding_fee_usd"]
+                gpos.closing_fee_usd = pnl_data["closing_fee_usd"]
+                gpos.net_pnl_usd = pnl_data["net_pnl_usd"]
+                gpos.unrealized_pnl = pnl_data["net_pnl_usd"]
+                if collateral_amount > 0:
+                    gpos.pnl_percentage = (pnl_data["net_pnl_usd"] / collateral_amount) * 100
+                gpos.pnl_source = "onchain"
+        except Exception as e:
+            log.debug(f"On-chain PnL enrichment failed for {symbol}: {e}")
+
+        parsed_positions.append(gpos)
     
     return parsed_positions
 

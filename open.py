@@ -1511,6 +1511,13 @@ CHAINLINK_ABI = [
                  {"name": "startedAt", "type": "uint256"},
                  {"name": "updatedAt", "type": "uint256"},
                  {"name": "answeredInRound", "type": "uint80"}]},
+    {"name": "getRoundData", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "_roundId", "type": "uint80"}],
+     "outputs": [{"name": "roundId", "type": "uint80"},
+                 {"name": "answer", "type": "int256"},
+                 {"name": "startedAt", "type": "uint256"},
+                 {"name": "updatedAt", "type": "uint256"},
+                 {"name": "answeredInRound", "type": "uint80"}]},
     {"name": "decimals", "type": "function", "stateMutability": "view",
      "inputs": [], "outputs": [{"type": "uint8"}]},
 ]
@@ -1563,6 +1570,85 @@ def fetch_current_price(symbol: str, w3=None) -> float:
         log.warning(f"CoinGecko fallback also failed for {symbol}: {e}")
 
     raise RuntimeError(f"Could not fetch price for {symbol} from Chainlink or CoinGecko")
+
+
+def fetch_price_touched_in_window(
+    symbol: str,
+    target_price: float,
+    is_long: bool,
+    w3=None,
+    window_seconds: int = 600,
+    tolerance_pct: float = 0.003,
+) -> bool:
+    """Check if Chainlink price touched a target within the last `window_seconds`.
+
+    Walks backward through Chainlink round data to see if price ever reached
+    the target level. Used for TP hit verification when current price has bounced.
+
+    Args:
+        symbol: Token symbol (BTC, ETH, SOL, LINK)
+        target_price: The TP price to check
+        is_long: True for LONG (price must go UP to hit TP), False for SHORT
+        w3: Web3 instance
+        window_seconds: How far back to look (default 10 minutes)
+        tolerance_pct: Price tolerance (default 0.3%)
+
+    Returns:
+        True if any historical round's price reached the target.
+    """
+    feed_addr = CHAINLINK_FEEDS.get(symbol.upper())
+    if not feed_addr or not w3:
+        return False
+
+    try:
+        feed = w3.eth.contract(
+            address=Web3.to_checksum_address(feed_addr), abi=CHAINLINK_ABI
+        )
+
+        if symbol.upper() not in _chainlink_decimals_cache:
+            _chainlink_decimals_cache[symbol.upper()] = feed.functions.decimals().call()
+        decimals = _chainlink_decimals_cache[symbol.upper()]
+
+        latest = feed.functions.latestRoundData().call()
+        current_round_id = latest[0]
+        cutoff_time = int(time.time()) - window_seconds
+
+        tol = target_price * tolerance_pct
+
+        # Walk backward through rounds (max 50 to limit RPC calls)
+        for i in range(50):
+            round_id = current_round_id - i
+            if round_id <= 0:
+                break
+            try:
+                data = feed.functions.getRoundData(round_id).call()
+                price = data[1] / (10 ** decimals)
+                updated_at = data[3]
+
+                if updated_at < cutoff_time:
+                    break  # outside our window
+
+                if is_long:
+                    if price >= target_price - tol:
+                        log.info(
+                            f"Historical price confirmation: {symbol} ${price:,.2f} "
+                            f"reached TP ${target_price:,.2f} at round {round_id}"
+                        )
+                        return True
+                else:
+                    if price <= target_price + tol:
+                        log.info(
+                            f"Historical price confirmation: {symbol} ${price:,.2f} "
+                            f"reached TP ${target_price:,.2f} at round {round_id}"
+                        )
+                        return True
+            except Exception:
+                continue
+
+        return False
+    except Exception as e:
+        log.warning(f"Historical price check failed for {symbol}: {e}")
+        return False
 
 
 def fetch_positions(w3: Web3, wallet: str) -> list:
