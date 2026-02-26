@@ -1292,9 +1292,8 @@ class CoreTelegramMixin:
                 realized_pnl += t["pnl_usd"]
                 realized_count += 1
 
-        # ── Open positions on-chain (unrealized + realized from partial TP closes) ──
+        # ── Open positions on-chain (unrealized PnL) ──
         unrealized_pnl = 0.0
-        tp_realized_pnl = 0.0
         open_count = 0
         open_lines = []
         try:
@@ -1320,7 +1319,6 @@ class CoreTelegramMixin:
                                         pos_realized += ((tp.price - cp.entry_price) / cp.entry_price) * tp_size
                                     else:
                                         pos_realized += ((cp.entry_price - tp.price) / cp.entry_price) * tp_size
-                            tp_realized_pnl += pos_realized
                             break
                     total_pos = cp.unrealized_pnl + pos_realized
                     t_sign = "+" if total_pos >= 0 else ""
@@ -1335,21 +1333,19 @@ class CoreTelegramMixin:
         except Exception as e:
             self.logger.warning(f"Hourly PnL: could not fetch positions: {e}")
 
-        # Today's total = closed trades + open unrealized + open TP realized
-        today_total = realized_pnl + unrealized_pnl + tp_realized_pnl
+        # Today's total = closed trades + open unrealized
+        # (realized_pnl already includes TP partial close PnL from on-chain events)
+        today_total = realized_pnl + unrealized_pnl
 
         # Build message
         r_sign = "+" if realized_pnl >= 0 else ""
         u_sign = "+" if unrealized_pnl >= 0 else ""
-        tp_sign = "+" if tp_realized_pnl >= 0 else ""
         t_sign = "+" if today_total >= 0 else ""
 
         msg = f"Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
 
         msg += f"**Today ({realized_count} closed)**\n"
         msg += f"  Closed:     {r_sign}${realized_pnl:,.2f}\n"
-        if tp_realized_pnl:
-            msg += f"  TP Realized: {tp_sign}${tp_realized_pnl:,.2f} (partial closes)\n"
         msg += f"  Unrealized: {u_sign}${unrealized_pnl:,.2f} ({open_count} open)\n"
         if open_lines:
             msg += "\n".join(open_lines) + "\n"
