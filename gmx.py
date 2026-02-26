@@ -15,6 +15,7 @@ Features:
 """
 
 import os
+import json
 import time
 import uuid
 import asyncio
@@ -178,6 +179,7 @@ class Position:
     pending_fill: bool = False  # True if placed as limit order and not yet filled on-chain
     pending_fill_since: Optional[float] = None  # timestamp when limit order was placed
     current_sl_key: Optional[str] = None  # hex key of the SL order we placed (to avoid cancelling it accidentally)
+    original_size_usd: float = 0.0  # position size at open (before any partial TP closes)
 
     @property
     def short_id(self) -> str:
@@ -280,6 +282,62 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             ],
         )
         self.logger = logging.getLogger("GMXBot")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Position state persistence (realized PnL survives restarts)
+    # ──────────────────────────────────────────────────────────────────────
+    POSITION_STATE_FILE = "position_state.json"
+
+    def _save_position_state(self):
+        """Persist realized PnL and TP hit state for all open positions."""
+        state = {}
+        for pos in self.positions.values():
+            if not pos.is_open or not pos.market_addr:
+                continue
+            key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
+            executed_indices = [
+                i for i, tp in enumerate(pos.take_profits) if tp.executed
+            ]
+            state[key] = {
+                "realized_pnl": pos.realized_pnl,
+                "tp_hits_count": pos.tp_hits_count,
+                "original_size_usd": pos.original_size_usd or pos.size_usd,
+                "executed_tp_indices": executed_indices,
+                "sl_move_label": pos.sl_move_label,
+                "sl_moved_to_entry": pos.sl_moved_to_entry,
+            }
+        try:
+            with open(self.POSITION_STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Failed to save position state: {e}")
+
+    def _load_position_state(self) -> dict:
+        """Load persisted position state from disk. Returns dict keyed by composite key."""
+        if not os.path.exists(self.POSITION_STATE_FILE):
+            return {}
+        try:
+            with open(self.POSITION_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load position state: {e}")
+            return {}
+
+    def _clear_position_state(self, pos):
+        """Remove a closed position's entry from the state file."""
+        if not pos.market_addr:
+            return
+        key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
+        try:
+            if os.path.exists(self.POSITION_STATE_FILE):
+                with open(self.POSITION_STATE_FILE, "r") as f:
+                    state = json.load(f)
+                if key in state:
+                    del state[key]
+                    with open(self.POSITION_STATE_FILE, "w") as f:
+                        json.dump(state, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Failed to clear position state: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -401,6 +459,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
           4. Removes internal positions that are no longer on-chain
         """
         MARKET_TO_SYMBOL = {v.lower(): k for k, v in self.cfg.markets.items()}
+        saved_state = self._load_position_state()
 
         wallets = self._all_wallets()
 
@@ -514,14 +573,36 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                             f"(SL @ ${reconstructed_sl:,.2f}, label={pos.sl_move_label})"
                         )
 
+                # ── Overlay persisted state (realized PnL, executed TPs) ──
+                state_key = f"{wid}:{market_lower}:{side}"
+                saved = saved_state.get(state_key)
+                if saved:
+                    pos.realized_pnl = saved.get("realized_pnl", 0.0)
+                    pos.original_size_usd = saved.get("original_size_usd", pos.size_usd)
+                    pos.tp_hits_count = max(pos.tp_hits_count, saved.get("tp_hits_count", 0))
+                    if saved.get("sl_move_label"):
+                        pos.sl_move_label = saved["sl_move_label"]
+                    if saved.get("sl_moved_to_entry"):
+                        pos.sl_moved_to_entry = True
+                    # Mark executed TPs from saved indices
+                    for idx in saved.get("executed_tp_indices", []):
+                        if idx < len(pos.take_profits):
+                            pos.take_profits[idx].executed = True
+                            pos.take_profits[idx].executed_at = pos.opened_at
+                    self.logger.info(
+                        f"Sync: restored state for {symbol} {side} [W{wid}]: "
+                        f"realized=${pos.realized_pnl:,.2f}, tp_hits={pos.tp_hits_count}"
+                    )
+
                 self.positions[pos.id] = pos
                 synced += 1
                 tp_str = f", {tp_count} TPs" if take_profits else ", no TPs"
                 sl_str = f", SL ${reconstructed_sl:,.2f}" if reconstructed_sl else ", no SL"
                 hits_str = f", {pos.tp_hits_count} TP hit(s)" if pos.tp_hits_count else ""
+                rlz_str = f", realized=${pos.realized_pnl:,.2f}" if pos.realized_pnl else ""
                 self.logger.info(
                     f"Synced on-chain position: {symbol} {side} "
-                    f"${cp.size_usd:,.2f} @ {cp.leverage:.1f}x [W{wid}]{tp_str}{sl_str}{hits_str}"
+                    f"${cp.size_usd:,.2f} @ {cp.leverage:.1f}x [W{wid}]{tp_str}{sl_str}{hits_str}{rlz_str}"
                 )
 
         # ── Clean up stale internal positions no longer on-chain ──
@@ -539,6 +620,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 pos.closed_at = time.time()
                 pos.exit_reason = "closed_while_offline"
                 self._record_trade(pos, exit_reason="closed_while_offline")
+                self._clear_position_state(pos)
                 stale_count += 1
 
                 # Cancel any orphaned orders for this market
@@ -1026,11 +1108,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 if order.order_kind == "tp":
                     tp = TakeProfit(price=order.price, close_pct=order.close_pct)
+                    retry_collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
                     txh = await asyncio.to_thread(
                         create_tp_order,
                         self.w3, acct, exchange, acct.address,
                         order.market_addr, collateral_token, order_vault,
-                        tp, order.size_usd, order.symbol, order.is_long,
+                        tp, order.size_usd, retry_collateral,
+                        order.symbol, order.is_long,
                         cfg.slippage_bps, cfg.execution_fee_wei, cfg.dry_run,
                     )
                     self.logger.info(
@@ -1106,7 +1190,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         """Telegram /sync command — force re-sync internal state from on-chain.
 
         Clears all internal position tracking and rebuilds from on-chain data.
-        This fixes stale state without requiring a full bot restart.
+        Also re-places TP orders with corrected collateral withdrawal so
+        leverage is preserved on partial closes.
         """
         await self.send_message(chat_id, "Syncing positions from on-chain...")
 
@@ -1134,9 +1219,116 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             else:
                 msg += "No open positions found on-chain."
             await self.send_message(chat_id, msg)
+
+            # Re-place TP orders with corrected collateral delta
+            await self._resync_tp_orders(chat_id)
+
         except Exception as e:
             self.logger.error(f"Sync failed: {e}")
             await self.send_message(chat_id, f"Sync failed: {e}")
+
+    async def _resync_tp_orders(self, chat_id: int):
+        """Cancel and re-place all TP orders with proportional collateral withdrawal.
+
+        Old TP orders used collateral_delta=0 which causes leverage to drop
+        when TPs execute. New orders withdraw proportional collateral so
+        leverage stays constant on the remaining position.
+        """
+        cfg = self.cfg
+        exchange = self.w3.eth.contract(
+            address=Web3.to_checksum_address(cfg.exchange_router),
+            abi=EXCHANGE_ROUTER_ABI,
+        )
+        collateral_token = Web3.to_checksum_address(cfg.collateral_token)
+        order_vault = Web3.to_checksum_address(cfg.order_vault)
+
+        total_cancelled = 0
+        total_placed = 0
+
+        for pos in list(self.positions.values()):
+            if not pos.is_open or not pos.market_addr:
+                continue
+
+            acct = self._get_account(pos.wallet_id)
+            market_lower = pos.market_addr.lower()
+            is_long = pos.side == "LONG"
+
+            try:
+                orders = await asyncio.to_thread(
+                    fetch_open_orders, self.w3, acct.address
+                )
+            except Exception as e:
+                self.logger.warning(f"Resync TPs: failed to fetch orders for W{pos.wallet_id}: {e}")
+                continue
+
+            # Find existing TP orders for this position
+            tp_orders = [
+                o for o in orders
+                if o["market"].lower() == market_lower
+                and o["order_type"] == ORDER_TYPE_LIMIT_DECREASE
+                and o.get("is_long") == is_long
+            ]
+
+            if not tp_orders:
+                continue
+
+            # Cancel old TP orders
+            cancelled = 0
+            for o in tp_orders:
+                key_hex = o.get("key_hex")
+                if not key_hex:
+                    continue
+                try:
+                    key_bytes = bytes.fromhex(key_hex)
+                    data = exchange.encode_abi("cancelOrder", [key_bytes])
+                    txh = await asyncio.to_thread(
+                        self._send_tx, exchange.address, data, 0, acct
+                    )
+                    cancelled += 1
+                    self.logger.info(f"Resync TPs: cancelled old TP for {pos.symbol}: {txh}")
+                except Exception as e:
+                    self.logger.warning(f"Resync TPs: cancel failed for {pos.symbol}: {e}")
+            total_cancelled += cancelled
+
+            if cancelled == 0:
+                continue
+
+            # Small delay for chain state to settle
+            await asyncio.sleep(2)
+
+            # Re-place TPs using current on-chain size and collateral
+            collateral_usd = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+            placed = 0
+            # Use the non-executed TPs from internal tracking
+            remaining_tps = [tp for tp in pos.take_profits if not tp.executed]
+            for tp_level in remaining_tps:
+                tp_obj = TakeProfit(price=tp_level.price, close_pct=tp_level.percentage)
+                try:
+                    txh = await asyncio.to_thread(
+                        create_tp_order,
+                        self.w3, acct, exchange, acct.address,
+                        pos.market_addr, collateral_token, order_vault,
+                        tp_obj, pos.size_usd, collateral_usd,
+                        pos.symbol, is_long,
+                        cfg.slippage_bps, cfg.execution_fee_wei, cfg.dry_run,
+                    )
+                    placed += 1
+                    self.logger.info(f"Resync TPs: placed TP @ ${tp_level.price:,.2f} for {pos.symbol}: {txh}")
+                    if not cfg.dry_run:
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    self.logger.warning(f"Resync TPs: place failed for {pos.symbol} TP @ ${tp_level.price:,.2f}: {e}")
+            total_placed += placed
+
+            # Update last known TP count
+            pos.last_known_tp_count = placed
+
+        if total_cancelled > 0 or total_placed > 0:
+            await self.send_message(
+                chat_id,
+                f"TP orders updated: cancelled {total_cancelled}, re-placed {total_placed}\n"
+                f"New TPs will withdraw proportional collateral to maintain leverage."
+            )
 
     # ──────────────────────────────────────────────────────────────────────
     # Signal Processing
@@ -1312,6 +1504,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
             if position:
                 self.positions[position.id] = position
+                self._save_position_state()
                 self.health_stats["trades_executed"] += 1
                 await self.notify_position_opened(position, order_type, signal_tp_count=signal_tp_count)
                 # Top up ETH for gas if balance is low
@@ -1408,6 +1601,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
             # Mark internal position as closed
             self._record_trade(pos, exit_reason="override")
+            self._clear_position_state(pos)
             pos.is_open = False
             pos.closed_at = time.time()
             pos.exit_reason = "override"
@@ -1529,6 +1723,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 market_addr=market_addr,
                 opened_at=time.time(),
                 wallet_id=wallet_id,
+                original_size_usd=size_usd,
             )
 
             # Try to execute on-chain
@@ -1956,6 +2151,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.closed_at = time.time()
                     pos.exit_reason = exit_reason
                     self._record_trade(pos, exit_reason=exit_reason)
+                    self._clear_position_state(pos)
 
                     # Cancel orphaned SL/TP orders left behind after close/liquidation
                     if sl_orders_remaining > 0 or tp_orders_remaining > 0:

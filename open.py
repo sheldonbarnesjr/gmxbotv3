@@ -1951,6 +1951,7 @@ def create_tp_order(
     order_vault: str,
     tp: TakeProfit,
     total_size_usd: float,
+    collateral_usd: float,
     symbol: str,
     is_long: bool,
     slippage_bps: int,
@@ -1966,6 +1967,9 @@ def create_tp_order(
     acceptablePrice = worst price you'll accept after slippage.
       LONG TP:  acceptablePrice = triggerPrice * (1 - slippage)   (selling, accept lower)
       SHORT TP: acceptablePrice = triggerPrice * (1 + slippage)   (buying, accept higher)
+
+    collateral_usd: total position collateral. Used to withdraw proportional
+      collateral on partial close so leverage stays constant.
     """
     # Ensure all addresses are checksummed
     wallet = Web3.to_checksum_address(wallet)
@@ -1978,6 +1982,14 @@ def create_tp_order(
     # Size for this TP level
     close_size_usd = total_size_usd * tp.close_pct
     size_delta_usd = int(close_size_usd * (10 ** 30))
+
+    # Withdraw proportional collateral so leverage stays constant on the
+    # remaining position.  Without this, GMX adds profit to collateral and
+    # leverage drops (e.g. 10x → 1x).
+    token = w3.eth.contract(address=collateral_token, abi=ERC20_ABI)
+    col_decimals = token.functions.decimals().call()
+    close_collateral = collateral_usd * tp.close_pct
+    collateral_delta = int(close_collateral * (10 ** col_decimals))
 
     trigger_price_scaled = scale_price(tp.price, symbol)
 
@@ -1992,7 +2004,7 @@ def create_tp_order(
         market=market,
         collateral_token=collateral_token,
         size_delta_usd=size_delta_usd,
-        initial_collateral_delta=0,
+        initial_collateral_delta=collateral_delta,
         trigger_price=trigger_price_scaled,
         acceptable_price=acceptable_price_scaled,
         execution_fee=execution_fee,
@@ -2211,6 +2223,7 @@ def execute_signal(
                     w3=w3, acct=acct, exchange=exchange, wallet=wallet,
                     market=market, collateral_token=collateral_token,
                     order_vault=order_vault, tp=tp, total_size_usd=size_usd,
+                    collateral_usd=collateral_usd,
                     symbol=signal.symbol, is_long=signal.is_long,
                     slippage_bps=slippage_bps, execution_fee=execution_fee,
                     dry_run=dry_run,

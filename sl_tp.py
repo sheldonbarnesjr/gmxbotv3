@@ -202,6 +202,7 @@ class SLTPMixin:
                         else:
                             realized_pnl += ((pos.entry_price - tp.price) / pos.entry_price) * tp_size
                     pos.realized_pnl = realized_pnl
+                    self._save_position_state()
 
                     # Calculate unrealized PnL on remaining position
                     remaining_size = pos.size_usd * sum(tp.percentage for tp in remaining_tps)
@@ -229,6 +230,7 @@ class SLTPMixin:
                     # Move SL to entry or previous TP
                     try:
                         await self.move_sl(pos, orders)
+                        self._save_position_state()
                     except Exception as e:
                         self.logger.warning(f"Failed to move SL after TP hit: {e}")
                         await self.notify(

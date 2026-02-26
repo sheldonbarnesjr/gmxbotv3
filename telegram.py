@@ -240,6 +240,24 @@ class CoreTelegramMixin:
                         continue
                     chat_id = msg["chat"]["id"]
 
+                    # ── Auth check: only allow admins ──
+                    sender = msg.get("from", {})
+                    sender_username = (sender.get("username") or "").lower()
+                    sender_id = str(sender.get("id", ""))
+                    allowed = False
+                    if self.cfg.admin_usernames and sender_username in self.cfg.admin_usernames:
+                        allowed = True
+                    elif self.cfg.bot_admin_chat_id and sender_id == self.cfg.bot_admin_chat_id:
+                        allowed = True
+                    elif str(chat_id) == str(self.cfg.admin_chat):
+                        allowed = True
+                    if not allowed:
+                        self.logger.warning(
+                            f"Unauthorized Bot API message from @{sender_username} "
+                            f"(id={sender_id}, chat={chat_id}), ignoring."
+                        )
+                        continue
+
                     # Track this chat as a Bot API chat for response routing
                     self._bot_api_chats.add(chat_id)
 
@@ -1224,8 +1242,9 @@ class CoreTelegramMixin:
         realized_pnl = sum(t.pnl_usd for t in todays_trades)
         realized_count = len(todays_trades)
 
-        # Unrealized (open positions on-chain)
+        # Open positions on-chain (unrealized + realized from partial TP closes)
         unrealized_pnl = 0.0
+        tp_realized_pnl = 0.0
         open_count = 0
         open_lines = []
         try:
@@ -1233,19 +1252,36 @@ class CoreTelegramMixin:
                 cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
                 for cp in cps:
                     sym = cp.symbol.upper().split("/")[0]
-                    if sym in PNL_SYMBOLS:
-                        unrealized_pnl += cp.unrealized_pnl
-                        open_count += 1
-                        u_sign = "+" if cp.unrealized_pnl >= 0 else ""
-                        side = "LONG" if cp.is_long else "SHORT"
-                        open_lines.append(
-                            f"  {sym} {side} [W{wid}]: {u_sign}${cp.unrealized_pnl:,.2f}"
-                        )
+                    if sym not in PNL_SYMBOLS:
+                        continue
+                    unrealized_pnl += cp.unrealized_pnl
+                    open_count += 1
+                    side = "LONG" if cp.is_long else "SHORT"
+                    # Add realized PnL from executed TPs on this open position
+                    pos_realized = 0.0
+                    for ip in self.positions.values():
+                        if (ip.is_open and ip.market_addr
+                                and ip.market_addr.lower() == cp.market.lower()
+                                and ip.side == side and ip.wallet_id == wid
+                                and ip.realized_pnl):
+                            pos_realized = ip.realized_pnl
+                            tp_realized_pnl += pos_realized
+                            break
+                    total_pos = cp.unrealized_pnl + pos_realized
+                    t_sign = "+" if total_pos >= 0 else ""
+                    detail = ""
+                    if pos_realized:
+                        r_s = "+" if pos_realized >= 0 else ""
+                        u_s = "+" if cp.unrealized_pnl >= 0 else ""
+                        detail = f" (rlz: {r_s}${pos_realized:,.2f}, unrlz: {u_s}${cp.unrealized_pnl:,.2f})"
+                    open_lines.append(
+                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f}{detail}"
+                    )
         except Exception as e:
             self.logger.warning(f"Hourly PnL: could not fetch positions: {e}")
 
-        # Today's total = realized + unrealized
-        today_total = realized_pnl + unrealized_pnl
+        # Today's total = closed trades + open unrealized + open TP realized
+        today_total = realized_pnl + unrealized_pnl + tp_realized_pnl
 
         # All-time realized
         all_trades = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
@@ -1255,13 +1291,16 @@ class CoreTelegramMixin:
         # Build message
         r_sign = "+" if realized_pnl >= 0 else ""
         u_sign = "+" if unrealized_pnl >= 0 else ""
+        tp_sign = "+" if tp_realized_pnl >= 0 else ""
         t_sign = "+" if today_total >= 0 else ""
         a_sign = "+" if alltime_pnl >= 0 else ""
 
         msg = f"📈 Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
 
         msg += f"**Today ({realized_count} closed)**\n"
-        msg += f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
+        msg += f"  Closed:     {r_sign}${realized_pnl:,.2f}\n"
+        if tp_realized_pnl:
+            msg += f"  TP Realized: {tp_sign}${tp_realized_pnl:,.2f} (partial closes)\n"
         msg += f"  Unrealized: {u_sign}${unrealized_pnl:,.2f} ({open_count} open)\n"
         if open_lines:
             msg += "\n".join(open_lines) + "\n"

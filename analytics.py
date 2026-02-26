@@ -274,35 +274,56 @@ class AnalyticsMixin:
         month_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym and t.closed_at >= month_cutoff]) for sym in PNL_SYMBOLS}
         alltime_stats = {sym: pnl_stats([t for t in relevant if t.symbol == sym]) for sym in PNL_SYMBOLS}
 
-        open_pnl = {sym: 0.0 for sym in PNL_SYMBOLS}
+        open_unrealized = {sym: 0.0 for sym in PNL_SYMBOLS}
+        open_realized = {sym: 0.0 for sym in PNL_SYMBOLS}
         open_fees = {sym: 0.0 for sym in PNL_SYMBOLS}
         any_onchain = False
         try:
-            for _, acct in self._all_wallets():
+            for wid, acct in self._all_wallets():
                 cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
                 for cp in cps:
                     sym = cp.symbol.upper().split("/")[0]
-                    if sym in PNL_SYMBOLS:
-                        open_pnl[sym] = open_pnl.get(sym, 0.0) + cp.unrealized_pnl
-                        if getattr(cp, 'pnl_source', 'local') == "onchain":
-                            any_onchain = True
-                            open_fees[sym] = open_fees.get(sym, 0.0) + (
-                                cp.borrowing_fee_usd + cp.funding_fee_usd + cp.closing_fee_usd
-                            )
+                    if sym not in PNL_SYMBOLS:
+                        continue
+                    open_unrealized[sym] = open_unrealized.get(sym, 0.0) + cp.unrealized_pnl
+                    if getattr(cp, 'pnl_source', 'local') == "onchain":
+                        any_onchain = True
+                        open_fees[sym] = open_fees.get(sym, 0.0) + (
+                            cp.borrowing_fee_usd + cp.funding_fee_usd + cp.closing_fee_usd
+                        )
+                    # Add realized PnL from executed TPs on this open position
+                    side = "LONG" if cp.is_long else "SHORT"
+                    for ip in self.positions.values():
+                        if (ip.is_open and ip.market_addr
+                                and ip.market_addr.lower() == cp.market.lower()
+                                and ip.side == side and ip.wallet_id == wid
+                                and ip.realized_pnl):
+                            open_realized[sym] = open_realized.get(sym, 0.0) + ip.realized_pnl
+                            break
         except Exception as e:
             self.logger.warning(f"/pnl: could not fetch chain positions: {e}")
 
         onchain_tag = " (on-chain)" if any_onchain else ""
-        open_lines = [f"**Open (Unrealized){onchain_tag}**"]
+        has_realized = any(v != 0 for v in open_realized.values())
+        open_lines = [f"**Open{onchain_tag}**"]
         open_total = 0.0
         total_fees = 0.0
         for sym in ("BTC", "ETH", "SOL"):
-            pnl = open_pnl.get(sym, 0.0)
+            unr = open_unrealized.get(sym, 0.0)
+            rlz = open_realized.get(sym, 0.0)
             fees = open_fees.get(sym, 0.0)
-            sign = "+" if pnl >= 0 else ""
-            fee_str = f"  (fees: -${fees:,.2f})" if fees > 0 else ""
-            open_lines.append(f"  {sym}: {sign}${pnl:,.2f}{fee_str}")
-            open_total += pnl
+            total = unr + rlz
+            sign = "+" if total >= 0 else ""
+            parts = []
+            if has_realized:
+                r_sign = "+" if rlz >= 0 else ""
+                u_sign = "+" if unr >= 0 else ""
+                parts.append(f"rlz: {r_sign}${rlz:,.2f}, unrlz: {u_sign}${unr:,.2f}")
+            if fees > 0:
+                parts.append(f"fees: -${fees:,.2f}")
+            detail = f"  ({', '.join(parts)})" if parts else ""
+            open_lines.append(f"  {sym}: {sign}${total:,.2f}{detail}")
+            open_total += total
             total_fees += fees
         sign = "+" if open_total >= 0 else ""
         open_lines.append(f"  Total: {sign}${open_total:,.2f}")
