@@ -533,27 +533,7 @@ class CoreTelegramMixin:
                         msg += fee_line
 
                 if sl_orders or tp_orders:
-                    msg += "  SL & TP:\n"
-                    # Deduplicate SL orders: show only the active one
-                    # If multiple SL orders exist on-chain (stale + new), show one + warning
-                    if len(sl_orders) > 1:
-                        msg += f"    ⚠️ {len(sl_orders)} SL orders found (cleaning up duplicates)\n"
-                        # Schedule async cleanup of duplicate SL orders
-                        asyncio.create_task(self._cleanup_duplicate_sl_orders(pos, sl_orders, orders))
-                    shown_sl = sl_orders[:1]  # show only the first SL
-                    for o in shown_sl:
-                        tp_price = o.get("trigger_price", 0) or 0
-                        if tp_price and pos.entry_price and pos.entry_price > 0:
-                            if pos.is_long:
-                                proj = ((tp_price - pos.entry_price) / pos.entry_price) * pos.size_usd
-                            else:
-                                proj = ((pos.entry_price - tp_price) / pos.entry_price) * pos.size_usd
-                            proj_sign = "+" if proj >= 0 else ""
-                            msg += f"    SL  @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected)\n"
-                        elif tp_price:
-                            msg += f"    SL  @ ${tp_price:,.2f}\n"
-                        else:
-                            msg += f"    SL  @ unknown\n"
+                    msg += "  TP & SL:\n"
                     # Shorts: sort TPs highest→lowest (price drops toward targets)
                     # Longs: sort TPs lowest→highest (price rises toward targets)
                     sorted_tps = sorted(
@@ -569,13 +549,13 @@ class CoreTelegramMixin:
                         close_pct_str = ""
                         if tp_size > 0 and pos.size_usd > 0:
                             close_pct = (tp_size / pos.size_usd) * 100
-                            close_pct_str = f" ({close_pct:.0f}%)"
+                            close_pct_str = f" (closes {close_pct:.0f}%)"
                         elif internal:
                             # Fall back to internal TP percentage if available
                             remaining_tps = [t for t in internal.take_profits if not t.executed]
                             remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
                             if j - 1 < len(remaining_tps_sorted):
-                                close_pct_str = f" ({remaining_tps_sorted[j-1].percentage:.0%})"
+                                close_pct_str = f" (closes {remaining_tps_sorted[j-1].percentage:.0%})"
 
                         if tp_price and pos.entry_price and pos.entry_price > 0:
                             # Token price change % — raw direction (negative for shorts)
@@ -600,13 +580,46 @@ class CoreTelegramMixin:
                             chg_sign = "+" if price_chg >= 0 else ""
                             sym = pos.symbol or ""
                             msg += (
-                                f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
-                                f"         {pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%\n"
+                                f"  TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
+                                f"     ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
                             )
                         elif tp_price:
-                            msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
+                            msg += f"  TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
                         else:
-                            msg += f"    TP{j} @ unknown\n"
+                            msg += f"  TP{j} @ unknown\n"
+
+                    # SL at the bottom — deduplicate if multiple exist on-chain
+                    if len(sl_orders) > 1:
+                        msg += f"  ⚠️ {len(sl_orders)} SL orders found (cleaning up duplicates)\n"
+                        asyncio.create_task(self._cleanup_duplicate_sl_orders(pos, sl_orders, orders))
+                    shown_sl = sl_orders[:1]
+                    for o in shown_sl:
+                        sl_price = o.get("trigger_price", 0) or 0
+                        if sl_price and pos.entry_price and pos.entry_price > 0:
+                            price_chg = ((sl_price - pos.entry_price) / pos.entry_price) * 100
+
+                            if pos.is_long:
+                                pnl_per_dollar = (sl_price - pos.entry_price) / pos.entry_price
+                            else:
+                                pnl_per_dollar = (pos.entry_price - sl_price) / pos.entry_price
+
+                            proj = pnl_per_dollar * pos.size_usd
+
+                            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                            pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
+                            pnl_pct_sign = "+" if pnl_pct >= 0 else ""
+
+                            proj_sign = "+" if proj >= 0 else ""
+                            chg_sign = "+" if price_chg >= 0 else ""
+                            sym = pos.symbol or ""
+                            msg += (
+                                f"  SL  @ ${sl_price:,.2f}\n"
+                                f"     ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
+                            )
+                        elif sl_price:
+                            msg += f"  SL  @ ${sl_price:,.2f}\n"
+                        else:
+                            msg += f"  SL  @ unknown\n"
 
                 if limit_orders:
                     msg += "  Limit Orders:\n"
