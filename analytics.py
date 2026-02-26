@@ -200,7 +200,7 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_winrate(self, chat_id: int, symbol: Optional[str], n: Optional[int]):
-        """Telegram /winrate command handler.
+        """Telegram /winrate command handler using on-chain trade data.
 
         Args:
             chat_id: Telegram chat ID
@@ -212,24 +212,57 @@ class AnalyticsMixin:
             /winrate BTC — BTC only
             /winrate BTC 20 — last 20 BTC trades
         """
-        stats = self.calculate_win_rate(symbol, n)
-        if not stats or stats.get("total", 0) == 0:
+        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
+
+        # Fetch on-chain trades (merged with local store)
+        all_stored = await self._fetch_and_store_trades()
+        reset_ts = self._get_pnl_reset_ts()
+        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+
+        # Tag with symbol, exclude dust (< $1)
+        trades = []
+        for t in all_trades:
+            if abs(t.get("pnl_usd", 0)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                trades.append({"pnl_usd": t["pnl_usd"], "sym": sym})
+
+        if symbol:
+            trades = [t for t in trades if t["sym"] == symbol.upper()]
+
+        if n and n > 0:
+            trades = trades[-n:]
+
+        if not trades:
             label = f" for {symbol}" if symbol else ""
-            await self.send_message(chat_id, f"No closed trades recorded{label} yet.\n\nTrades are recorded when you use /close to manually close a position.")
+            await self.send_message(chat_id, f"No closed trades{label} yet.")
             return
+
+        wins = [t for t in trades if t["pnl_usd"] > 0]
+        losses = [t for t in trades if t["pnl_usd"] < 0]
+        total_pnl = sum(t["pnl_usd"] for t in trades)
+        win_rate = len(wins) / len(trades) * 100
+        avg_win = sum(t["pnl_usd"] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0
 
         title = "Win Rate"
         if symbol:
-            title += f" — {symbol}"
+            title += f" — {symbol.upper()}"
         if n:
             title += f" (last {n})"
 
+        pnl_sign = "+" if total_pnl >= 0 else ""
         msg = (
             f"**{title}**\n\n"
-            f"Win Rate: {stats['win_rate']:.1f}% ({stats['wins']}/{stats['total']})\n"
-            f"Net PnL: ${stats['pnl']:,.2f}\n"
-            f"Avg Win: ${stats['avg_win']:,.2f}\n"
-            f"Avg Loss: ${stats['avg_loss']:,.2f}"
+            f"Win Rate: {win_rate:.1f}% ({len(wins)}/{len(trades)})\n"
+            f"Net PnL: {pnl_sign}${total_pnl:,.2f}\n"
+            f"Avg Win: +${avg_win:,.2f}\n"
+            f"Avg Loss: ${avg_loss:,.2f}"
         )
         await self.send_message(chat_id, msg)
 
