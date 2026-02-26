@@ -494,7 +494,14 @@ class CoreTelegramMixin:
                             msg += f"    SL  @ ${tp_price:,.2f}\n"
                         else:
                             msg += f"    SL  @ unknown\n"
-                    for j, o in enumerate(tp_orders, 1):
+                    # Shorts: sort TPs highest→lowest (price drops toward targets)
+                    # Longs: sort TPs lowest→highest (price rises toward targets)
+                    sorted_tps = sorted(
+                        tp_orders,
+                        key=lambda x: x.get("trigger_price", 0) or 0,
+                        reverse=not pos.is_long,
+                    )
+                    for j, o in enumerate(sorted_tps, 1):
                         tp_price = o.get("trigger_price", 0) or 0
 
                         # % of position closing at this TP
@@ -511,12 +518,19 @@ class CoreTelegramMixin:
                                 close_pct_str = f" ({remaining_tps_sorted[j-1].percentage:.0%})"
 
                         if tp_price and pos.entry_price and pos.entry_price > 0:
+                            # Price change % — always raw direction (negative for shorts)
+                            price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
+
+                            # Projected PnL — only for the portion closing at this TP
                             if pos.is_long:
-                                proj = ((tp_price - pos.entry_price) / pos.entry_price) * pos.size_usd
-                                price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
+                                pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
                             else:
-                                proj = ((pos.entry_price - tp_price) / pos.entry_price) * pos.size_usd
-                                price_chg = ((pos.entry_price - tp_price) / pos.entry_price) * 100
+                                pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
+
+                            # Use on-chain close size if available, else derive from close_pct_str
+                            tp_close_size = tp_size if tp_size > 0 else pos.size_usd
+                            proj = pnl_per_dollar * tp_close_size
+
                             proj_sign = "+" if proj >= 0 else ""
                             chg_sign = "+" if price_chg >= 0 else ""
                             msg += f"    TP{j}{close_pct_str} @ ${tp_price:,.2f}  ({proj_sign}${proj:,.2f} projected, {chg_sign}{price_chg:.2f}%)\n"
