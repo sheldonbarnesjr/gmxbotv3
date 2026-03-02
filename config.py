@@ -205,6 +205,7 @@ class Config:
     log_level: str = "INFO"
 
 
+
 def load_config() -> Config:
     """Read .env / environment variables and return a fully populated Config."""
 
@@ -281,4 +282,5 @@ def load_config() -> Config:
 
         # Logging
         log_level=_env("LOG_LEVEL", "INFO").upper(),
+
     )

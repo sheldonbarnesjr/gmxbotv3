@@ -385,17 +385,20 @@ class AnalyticsMixin:
         # Apply reset timestamp filter
         all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
 
+        def _net(t):
+            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
+
         def bucket_stats(trades_list):
             if not trades_list:
                 return {"pnl": 0.0, "trades": 0, "wins": 0}
-            pnl = sum(t["pnl_usd"] for t in trades_list)
-            wins = sum(1 for t in trades_list if t["pnl_usd"] > 0)
+            pnl = sum(_net(t) for t in trades_list)
+            wins = sum(1 for t in trades_list if _net(t) > 0)
             return {"pnl": pnl, "trades": len(trades_list), "wins": wins}
 
         # Tag each trade with symbol, exclude dust trades (< $1 PnL)
         tagged = []
         for t in all_trades:
-            if abs(t.get("pnl_usd", 0)) < 1:
+            if abs(_net(t)) < 1:
                 continue
             sym = market_to_sym.get((t.get("market_address") or "").lower())
             if sym:

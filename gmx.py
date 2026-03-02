@@ -69,6 +69,7 @@ from sl_tp import SLTPMixin
 from wallet_mgmt import WalletMixin
 from price_feeds import PriceFeedsMixin, PriceData
 from analytics import AnalyticsMixin, TradeRecord
+from withdraw_mixin import WithdrawMixin
 from telegram import CoreTelegramMixin
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -207,7 +208,7 @@ class Position:
 # BOT ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, AnalyticsMixin, CoreTelegramMixin):
+class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, AnalyticsMixin, WithdrawMixin, CoreTelegramMixin):
     """Production GMX V2 Trading Bot with real on-chain execution."""
 
     def __init__(self):

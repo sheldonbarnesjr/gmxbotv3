@@ -92,7 +92,8 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /summary — Send daily summary now
 /topup — Manual ETH top-up (swap USDC → ETH for gas)
 /tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
-/withdraw <amount> — Withdraw USDC to an external Arbitrum address
+/deposit — Show W1 deposit address (auto-rebalances when USDC arrives)
+/withdraw <amount> — Withdraw USDC to any Arbitrum address
 /winrate [SYMBOL] [N] — Win rate stats
 
 **Wallets:** W1=swing, W2-W4=scalps"""
@@ -369,10 +370,19 @@ class CoreTelegramMixin:
             elif cmd == "/withdraw":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_withdraw(chat_id, arg)
+            elif cmd == "/deposit":
+                await self.cmd_deposit(chat_id)
             elif cmd == "/cancel":
                 if chat_id in self.pending_withdraw:
-                    del self.pending_withdraw[chat_id]
-                    await self.send_message(chat_id, "Withdrawal cancelled.")
+                    state = self.pending_withdraw[chat_id].get("state", "")
+                    if state in ("awaiting_address", "confirm"):
+                        del self.pending_withdraw[chat_id]
+                        await self.send_message(chat_id, "Withdrawal cancelled.")
+                    else:
+                        await self.send_message(
+                            chat_id,
+                            "Cannot cancel — transfer already in progress."
+                        )
                 elif chat_id in self.pending_closes:
                     del self.pending_closes[chat_id]
                     await self.send_message(chat_id, "Close cancelled.")
@@ -1219,9 +1229,13 @@ class CoreTelegramMixin:
                 self.logger.error(f"Daily summary error: {e}")
                 await asyncio.sleep(3600)
 
-    async def hourly_pnl_loop(self):
-        """Send an hourly PnL snapshot between 9 AM and 11 PM ET.
+    # Last known PnL snapshot for change detection (set by send_hourly_pnl)
+    _last_pnl_snapshot: Optional[dict] = None
 
+    async def hourly_pnl_loop(self):
+        """Send a PnL Update between 9 AM and 11 PM ET, weekdays only.
+
+        Only sends if PnL has changed since the last update.
         Also records a balance snapshot every hour for 24h tracking.
         """
         while True:
@@ -1244,22 +1258,32 @@ class CoreTelegramMixin:
                     self.logger.debug(f"Hourly position sync failed: {e}")
 
                 ET = ZoneInfo("America/New_York")
-                hour = datetime.now(ET).hour
-                if 9 <= hour <= 22:  # 9 AM to 11 PM ET (22:xx is the last alert)
+                now_et = datetime.now(ET)
+                hour = now_et.hour
+                weekday = now_et.weekday()  # 0=Mon … 6=Sun
+
+                # Skip weekends (Sat=5, Sun=6)
+                if weekday >= 5:
+                    self.logger.debug(f"PnL Update skipped — weekend ({now_et.strftime('%A')})")
+                    continue
+
+                if 9 <= hour <= 22:  # 9 AM to 11 PM ET
                     await self.send_hourly_pnl()
                 else:
-                    self.logger.debug(f"Hourly PnL skipped — outside 9AM-11PM ET (currently {hour}:00)")
+                    self.logger.debug(f"PnL Update skipped — outside 9AM-11PM ET (currently {hour}:00)")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"Hourly PnL loop error: {e}")
+                self.logger.error(f"PnL Update loop error: {e}")
                 await asyncio.sleep(3600)
 
     async def send_hourly_pnl(self):
-        """Build and send the hourly PnL alert.
+        """Build and send the PnL Update alert.
 
-        Uses GMX subsquid for realized trade history (all wallets combined)
+        Uses on-chain event logs for realized trade history (all wallets combined)
         and on-chain data for open position unrealized PnL.
+
+        Only sends if PnL has changed since the last update.
         """
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
@@ -1281,15 +1305,18 @@ class CoreTelegramMixin:
         all_stored = await self._fetch_and_store_trades()
         today_trades = [t for t in all_stored if t.get("timestamp", 0) >= since]
 
-        # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum
+        # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum.
+        # Use net_pnl_usd (includes fees + price impact) with fallback to
+        # pnl_usd for older stored trades that lack the field.
         realized_pnl = 0.0
         realized_count = 0
         for t in today_trades:
-            if abs(t.get("pnl_usd", 0)) < 1:
+            pnl = t.get("net_pnl_usd", t.get("pnl_usd", 0))
+            if abs(pnl) < 1:
                 continue
             sym = market_to_sym.get((t.get("market_address") or "").lower())
             if sym:
-                realized_pnl += t["pnl_usd"]
+                realized_pnl += pnl
                 realized_count += 1
 
         # ── Open positions on-chain (unrealized PnL) ──
@@ -1331,18 +1358,29 @@ class CoreTelegramMixin:
                         f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f}{detail}"
                     )
         except Exception as e:
-            self.logger.warning(f"Hourly PnL: could not fetch positions: {e}")
+            self.logger.warning(f"PnL Update: could not fetch positions: {e}")
 
         # Today's total = closed trades + open unrealized
-        # (realized_pnl already includes TP partial close PnL from on-chain events)
         today_total = realized_pnl + unrealized_pnl
+
+        # ── Change detection: skip if nothing changed ──
+        current_snapshot = {
+            "realized_pnl": round(realized_pnl, 2),
+            "realized_count": realized_count,
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "open_count": open_count,
+        }
+        if self._last_pnl_snapshot == current_snapshot:
+            self.logger.debug("PnL Update skipped — no change since last update")
+            return
+        self._last_pnl_snapshot = current_snapshot
 
         # Build message
         r_sign = "+" if realized_pnl >= 0 else ""
         u_sign = "+" if unrealized_pnl >= 0 else ""
         t_sign = "+" if today_total >= 0 else ""
 
-        msg = f"Hourly PnL — {now.strftime('%I:%M %p ET')}\n\n"
+        msg = f"PnL Update — {now.strftime('%I:%M %p ET')}\n\n"
 
         msg += f"**Today ({realized_count} closed)**\n"
         msg += f"  Closed:     {r_sign}${realized_pnl:,.2f}\n"
@@ -1352,41 +1390,73 @@ class CoreTelegramMixin:
         msg += f"  Today Total: {t_sign}${today_total:,.2f}"
 
         await self.notify(msg)
-        self.logger.info(f"Hourly PnL sent: today={t_sign}${today_total:,.2f}")
+        self.logger.info(f"PnL Update sent: today={t_sign}${today_total:,.2f}")
 
     async def send_daily_summary(self):
-        cfg = self.cfg
+        """Build and send the daily summary using on-chain trade data.
+
+        Uses the same on-chain data source as /pnl and PnL Update
+        (fetched via _fetch_and_store_trades) for accurate numbers.
+        """
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_cutoff = today_start.timestamp()
+        today_cutoff = int(today_start.timestamp())
 
         PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
 
-        todays_trades = [t for t in self.trade_history if t.closed_at >= today_cutoff and t.symbol in PNL_SYMBOLS]
-        all_trades = [t for t in self.trade_history if t.symbol in PNL_SYMBOLS]
+        # Build reverse map: market_address (lower) → symbol
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
 
-        daily_pnl = sum(t.pnl_usd for t in todays_trades)
-        daily_wins = sum(1 for t in todays_trades if t.pnl_usd > 0)
-        daily_losses = sum(1 for t in todays_trades if t.pnl_usd < 0)
+        # ── Fetch on-chain trades (merged with local store) ──
+        all_stored = await self._fetch_and_store_trades()
+        reset_ts = self._get_pnl_reset_ts()
+        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+
+        def _net(t):
+            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
+
+        # Tag trades with symbol, exclude dust (< $1)
+        tagged = []
+        for t in all_trades:
+            if abs(_net(t)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                entry = dict(t)
+                entry["_sym"] = sym
+                tagged.append(entry)
+
+        todays_trades = [t for t in tagged if t.get("timestamp", 0) >= today_cutoff]
+
+        # ── Daily stats ──
+        daily_pnl = sum(_net(t) for t in todays_trades)
+        daily_wins = sum(1 for t in todays_trades if _net(t) > 0)
+        daily_losses = sum(1 for t in todays_trades if _net(t) <= 0)
         daily_count = len(todays_trades)
-
-        lifetime_pnl = sum(t.pnl_usd for t in all_trades)
-        lifetime_wins = sum(1 for t in all_trades if t.pnl_usd > 0)
-        lifetime_losses = sum(1 for t in all_trades if t.pnl_usd < 0)
-        lifetime_count = len(all_trades)
-        lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
         daily_winrate = (daily_wins / daily_count * 100) if daily_count else 0.0
 
+        # ── Lifetime stats (since reset) ──
+        lifetime_pnl = sum(_net(t) for t in tagged)
+        lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
+        lifetime_losses = sum(1 for t in tagged if _net(t) <= 0)
+        lifetime_count = len(tagged)
+        lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
+
+        # ── Per-symbol breakdown (today) ──
         symbol_lines = []
         for sym in ("BTC", "ETH", "SOL"):
-            sym_trades = [t for t in todays_trades if t.symbol == sym]
+            sym_trades = [t for t in todays_trades if t["_sym"] == sym]
             if sym_trades:
-                sym_pnl = sum(t.pnl_usd for t in sym_trades)
+                sym_pnl = sum(_net(t) for t in sym_trades)
                 sym_sign = "+" if sym_pnl >= 0 else ""
-                sym_w = sum(1 for t in sym_trades if t.pnl_usd > 0)
+                sym_w = sum(1 for t in sym_trades if _net(t) > 0)
                 symbol_lines.append(f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}/{len(sym_trades)} wins)")
 
+        # ── Wallet balances ──
         balance_lines = []
         total_usdc = 0.0
         total_deployed = 0.0
@@ -1406,14 +1476,17 @@ class CoreTelegramMixin:
             self.logger.warning(f"Daily summary: balance fetch failed: {e}")
             balance_lines.append("  (could not fetch balances)")
 
+        # ── Open positions (unrealized PnL) ──
         open_pnl = 0.0
         open_count = 0
         try:
             for _, acct in self._all_wallets():
                 cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
                 for cp in cps:
-                    open_pnl += cp.unrealized_pnl
-                    open_count += 1
+                    sym = cp.symbol.upper().split("/")[0]
+                    if sym in PNL_SYMBOLS:
+                        open_pnl += cp.unrealized_pnl
+                        open_count += 1
         except Exception:
             pass
 
@@ -1422,8 +1495,8 @@ class CoreTelegramMixin:
         o_sign = "+" if open_pnl >= 0 else ""
 
         msg = (
-            f"📊 Daily Summary — {now.strftime('%b %d, %Y')}\n\n"
-            f"Today ({daily_count} trades):\n"
+            f"Daily Summary — {now.strftime('%b %d, %Y')}\n\n"
+            f"**Today ({daily_count} trades)**\n"
             f"  PnL: {d_sign}${daily_pnl:,.2f}\n"
             f"  Win Rate: {daily_winrate:.0f}% ({daily_wins}W / {daily_losses}L)\n"
         )
@@ -1431,15 +1504,15 @@ class CoreTelegramMixin:
             msg += "\n".join(symbol_lines) + "\n"
 
         msg += (
-            f"\nLifetime ({lifetime_count} trades):\n"
+            f"\n**Lifetime ({lifetime_count} trades)**\n"
             f"  PnL: {l_sign}${lifetime_pnl:,.2f}\n"
             f"  Win Rate: {lifetime_winrate:.0f}% ({lifetime_wins}W / {lifetime_losses}L)\n"
         )
 
         if open_count:
-            msg += f"\nOpen Positions ({open_count}):\n  Unrealized: {o_sign}${open_pnl:,.2f}\n"
+            msg += f"\n**Open Positions ({open_count})**\n  Unrealized: {o_sign}${open_pnl:,.2f}\n"
 
-        msg += "\nAccount Balance:\n" + "\n".join(balance_lines) + "\n"
+        msg += "\n**Account Balance**\n" + "\n".join(balance_lines) + "\n"
         msg += f"  Total USDC: ${total_usdc:,.2f}\n  Deployed: ${total_deployed:,.2f}"
 
         await self.notify(msg)

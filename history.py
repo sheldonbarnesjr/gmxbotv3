@@ -30,6 +30,23 @@ _P30 = 10 ** 30
 # Arbitrum ~4 blocks/sec
 _BLOCKS_PER_SECOND = 4
 
+# Known stablecoin addresses on Arbitrum (lowercase) — fee amounts in these
+# tokens map 1:1 to USD after dividing by their decimals.
+_STABLECOINS = {
+    "0xaf88d065e77c8cc2239327c5edb3a432268e5831",  # USDC
+    "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",  # USDC.e
+    "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",  # USDT
+}
+
+# token address (lowercase) → decimals
+_TOKEN_DECIMALS = {
+    "0xaf88d065e77c8cc2239327c5edb3a432268e5831": 6,   # USDC
+    "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8": 6,   # USDC.e
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1": 18,  # WETH
+    "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f": 8,   # WBTC
+    "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": 6,   # USDT
+}
+
 
 def _get_event_log1_abi():
     """Build EventLog1 ABI using the eventData components from open.py."""
@@ -148,36 +165,66 @@ def fetch_trade_history(
 
                 ed = decoded["args"]["eventData"]
 
-                # Address items — extract market and verify account belongs to us
+                # Address items — extract market, account, and collateral token
                 market_addr = None
                 event_account = None
+                collateral_token = None
                 for item in ed["addressItems"]["items"]:
                     if item["key"] == "market":
                         market_addr = item["value"].lower()
                     elif item["key"] == "account":
                         event_account = item["value"].lower()
+                    elif item["key"] == "collateralToken":
+                        collateral_token = item["value"].lower()
 
                 # Skip events that belong to a different wallet
                 if event_account and event_account != account_lower:
                     continue
 
-                # Uint items
+                # Uint items — size + fee amounts (in collateral token units)
                 size_delta = 0
+                borrowing_fee_raw = 0
+                position_fee_raw = 0
+                execution_price_raw = 0
                 for item in ed["uintItems"]["items"]:
-                    if item["key"] == "sizeDeltaUsd":
+                    k = item["key"]
+                    if k == "sizeDeltaUsd":
                         size_delta = item["value"] / _P30
+                    elif k == "borrowingFeeAmount":
+                        borrowing_fee_raw = item["value"]
+                    elif k == "positionFeeAmount":
+                        position_fee_raw = item["value"]
+                    elif k == "executionPrice":
+                        execution_price_raw = item["value"]
 
-                # Int items (PnL)
+                # Int items — PnL and price impact (already USD at 1e30)
                 base_pnl = 0
+                price_impact = 0
                 for item in ed["intItems"]["items"]:
-                    if item["key"] == "basePnlUsd":
+                    k = item["key"]
+                    if k == "basePnlUsd":
                         base_pnl = item["value"] / _P30
+                    elif k == "priceImpactUsd":
+                        price_impact = item["value"] / _P30
 
                 # Bool items
                 is_long = None
                 for item in ed["boolItems"]["items"]:
                     if item["key"] == "isLong":
                         is_long = item["value"]
+
+                # Convert fee amounts from collateral-token units to USD
+                fees_usd = 0.0
+                if collateral_token and (borrowing_fee_raw or position_fee_raw):
+                    decimals = _TOKEN_DECIMALS.get(collateral_token, 6)
+                    fee_tokens = (borrowing_fee_raw + position_fee_raw) / (10 ** decimals)
+                    if collateral_token in _STABLECOINS:
+                        fees_usd = fee_tokens
+                    elif execution_price_raw > 0:
+                        # Non-stablecoin collateral (WBTC/WETH): convert via execution price
+                        fees_usd = fee_tokens * (execution_price_raw / _P30)
+
+                net_pnl = base_pnl + price_impact - fees_usd
 
                 # Get block timestamp
                 blk = w3.eth.get_block(block_num)
@@ -195,6 +242,9 @@ def fetch_trade_history(
                     "is_long": is_long,
                     "size_delta_usd": size_delta,
                     "pnl_usd": base_pnl,
+                    "net_pnl_usd": net_pnl,
+                    "price_impact_usd": price_impact,
+                    "total_fees_usd": fees_usd,
                     "timestamp": ts,
                     "tx_hash": tx_hash,
                     "log_index": log_idx,
