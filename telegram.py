@@ -628,8 +628,7 @@ class CoreTelegramMixin:
 
                     # SL at the bottom — deduplicate if multiple exist on-chain
                     if len(sl_orders) > 1:
-                        msg += f"  ⚠️ {len(sl_orders)} SL orders found (cleaning up duplicates)\n"
-                        asyncio.create_task(self._cleanup_duplicate_sl_orders(pos, sl_orders, orders))
+                        msg += f"  ⚠️ {len(sl_orders)} SL orders found (run /sync to clean up)\n"
                     shown_sl = sl_orders[:1]
                     for o in shown_sl:
                         sl_price = o.get("trigger_price", 0) or 0
@@ -688,62 +687,6 @@ class CoreTelegramMixin:
                 msg += f"  {o['symbol']} {side} @ {price_str}  (${o['size_usd']:,.2f})\n"
 
         await self.send_message(chat_id, msg)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Duplicate SL cleanup
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def _cleanup_duplicate_sl_orders(self, chain_pos, sl_orders: list, all_orders: list):
-        """Cancel duplicate SL orders for a position, keeping only the most recent one.
-
-        This can happen when move_sl partially fails or when the bot restarts
-        and re-places an SL that already exists on-chain.
-        """
-        if len(sl_orders) <= 1:
-            return
-
-        cfg = self.cfg
-        if cfg.dry_run:
-            self.logger.info(f"[DRY_RUN] Would clean up {len(sl_orders) - 1} duplicate SL order(s)")
-            return
-
-        # Keep the last SL order (most recently created), cancel the rest
-        to_cancel = sl_orders[:-1]
-        kept = sl_orders[-1]
-
-        wid = getattr(chain_pos, '_wallet_id', 1)
-        acct = self._get_account(wid)
-        exchange = self.w3.eth.contract(
-            address=Web3.to_checksum_address(cfg.exchange_router),
-            abi=EXCHANGE_ROUTER_ABI,
-        )
-        wallet = Web3.to_checksum_address(acct.address)
-
-        cancelled = 0
-        for o in to_cancel:
-            key_hex = o.get("key_hex")
-            if not key_hex:
-                continue
-            try:
-                key_bytes = bytes.fromhex(key_hex)
-                data = exchange.encode_abi("cancelOrder", [key_bytes])
-                tx = _open_mod.build_tx(self.w3, wallet, exchange.address, data, value=0)
-                txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=False)
-                _open_mod.wait_receipt(self.w3, txh)
-                cancelled += 1
-                self.logger.info(
-                    f"Cleaned up duplicate SL for {chain_pos.symbol}: "
-                    f"cancelled @ ${o['trigger_price']:,.2f} (key=0x{key_hex[:12]}...)"
-                )
-            except Exception as e:
-                self.logger.warning(f"Failed to cancel duplicate SL: {e}")
-
-        if cancelled > 0:
-            kept_price = kept.get('trigger_price', 0)
-            await self.notify(
-                f"🧹 {chain_pos.symbol}: Cleaned up {cancelled} duplicate SL order(s). "
-                f"Kept SL @ ${kept_price:,.2f}"
-            )
 
     # ──────────────────────────────────────────────────────────────────────
     # /close + confirmation handler
