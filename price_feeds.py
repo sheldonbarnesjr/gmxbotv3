@@ -33,8 +33,8 @@ class PriceFeedsMixin:
         """Continuously update prices for tracked symbols."""
         while True:
             try:
-                await asyncio.sleep(self.cfg.price_update_interval)
                 await self.update_all_prices()
+                await asyncio.sleep(self.cfg.price_update_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:

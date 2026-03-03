@@ -50,7 +50,7 @@ def retry_on_chain(max_retries: int = 3, base_delay: float = 2.0, label: str = "
                         time.sleep(delay)
                 except Exception as e:
                     err_str = str(e).lower()
-                    is_rpc = any(kw in err_str for kw in ["connection", "timeout", "nonce too low", "replacement", "already known", "rate limit", "502", "503", "429"])
+                    is_rpc = any(kw in err_str for kw in ["connection", "timeout", "rate limit", "502", "503", "429"])
                     if is_rpc and attempt < max_retries:
                         last_exc = e
                         delay = base_delay * (2 ** (attempt - 1))
@@ -245,7 +245,7 @@ def must_addr(name: str) -> str:
     return Web3.to_checksum_address(v)
 
 def to_wei_decimal(amount: float, decimals: int) -> int:
-    return int(amount * (10 ** decimals))
+    return round(amount * (10 ** decimals))
 
 def from_wei_decimal(amount: int, decimals: int) -> float:
     return amount / (10 ** decimals)
@@ -268,7 +268,7 @@ def get_fees(w3: Web3) -> dict:
     if "baseFeePerGas" in latest and latest["baseFeePerGas"] is not None:
         base = latest["baseFeePerGas"]
         priority = w3.to_wei(0.01, "gwei")
-        max_fee = base + priority * 2
+        max_fee = base * 2 + priority
         return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority}
     return {"gasPrice": w3.eth.gas_price}
 
@@ -613,10 +613,10 @@ def fetch_position_pnl(
         borrowing_fee_usd = fees[2][0] / (10 ** 30)
 
         # fees.funding.fundingFeeAmount (fees[1][0]) — in collateral token units
-        # Need to convert to USD. For USDC (6 dec), divide by 10^6 to get USD.
+        # NOTE: This assumes USDC (short token, 6 dec) as collateral for all positions.
+        # If a position uses a non-stablecoin collateral (WBTC/WETH), this will be wrong.
         collateral_decimals = MARKET_TOKEN_DECIMALS.get(market.lower(), (18, 18, 6))[2]
         funding_fee_amount = fees[1][0] / (10 ** collateral_decimals)
-        # funding fee is always denominated in USD for USDC collateral
         funding_fee_usd = funding_fee_amount
 
         # fees.positionFeeAmount (fees[4+6] = index 11 in the flat tuple? No...)
@@ -834,7 +834,8 @@ def create_close_order(
     debug: bool = False
 ) -> str:
     """Create GMX v2 decrease order to close position"""
-    
+    percentage = max(0.01, min(percentage, 1.0))
+
     if debug:
         log.debug(f"🔧 Creating close order for {position.symbol} {'LONG' if position.is_long else 'SHORT'}")
         log.debug(f"   Position size: ${position.size_usd:.2f}")
@@ -1026,8 +1027,8 @@ def create_close_order(
         return tx_hash
         
     except Exception as e:
-        log.error(f"❌ Error creating close order: {e}")
-        return ""
+        log.error(f"Error creating close order: {e}")
+        raise
 
 def main():
     """Main close.py execution"""

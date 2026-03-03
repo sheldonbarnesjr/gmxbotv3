@@ -92,8 +92,15 @@ def _send_message(token: str, chat_id: str, text: str) -> bool:
     }, timeout=15)
     data = resp.json()
     if not data.get("ok"):
-        logger.error(f"Bot API sendMessage error: {data}")
-        return False
+        # Retry without parse_mode if Markdown formatting caused the failure
+        resp = requests.post(url, json={
+            "chat_id": chat_id,
+            "text": text,
+        }, timeout=15)
+        data = resp.json()
+        if not data.get("ok"):
+            logger.error(f"Bot API sendMessage error: {data}")
+            return False
     return True
 
 

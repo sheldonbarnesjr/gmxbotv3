@@ -10,7 +10,7 @@ Contains:
 Other Telegram features have been moved to specialized mixins:
   - NotificationsMixin (notifications.py): notify(), send_message(), etc.
   - SLTPMixin (sl_tp.py): cmd_sl(), cmd_addorder(), cmd_cancelorder()
-  - WalletMixin (wallet_mgmt.py): cmd_balance(), cmd_gas(), cmd_topup(), cmd_balance_wallets()
+  - WalletMixin (wallet_mgmt.py): cmd_balance(), cmd_topup(), cmd_balance_wallets()
   - PriceFeedsMixin (price_feeds.py): cmd_prices()
   - AnalyticsMixin (analytics.py): cmd_winrate(), cmd_pnl(), cmd_health()
 
@@ -65,9 +65,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /balance-wallets — Rebalance USDC between wallets
 /cancelorder — List & cancel individual SL/TP orders
 /close — Close positions
-/consolidate — Move all free USDC from W2-W4 into W1
 /deposit — Show W1 deposit address
-/gas — ETH gas balances for all wallets
 /halt — Halt trading
 /health — System health
 /help — This message
@@ -79,11 +77,11 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /positions — Show on-chain positions & orders
 /prices — Live GMX & Chainlink prices
 /resume — Resume trading
+/signals — Recent signal history & status
 /sl — Move stop loss
 /status — Bot status & mode
 /summary — Send daily summary now
-/sync — Re-sync positions & clean up stale orders
-/topup — Swap USDC to ETH for gas
+/topup — Swap USDC to ETH for gas (shows gas balances with no args)
 /tradesize — Show/change trade size
 /withdraw — Withdraw USDC to any Arbitrum address
 /winrate — Win rate stats
@@ -113,7 +111,7 @@ class CoreTelegramMixin:
     Also expects these methods from mixins:
         notify(), send_message() — from NotificationsMixin
         cmd_sl(), cmd_addorder(), cmd_cancelorder() — from SLTPMixin
-        cmd_balance(), cmd_gas(), cmd_topup(), cmd_balance_wallets() — from WalletMixin
+        cmd_balance(), cmd_topup(), cmd_balance_wallets() — from WalletMixin
         cmd_prices() — from PriceFeedsMixin
         cmd_winrate(), cmd_pnl(), cmd_health() — from AnalyticsMixin
     """
@@ -187,6 +185,8 @@ class CoreTelegramMixin:
             # Confirmation handler — non-command messages from admin
             @self.client.on(events.NewMessage(chats=[admin_chat_id]))
             async def handle_confirm(event):
+                if not event.message.text:
+                    return
                 text = event.message.text.strip()
                 if text.startswith("/"):
                     return
@@ -295,6 +295,8 @@ class CoreTelegramMixin:
             elif cmd == "/confirm":
                 if chat_id in self.pending_withdraw:
                     await self.handle_withdraw_reply(chat_id, "CONFIRM")
+                elif chat_id in self.pending_increase:
+                    await self.handle_increase_reply(chat_id, "CONFIRM")
                 else:
                     await self.handle_close_confirmation(chat_id, "YES")
             elif cmd == "/halt":
@@ -327,6 +329,9 @@ class CoreTelegramMixin:
                 await self.cmd_lastmsg(chat_id)
             elif cmd == "/lastsignal":
                 await self.cmd_lastsignal(chat_id)
+            elif cmd == "/signals":
+                arg = parts[1] if len(parts) > 1 else ""
+                await self.cmd_signals(chat_id, arg)
             elif cmd == "/increase":
                 arg = parts[1] if len(parts) > 1 else None
                 await self.cmd_increase(chat_id, arg)
@@ -344,17 +349,11 @@ class CoreTelegramMixin:
             elif cmd == "/sl":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_sl(chat_id, arg)
-            elif cmd == "/consolidate":
-                await self.cmd_consolidate(chat_id)
-            elif cmd == "/gas":
-                await self.cmd_gas(chat_id)
             elif cmd == "/tradesize":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_tradesize(chat_id, arg)
             elif cmd == "/pdf":
                 await self.cmd_pdf(chat_id)
-            elif cmd == "/sync":
-                await self.cmd_sync(chat_id)
             elif cmd == "/withdraw":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_withdraw(chat_id, arg)
@@ -374,6 +373,9 @@ class CoreTelegramMixin:
                 elif chat_id in self.pending_closes:
                     del self.pending_closes[chat_id]
                     await self.send_message(chat_id, "Close cancelled.")
+                elif chat_id in self.pending_increase:
+                    del self.pending_increase[chat_id]
+                    await self.send_message(chat_id, "Increase cancelled.")
                 else:
                     await self.send_message(chat_id, "Nothing to cancel.")
             else:
@@ -522,14 +524,15 @@ class CoreTelegramMixin:
                         internal = ip
                         break
 
-                # TP hit info from internal state — use executed flags as source of truth
+                # TP hit info from internal state — use verified_decreases as source of truth
                 tp_hits = 0
                 total_tps = 0
                 sl_label = None
                 realized_pnl = 0.0
                 if internal:
-                    tp_hits = sum(1 for tp in internal.take_profits if tp.executed)
-                    total_tps = len(internal.take_profits)
+                    # Use verified_decreases as source of truth for TP hits
+                    tp_hits = internal.tp_hits_count
+                    total_tps = len([tp for tp in internal.take_profits if tp.price > 0])
                     tp_hits = min(tp_hits, total_tps)
                     sl_label = internal.sl_move_label
                     # Use verified realized PnL from internal state (validated by sync)
@@ -574,18 +577,19 @@ class CoreTelegramMixin:
                 if sl_orders or tp_orders or (internal and tp_hits > 0):
                     msg += "  TP & SL:\n"
 
-                    # Show executed (hit) TPs first with checkmark
+                    # Show verified hit TPs first with checkmark
                     hit_tp_num = 0
-                    if internal:
-                        internal_sorted = sorted(
-                            internal.take_profits,
-                            key=lambda t: t.price,
-                            reverse=(not pos.is_long),
-                        )
-                        for tp_level in internal_sorted:
-                            if tp_level.executed:
-                                hit_tp_num += 1
-                                msg += f"  TP{hit_tp_num} ✅ ${tp_level.price:,.2f} — HIT\n"
+                    if internal and internal.verified_decreases:
+                        # Build hit TPs from verified_decreases (source of truth)
+                        hit_prices = [
+                            d.get("matched_tp_price", 0)
+                            for d in internal.verified_decreases
+                            if d.get("matched_tp_price", 0) > 0
+                        ]
+                        hit_prices_sorted = sorted(hit_prices, reverse=(not pos.is_long))
+                        for hp in hit_prices_sorted:
+                            hit_tp_num += 1
+                            msg += f"  TP{hit_tp_num} ✅ ${hp:,.2f} — HIT\n"
 
                     # Remaining on-chain TPs — numbered after hit TPs
                     sorted_tps = sorted(
@@ -605,7 +609,8 @@ class CoreTelegramMixin:
                             close_pct = (tp_size / pos.size_usd) * 100
                             close_pct_str = f" (closes {close_pct:.0f}%)"
                         elif internal:
-                            remaining_tps = [t for t in internal.take_profits if not t.executed]
+                            hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
+                            remaining_tps = [t for t in internal.take_profits if t.price not in hit_tp_prices]
                             remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
                             if j - 1 < len(remaining_tps_sorted):
                                 close_pct_str = f" (closes {remaining_tps_sorted[j-1].percentage:.0%})"
@@ -640,7 +645,7 @@ class CoreTelegramMixin:
 
                     # SL at the bottom — deduplicate if multiple exist on-chain
                     if len(sl_orders) > 1:
-                        msg += f"  ⚠️ {len(sl_orders)} SL orders found (run /sync to clean up)\n"
+                        msg += f"  ⚠️ {len(sl_orders)} SL orders found\n"
                     shown_sl = sl_orders[:1]
                     for o in shown_sl:
                         sl_price = o.get("trigger_price", 0) or 0
@@ -772,7 +777,7 @@ class CoreTelegramMixin:
         else:
             if positions:
                 for pos in positions:
-                    if arg_upper in pos.symbol.upper():
+                    if arg_upper == pos.symbol.upper() or arg_upper == pos.symbol.upper().split("/")[0]:
                         to_close.append(pos)
             if not to_close:
                 await self.send_message(chat_id, f"No position found matching '{arg}'")
@@ -862,7 +867,7 @@ class CoreTelegramMixin:
                                 internal_pos.current_price = pos.current_price
                                 internal_pos.unrealized_pnl = pos.unrealized_pnl
                                 internal_pos.exit_reason = "manual"
-                                self._record_trade(internal_pos, exit_reason="manual")
+                                await self._record_trade(internal_pos, exit_reason="manual")
                                 matched = True
                                 break
                         if not matched:
@@ -1045,9 +1050,10 @@ class CoreTelegramMixin:
                 if (pos.is_open and pos.market_addr
                         and pos.market_addr.lower() == cp.market.lower()
                         and pos.wallet_id == wid and pos.side == side):
+                    old_collateral = pos.size_usd / pos.leverage if pos.leverage > 0 else pos.size_usd
                     pos.size_usd += additional_size
                     # Recalculate leverage from new on-chain size/collateral
-                    new_collateral = pos.size_usd / pos.leverage + amount
+                    new_collateral = old_collateral + amount
                     if new_collateral > 0:
                         pos.leverage = pos.size_usd / new_collateral
                     break
@@ -1096,6 +1102,39 @@ class CoreTelegramMixin:
         await self.process_signal(self.last_signal_text)
 
     # ──────────────────────────────────────────────────────────────────────
+    # /signals
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def cmd_signals(self, chat_id: int, args: str = ""):
+        """Show recent signals and their status from the signal store."""
+        n = 10
+        if args.strip().isdigit():
+            n = min(int(args.strip()), 50)
+
+        recent = self.signal_store.get_recent(n)
+        if not recent:
+            await self.send_message(chat_id, "No signals recorded yet.")
+            return
+
+        from datetime import datetime
+        lines = [f"**Last {len(recent)} Signals**\n"]
+        for sig in recent:
+            status_icon = {
+                "pending": "...",
+                "executed": "OK",
+                "rejected": "NO",
+            }.get(sig.status, "??")
+            ts = datetime.fromtimestamp(sig.timestamp_received).strftime("%m/%d %H:%M")
+            line = f"`[{status_icon}]` {ts} {sig.symbol} {sig.side} {sig.leverage:.0f}x [{sig.trade_type}]"
+            if sig.rejection_reason:
+                line += f"\n       Reason: {sig.rejection_reason[:40]}"
+            if sig.position_id:
+                line += f"\n       Pos: ...{sig.position_id[-6:]}"
+            lines.append(line)
+
+        await self.send_message(chat_id, "\n".join(lines))
+
+    # ──────────────────────────────────────────────────────────────────────
     # /tradesize
     # ──────────────────────────────────────────────────────────────────────
 
@@ -1117,7 +1156,7 @@ class CoreTelegramMixin:
                 return
 
             new_val = float(arg.strip().replace("%", ""))
-            new_pct = new_val / 100.0 if new_val > 1.0 else new_val
+            new_pct = new_val / 100.0 if new_val >= 1.0 else new_val
 
             if new_pct < 0.01 or new_pct > 0.50:
                 await self.send_message(chat_id, "Trade size must be between 1% and 50%.")
@@ -1213,7 +1252,6 @@ class CoreTelegramMixin:
                 break
             except Exception as e:
                 self.logger.error(f"PnL Update loop error: {e}")
-                await asyncio.sleep(3600)
 
     async def send_hourly_pnl(self):
         """Build and send the PnL Update alert.

@@ -165,9 +165,9 @@ class WithdrawMixin:
         # ── confirm: user confirms ──
         if state == "confirm":
             upper = text.upper()
-            if upper in ("YES", "Y", "CONFIRM"):
+            if upper in ("YES", "Y", "CONFIRM", "/CONFIRM"):
                 await self._execute_withdraw(chat_id)
-            elif upper in ("NO", "N", "CANCEL"):
+            elif upper in ("NO", "N", "CANCEL", "/CANCEL"):
                 del self.pending_withdraw[chat_id]
                 await self.send_message(chat_id, "Withdrawal cancelled.")
             else:
@@ -181,9 +181,16 @@ class WithdrawMixin:
 
     async def _execute_withdraw(self, chat_id: int):
         """Consolidate if needed, then send USDC to the destination address."""
-        pending = self.pending_withdraw[chat_id]
-        amount = pending["amount"]
-        destination = pending["destination"]
+        pending = self.pending_withdraw.get(chat_id)
+        if not pending:
+            await self.send_message(chat_id, "No pending withdrawal found.")
+            return
+        amount = pending.get("amount")
+        destination = pending.get("destination")
+        if not amount or not destination:
+            self.pending_withdraw.pop(chat_id, None)
+            await self.send_message(chat_id, "Withdrawal data incomplete. Please start over with /withdraw.")
+            return
 
         try:
             # ── Consolidate if W1 doesn't have enough ──
@@ -223,7 +230,7 @@ class WithdrawMixin:
             decimals = await asyncio.to_thread(
                 lambda: usdc_contract.functions.decimals().call()
             )
-            raw_amount = int(amount * (10 ** decimals))
+            raw_amount = round(amount * (10 ** decimals))
 
             transfer_data = usdc_contract.encode_abi(
                 "transfer",

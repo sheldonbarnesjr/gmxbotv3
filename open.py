@@ -762,7 +762,7 @@ def must_addr(name: str) -> str:
 
 
 def to_wei_decimal(amount: float, decimals: int) -> int:
-    return int(amount * (10 ** decimals))
+    return round(amount * (10 ** decimals))
 
 
 def from_wei_decimal(amount: int, decimals: int) -> float:
@@ -799,7 +799,7 @@ def get_fees(w3: Web3) -> dict:
     if "baseFeePerGas" in latest and latest["baseFeePerGas"] is not None:
         base = latest["baseFeePerGas"]
         priority = w3.to_wei(0.01, "gwei")
-        max_fee = base + priority * 2
+        max_fee = base * 2 + priority
         return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority}
     return {"gasPrice": w3.eth.gas_price}
 
@@ -816,7 +816,7 @@ def build_tx(w3: Web3, from_addr: str, to_addr: str, data, value=0) -> dict:
     }
     tx.update(fees)
     est = w3.eth.estimate_gas({**tx, "data": data})
-    gas = min(int(est * 1.25), int(os.getenv("GAS_LIMIT", "2000000")))
+    gas = int(est * 1.25)
     tx["gas"] = gas
     tx["data"] = data
     return tx
@@ -1707,10 +1707,19 @@ def fetch_positions(w3: Web3, wallet: str) -> list:
             col_dec, col_sym = 6, "?"
         collateral_amount = collateral_raw / (10 ** col_dec)
         leverage = size_usd / collateral_amount if collateral_amount > 0 else 0
+        # Look up token decimals from market address for accurate entry price
+        _MARKET_DECIMALS = {
+            "0x47c031236e19d024b42f8ae6780e44a573170703": 8,   # BTC
+            "0x70d95587d40a2caf56bd97485ab3eec10bee6336": 18,  # ETH
+            "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": 9,   # SOL
+            "0x7f1fa204bb700853d36994da19f830b6ad18455c": 18,  # LINK
+            "0xc25cef6061cf5de5eb761b50e4743c1f5d7e5407": 18,  # ARB
+            "0x6853ea96ff216fab11d2d930ce3c508556a4bdc4": 8,   # DOGE
+            "0x7bbbf946883a5701350007320f525c5379b8178a": 18,  # AVAX
+        }
         if size_tokens_raw > 0:
-            entry_8 = size_usd / (size_tokens_raw / (10 ** 8))
-            entry_18 = size_usd / (size_tokens_raw / (10 ** 18))
-            entry_price = entry_8 if 1 < entry_8 < 1_000_000 else entry_18
+            token_dec = _MARKET_DECIMALS.get(market.lower(), 18)
+            entry_price = size_usd / (size_tokens_raw / (10 ** token_dec))
         else:
             entry_price = 0
         side = "LONG" if is_long else "SHORT"
@@ -2098,7 +2107,7 @@ def create_sl_order(
     order_vault = Web3.to_checksum_address(order_vault)
 
     # Use wider slippage for SL to ensure execution
-    sl_slip = max(slippage_bps, 100) / 10_000.0  # at least 1% for SL
+    sl_slip = max(slippage_bps, 300) / 10_000.0  # at least 3% for SL to ensure execution
 
     size_delta_usd = int(size_usd * (10 ** 30))
     trigger_price_scaled = scale_price(sl_price, symbol)
@@ -2298,7 +2307,7 @@ def execute_signal(
     log.info(f"  SL:    {results['sl']}")
 
     # Count total execution fees spent
-    num_orders = 1 + len(signal.take_profits) + 1  # open + TPs + SL
+    num_orders = 1 + len(signal.take_profits) + (1 if signal.stop_loss else 0)  # open + TPs + SL
     total_fee_eth = num_orders * execution_fee / (10 ** 18)
     log.info(f"  Total execution fees: {total_fee_eth:.4f} ETH "
              f"({num_orders} orders)")
@@ -2481,6 +2490,12 @@ if __name__ == "__main__":
     if len(valid_tps) < len(signal.take_profits):
         log.warning(f"Removed {len(signal.take_profits) - len(valid_tps)} invalid TP(s)")
         signal.take_profits = valid_tps
+        # Renormalize TP percentages to sum to 1.0
+        total_pct = sum(tp.close_pct for tp in signal.take_profits)
+        if signal.take_profits and total_pct > 0 and abs(total_pct - 1.0) > 0.001:
+            for tp in signal.take_profits:
+                tp.close_pct /= total_pct
+            log.info(f"Renormalized {len(signal.take_profits)} TP(s) to sum to 100%")
 
     # Check ETH balance covers all execution fees
     num_orders = 1 + len(signal.take_profits) + (1 if signal.stop_loss else 0)

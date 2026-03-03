@@ -152,7 +152,7 @@ def fetch_trade_history(
 
         # Find PositionDecrease EventLog1 in same transaction
         for rlog in receipt["logs"]:
-            topics = [t.hex() if isinstance(t, bytes) else t for t in rlog["topics"]]
+            topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
             if not (rlog["address"].lower() == emitter_addr.lower()
                     and topics[0] == _EVENT_LOG1_TOPIC[2:]):
                 continue
@@ -326,7 +326,7 @@ def fetch_recent_position_decreases(
         processed_receipts[tx_hash] = True
 
         for rlog in receipt["logs"]:
-            topics = [t.hex() if isinstance(t, bytes) else t for t in rlog["topics"]]
+            topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
             if not (rlog["address"].lower() == emitter_addr.lower()
                     and topics[0] == _EVENT_LOG1_TOPIC[2:]):
                 continue
@@ -411,6 +411,7 @@ def fetch_recent_position_decreases(
                     "net_pnl_usd": net_pnl,
                     "timestamp": blk["timestamp"],
                     "tx_hash": tx_hash,
+                    "log_index": rlog.get("logIndex", 0),
                 })
 
             except Exception as e:

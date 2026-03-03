@@ -29,6 +29,7 @@ from open import (
     wait_receipt as open_wait_receipt,
     fetch_open_orders,
 )
+from state_io import atomic_json_write
 
 BALANCE_SNAPSHOTS_FILE = "balance_snapshots.json"
 MAX_SNAPSHOT_AGE_HOURS = 48
@@ -53,6 +54,8 @@ class WalletMixin:
             return self.account3
         if wallet_id == 2 and self.account2:
             return self.account2
+        if wallet_id != 1:
+            self.logger.warning(f"Wallet {wallet_id} not configured, falling back to W1")
         return self.account
 
     def _all_wallets(self) -> List[tuple]:
@@ -211,8 +214,7 @@ class WalletMixin:
         cutoff = time.time() - (MAX_SNAPSHOT_AGE_HOURS * 3600)
         snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
         try:
-            with open(BALANCE_SNAPSHOTS_FILE, "w") as f:
-                json.dump(snapshots, f)
+            atomic_json_write(BALANCE_SNAPSHOTS_FILE, snapshots)
         except Exception as e:
             self.logger.warning(f"Failed to save balance snapshot: {e}")
 
@@ -290,7 +292,7 @@ class WalletMixin:
                 if send_amount < 0.50:
                     continue
 
-                raw_amount = int(send_amount * (10 ** decimals))
+                raw_amount = round(send_amount * (10 ** decimals))
                 transfer_data = usdc_contract.encode_abi(
                     "transfer",
                     [Web3.to_checksum_address(target_acct.address), raw_amount],
@@ -455,7 +457,7 @@ class WalletMixin:
             for sender_wid, receiver_wid, amount in transfers:
                 sender_acct = self._get_account(sender_wid)
                 receiver_acct = self._get_account(receiver_wid)
-                raw_amount = int(amount * (10 ** decimals))
+                raw_amount = round(amount * (10 ** decimals))
 
                 transfer_data = usdc_contract.encode_abi(
                     "transfer",
@@ -528,7 +530,6 @@ class WalletMixin:
                 break
             except Exception as e:
                 self.logger.error(f"Rebalance loop error: {e}")
-                await asyncio.sleep(3600)
 
     async def gas_check_loop(self):
         """Check ETH gas balance every hour and auto top-up if needed."""
@@ -541,7 +542,6 @@ class WalletMixin:
                 break
             except Exception as e:
                 self.logger.error(f"Gas check loop error: {e}")
-                await asyncio.sleep(3600)
 
     async def topup_eth_if_needed(self):
         """Check ETH balance for all wallets and auto-topup if low.
@@ -656,12 +656,14 @@ class WalletMixin:
             wallet_lines = []
             wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
 
+            total_pnl = 0.0
             for wid, acct in self._all_wallets():
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
                 try:
                     positions = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
                     deployed = sum(p.collateral_amount for p in positions)
                     n_pos = len(positions)
+                    total_pnl += sum(p.unrealized_pnl for p in positions)
                 except Exception:
                     deployed = 0.0
                     n_pos = 0
@@ -675,14 +677,6 @@ class WalletMixin:
                     f"**{label}** {addr}\n"
                     f"  USDC: ${usdc:,.2f} | Deployed: {dep_str} | Positions: {n_pos}"
                 )
-
-            total_pnl = 0.0
-            for _, acct in self._all_wallets():
-                try:
-                    positions = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
-                    total_pnl += sum(p.unrealized_pnl for p in positions)
-                except Exception:
-                    pass
 
             total_portfolio = total_usdc + total_deployed + total_pnl
             collateral_per_trade = total_portfolio * cfg.portfolio_pct

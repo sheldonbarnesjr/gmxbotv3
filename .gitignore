@@ -2,6 +2,7 @@
 .env
 .venv/
 __pycache__/
+*.pyc
 
 # Telegram session
 *.session
@@ -12,9 +13,21 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
-*.pyc
+
+# macOS
+.DS_Store
 
 # Claude
 .claude/
-txt
-.pdf
+
+# Generated docs / notes
+*.txt
+*.pdf
+
+# State backups & temp files (from state_io atomic writes)
+*.json.bak
+.state_*.tmp
+tmp*.json
+
+# Test files
+test_*.py

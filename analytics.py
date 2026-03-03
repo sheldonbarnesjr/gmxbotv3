@@ -33,7 +33,9 @@ from zoneinfo import ZoneInfo
 from fpdf import FPDF
 
 from close import fetch_positions as chain_fetch_positions
+from history import fetch_recent_position_decreases
 from risk import calculate_unrealized_pnl, calculate_pnl_percentage
+from state_io import atomic_json_write, safe_json_read
 
 
 logger = logging.getLogger("GMXBot.analytics")
@@ -68,7 +70,9 @@ class AnalyticsMixin:
     """Mixin providing analytics & reporting methods for GMXBot."""
 
     def calculate_win_rate(self, symbol: str = None, n: int = None) -> Dict[str, Any]:
-        """Calculate win rate statistics.
+        """Calculate win rate from internal trade history (sync fallback).
+
+        For accurate fee-inclusive metrics, use calculate_win_rate_onchain() instead.
 
         Args:
             symbol: Filter trades by symbol (e.g., 'BTC'). None = all symbols.
@@ -103,8 +107,65 @@ class AnalyticsMixin:
             "pnl": total_pnl,
         }
 
-    def _record_trade(self, pos_obj, exit_reason: str = "manual"):
+    async def calculate_win_rate_onchain(self, symbol: str = None, n: int = None) -> Dict[str, Any]:
+        """Calculate win rate from on-chain PositionDecrease events (fee-inclusive PnL).
+
+        Uses _fetch_and_store_trades() which queries on-chain event logs and
+        merges with locally stored history. PnL values include borrowing fees,
+        funding fees, price impact, and position fees.
+
+        Args:
+            symbol: Filter trades by symbol (e.g., 'BTC'). None = all symbols.
+            n: Limit to last N trades. None = all trades.
+
+        Returns:
+            Dict with keys: win_rate, wins, losses, total, avg_win, avg_loss, pnl
+        """
+        all_trades = await self._fetch_and_store_trades()
+
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            market_to_sym[addr.lower()] = sym
+
+        def _net(t):
+            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
+
+        trades = []
+        for t in all_trades:
+            if abs(_net(t)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                trades.append({"pnl": _net(t), "sym": sym})
+
+        if symbol:
+            trades = [t for t in trades if t["sym"] == symbol.upper()]
+        if n and n > 0:
+            trades = trades[-n:]
+
+        if not trades:
+            return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0, "avg_win": 0, "avg_loss": 0, "pnl": 0}
+
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] < 0]
+        total_pnl = sum(t["pnl"] for t in trades)
+
+        return {
+            "win_rate": len(wins) / len(trades) * 100,
+            "wins": len(wins),
+            "losses": len(losses),
+            "total": len(trades),
+            "avg_win": sum(t["pnl"] for t in wins) / len(wins) if wins else 0,
+            "avg_loss": sum(t["pnl"] for t in losses) / len(losses) if losses else 0,
+            "pnl": total_pnl,
+        }
+
+    async def _record_trade(self, pos_obj, exit_reason: str = "manual"):
         """Record a closed position as a trade in history.
+
+        Fetches actual exit price and PnL from on-chain PositionDecrease
+        events when available, falling back to internal data if the RPC
+        call fails or no events are found.
 
         Args:
             pos_obj: Position object with id, symbol, side, entry_price, size_usd, leverage, etc.
@@ -113,15 +174,54 @@ class AnalyticsMixin:
         if pos_obj.closed_at is None:
             pos_obj.closed_at = time.time()
 
+        # Default to internal values (will be overwritten by on-chain data if available)
         exit_price = pos_obj.current_price if pos_obj.current_price > 0 else pos_obj.entry_price
+        pnl_usd = None  # set from chain if available
+
+        # Try to get actual exit data from on-chain PositionDecrease events
+        market_addr = getattr(pos_obj, 'market_addr', None)
+        if market_addr and hasattr(self, 'w3') and self.w3:
+            try:
+                acct = self._get_account(getattr(pos_obj, 'wallet_id', 1))
+                decreases = await asyncio.to_thread(
+                    fetch_recent_position_decreases,
+                    self.w3, acct.address, market_addr,
+                    pos_obj.side == "LONG",
+                    lookback_seconds=1800,  # 30-min window
+                )
+                if decreases:
+                    # Use the most recent decrease event for exit price and close time
+                    latest = max(decreases, key=lambda d: d.get("timestamp", 0))
+                    if latest.get("execution_price", 0) > 0:
+                        exit_price = latest["execution_price"]
+                    if latest.get("timestamp"):
+                        pos_obj.closed_at = latest["timestamp"]
+                    # Sum net_pnl across all decrease events (partial TPs + final close)
+                    chain_pnl = sum(d.get("net_pnl_usd", 0) for d in decreases)
+                    if decreases:
+                        pnl_usd = chain_pnl
+                        self.logger.info(
+                            f"On-chain exit data: price=${exit_price:,.2f}, "
+                            f"net_pnl=${pnl_usd:,.2f} ({len(decreases)} event(s))"
+                        )
+            except Exception as e:
+                self.logger.debug(f"On-chain exit data unavailable for {pos_obj.symbol}: {e}")
+
+        # Fall back to internal calculation if chain data unavailable
+        if pnl_usd is None:
+            if pos_obj.unrealized_pnl is not None and pos_obj.unrealized_pnl != 0.0:
+                pnl_usd = pos_obj.unrealized_pnl
+            else:
+                pnl_usd = calculate_unrealized_pnl(
+                    pos_obj.side,
+                    pos_obj.entry_price,
+                    exit_price,
+                    pos_obj.size_usd,
+                )
+
         duration = pos_obj.duration_hours
-        unrealized_pnl = pos_obj.unrealized_pnl or calculate_unrealized_pnl(
-            pos_obj.side,
-            pos_obj.entry_price,
-            exit_price,
-            pos_obj.size_usd,
-        )
-        pnl_pct = calculate_pnl_percentage(unrealized_pnl, pos_obj.size_usd, pos_obj.leverage)
+        full_size = pos_obj.original_size_usd if pos_obj.original_size_usd > 0 else pos_obj.size_usd
+        pnl_pct = calculate_pnl_percentage(pnl_usd, full_size, pos_obj.leverage)
 
         trade = TradeRecord(
             id=pos_obj.id,
@@ -132,7 +232,7 @@ class AnalyticsMixin:
             size_usd=pos_obj.size_usd,
             leverage=pos_obj.leverage,
             duration_hours=duration,
-            pnl_usd=unrealized_pnl,
+            pnl_usd=pnl_usd,
             pnl_percentage=pnl_pct,
             exit_reason=exit_reason,
             opened_at=pos_obj.opened_at,
@@ -147,27 +247,28 @@ class AnalyticsMixin:
         )
 
     def _save_trade_history(self):
-        """Persist trade history to disk as JSON."""
+        """Persist trade history to disk as JSON (atomic write with backup)."""
         try:
             data = [asdict(t) for t in self.trade_history]
-            with open(TRADE_HISTORY_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            atomic_json_write(TRADE_HISTORY_FILE, data)
         except Exception as e:
             logger.warning(f"Failed to save trade history: {e}")
 
     def _load_trade_history(self):
-        """Load trade history from disk on startup."""
-        if not os.path.exists(TRADE_HISTORY_FILE):
-            return
-        try:
-            with open(TRADE_HISTORY_FILE, "r") as f:
-                data = json.load(f)
-            self.trade_history = [
-                TradeRecord(**record) for record in data
-            ]
+        """Load trade history from disk on startup (with .bak fallback)."""
+        data = safe_json_read(TRADE_HISTORY_FILE, default=[])
+        if data:
+            self.trade_history = []
+            skipped = 0
+            for record in data:
+                try:
+                    self.trade_history.append(TradeRecord(**record))
+                except Exception as e:
+                    skipped += 1
+                    logger.warning(f"Skipping corrupt trade record: {e}")
+            if skipped:
+                logger.warning(f"Skipped {skipped} corrupt trade record(s)")
             logger.info(f"Loaded {len(self.trade_history)} trade(s) from {TRADE_HISTORY_FILE}")
-        except Exception as e:
-            logger.warning(f"Failed to load trade history: {e}")
 
     def get_health_report(self) -> Dict[str, Any]:
         """Get bot health status.
@@ -212,7 +313,7 @@ class AnalyticsMixin:
             /winrate BTC — BTC only
             /winrate BTC 20 — last 20 BTC trades
         """
-        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
         market_to_sym = {}
         for sym, addr in self.cfg.markets.items():
             if sym in PNL_SYMBOLS:
@@ -274,20 +375,13 @@ class AnalyticsMixin:
     # ── On-chain trade local storage ──
 
     def _load_onchain_trades(self) -> List[Dict[str, Any]]:
-        """Load locally-stored on-chain trades."""
-        if not os.path.exists(ONCHAIN_TRADES_FILE):
-            return []
-        try:
-            with open(ONCHAIN_TRADES_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, ValueError):
-            return []
+        """Load locally-stored on-chain trades (with .bak fallback)."""
+        return safe_json_read(ONCHAIN_TRADES_FILE, default=[])
 
     def _save_onchain_trades(self, trades: List[Dict[str, Any]]):
-        """Persist on-chain trades to disk."""
+        """Persist on-chain trades to disk (atomic write with backup)."""
         try:
-            with open(ONCHAIN_TRADES_FILE, "w") as f:
-                json.dump(trades, f, indent=2)
+            atomic_json_write(ONCHAIN_TRADES_FILE, trades)
         except Exception as e:
             logger.warning(f"Failed to save onchain trades: {e}")
 
@@ -350,7 +444,7 @@ class AnalyticsMixin:
           - Today: realized + unrealized + combined total
           - 30 Days / All Time: realized with win rate
         """
-        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -489,7 +583,7 @@ class AnalyticsMixin:
         await self.send_message(chat_id, "Fetching on-chain trades & generating PDF...")
 
         # Build market_address → symbol map
-        PNL_SYMBOLS = {"BTC", "SOL", "ETH"}
+        PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
         market_to_sym = {}
         for sym, addr in self.cfg.markets.items():
             if sym in PNL_SYMBOLS:
@@ -533,7 +627,7 @@ class AnalyticsMixin:
             key = f"{tx}:{li}" if tx else ""
             sym = market_to_sym.get((t.get("market_address") or "").lower(), "???")
             side = "LONG" if t.get("is_long") else "SHORT"
-            pnl = t.get("pnl_usd", 0.0)
+            pnl = t.get("net_pnl_usd", t.get("pnl_usd", 0.0))
             unified.append({
                 "symbol": sym,
                 "side": side,

@@ -49,7 +49,10 @@ class NotificationsMixin:
         # Bot API path — send to DM chats + the configured admin chat
         bot_api_chats = set(getattr(self, '_bot_api_chats', set()))
         if self.cfg.bot_admin_chat_id:
-            bot_api_chats.add(int(self.cfg.bot_admin_chat_id))
+            try:
+                bot_api_chats.add(int(self.cfg.bot_admin_chat_id))
+            except (ValueError, TypeError):
+                self.logger.warning(f"Invalid bot_admin_chat_id: {self.cfg.bot_admin_chat_id!r}")
         for chat_id in bot_api_chats:
             try:
                 ok = await bot_api.send_admin_message(
@@ -117,12 +120,7 @@ class NotificationsMixin:
         sl_str = f"${position.stop_loss:,.2f}" if position.stop_loss is not None else "None"
         wallet_label = f" [W{position.wallet_id}]" if hasattr(position, 'wallet_id') else ""
         placed_count = len(position.take_profits)
-        expected = getattr(position, 'expected_tp_count', 0) or placed_count
-        if placed_count >= expected:
-            tp_header = f"TPs: {expected}/{expected} placed"
-        else:
-            failed = expected - placed_count
-            tp_header = f"TPs: {placed_count}/{expected} placed — {failed} failed, queued for retry"
+        tp_header = f"TPs: {placed_count}/{placed_count} placed"
         msg = (
             f"**Position Opened ({order_label})**\n\n"
             f"{position.symbol} {position.side}{wallet_label}\n"

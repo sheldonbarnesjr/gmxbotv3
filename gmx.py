@@ -23,7 +23,6 @@ import hashlib
 import logging
 import statistics
 import traceback
-from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -43,6 +42,8 @@ from eth_account import Account
 # IMPORT CONFIG MODULE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 from config import load_config, Config, ALLOWED_SYMBOLS, CHAINLINK_FEEDS, CHAINLINK_ABI
+from state_io import atomic_json_write, safe_json_read
+from signal_store import SignalStore
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # IMPORT RISK FUNCTIONS
@@ -90,7 +91,6 @@ from open import (  # type: ignore[assignment]  # noqa: A004
     create_sl_order,
     create_tp_order,
     fetch_current_price,
-    fetch_price_touched_in_window,
     cancel_orders_for_market,
     cancel_all_orders,
     fetch_open_orders,
@@ -121,9 +121,6 @@ from close import (
 class TakeProfitLevel:
     price: float
     percentage: float
-    executed: bool = False
-    executed_at: Optional[float] = None
-    realized_pnl_usd: Optional[float] = None  # actual PnL from on-chain event
 
 
 @dataclass
@@ -169,22 +166,31 @@ class Position:
     tp_tx_hashes: List[str] = field(default_factory=list)
     sl_tx_hash: Optional[str] = None
     exit_reason: Optional[str] = None
+    signal_id: Optional[str] = None  # links back to SignalStore entry
+    order_history: list = field(default_factory=list)  # chronological order events
 
     # Which wallet this position belongs to (1=swing, 2-4=scalp)
     wallet_id: int = 1
 
     # On-chain tracking for TP-hit → move SL
     market_addr: Optional[str] = None
+    collateral_token: Optional[str] = None  # on-chain collateral token address (for Reader PnL queries)
     sl_moved_to_entry: bool = False
     sl_move_label: Optional[str] = None  # e.g. "Entry", "TP1", "TP2" — where the SL was moved to
     sl_move_failed: bool = False  # True if a move_sl attempt failed — SL may be at wrong price
-    tp_hits_count: int = 0  # how many TPs have been hit so far
-    last_known_tp_count: int = 0  # track how many TP orders remain on-chain
     pending_fill: bool = False  # True if placed as limit order and not yet filled on-chain
     pending_fill_since: Optional[float] = None  # timestamp when limit order was placed
     current_sl_key: Optional[str] = None  # hex key of the SL order we placed (to avoid cancelling it accidentally)
     original_size_usd: float = 0.0  # position size at open (before any partial TP closes)
-    expected_tp_count: int = 0  # count of TPs from the parsed signal (before placement)
+    processed_tx_hashes: set = field(default_factory=set)  # dedup PositionDecrease events by tx_hash:log_index
+    # Verified PositionDecrease events — single source of truth for TP hits
+    # Each dict: {execution_price, net_pnl_usd, timestamp, tx_hash, log_index, size_delta_usd, matched_tp_price}
+    verified_decreases: list = field(default_factory=list)
+
+    @property
+    def tp_hits_count(self) -> int:
+        """Derived from verified on-chain PositionDecrease events."""
+        return len(self.verified_decreases)
 
     @property
     def short_id(self) -> str:
@@ -246,6 +252,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Retry queue for failed TP/SL order placements
         self.failed_order_queue: List[FailedOrder] = []
 
+        # Signal store — persistent archive of all parsed signals
+        self.signal_store = SignalStore()
+
         # Concurrency: prevent duplicate signal execution
         self._signal_lock = asyncio.Lock()
         self._recent_signal_hashes: Dict[str, float] = {}  # hash -> timestamp
@@ -269,7 +278,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.tp_monitor_task: Optional[asyncio.Task] = None
         self.daily_summary_task: Optional[asyncio.Task] = None
         self.rebalance_task: Optional[asyncio.Task] = None
-        self.reconcile_task: Optional[asyncio.Task] = None
         self.order_retry_task: Optional[asyncio.Task] = None
         self.resolved_channels: Dict[int, str] = {}  # channel_id -> channel_name
 
@@ -281,10 +289,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Cooldown: after order placement, skip TP monitoring & reconciliation
         # to prevent false TP-hit detection from manual order changes.
         self._orders_cooldown_until: float = 0.0
-
-        # 2-cycle confirmation: track TPs missing from on-chain across reconcile cycles.
-        # Key = "pos_id:tp_price", value = miss count. Only mark executed after 2 misses.
-        self._reconcile_missing_tps: dict = {}
 
         # 2-check guard: track positions missing from on-chain across check cycles.
         # Key = pos_id, value = consecutive miss count. Only close after 2 misses.
@@ -306,9 +310,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     def _set_orders_cooldown(self, seconds: float = 30.0):
         """Set a cooldown period after order placement.
 
-        During cooldown, check_tp_hits and reconcile_positions skip
-        all positions to avoid interpreting manual order changes as
-        TP hits or duplicates.
+        During cooldown, check_tp_hits skips all positions to avoid
+        interpreting manual order changes as TP hits.
         """
         self._orders_cooldown_until = time.time() + seconds
         self.logger.info(f"Orders cooldown set for {seconds:.0f}s")
@@ -343,47 +346,54 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             if not pos.is_open or not pos.market_addr:
                 continue
             key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
-            executed_indices = [
-                i for i, tp in enumerate(pos.take_profits) if tp.executed
-            ]
 
             # Preserve original TPs from first save — never overwrite
             existing_entry = existing_state.get(key, {})
             preserved_original_tps = existing_entry.get("original_take_profits")
 
+            # Sanitize original_take_profits to heal corrupted state.
+            # If preserved list is corrupted (has price<=0 entries or more entries
+            # than expected), discard it and use current pos.take_profits instead.
+            current_tps = [
+                {"price": tp.price, "close_pct": tp.percentage}
+                for tp in pos.take_profits if tp.price > 0
+            ]
+            if preserved_original_tps:
+                cleaned = [tp for tp in preserved_original_tps if tp.get("price", 0) > 0]
+                if len(pos.take_profits) > 0 and len(cleaned) > len(pos.take_profits):
+                    # Corrupted — too many entries, discard preserved and use current
+                    sanitized_tps = current_tps
+                else:
+                    sanitized_tps = cleaned if cleaned else current_tps
+            else:
+                sanitized_tps = current_tps
+
             state[key] = {
                 "realized_pnl": pos.realized_pnl,
-                "tp_hits_count": pos.tp_hits_count,
                 "original_size_usd": pos.original_size_usd or pos.size_usd,
-                "executed_tp_indices": executed_indices,
+                "expected_tp_count": len(pos.take_profits),
                 "sl_move_label": pos.sl_move_label,
                 "sl_moved_to_entry": pos.sl_moved_to_entry,
-                "expected_tp_count": pos.expected_tp_count,
                 "opened_at": pos.opened_at,
-                "original_take_profits": preserved_original_tps if preserved_original_tps else [
-                    {"price": tp.price, "close_pct": tp.percentage}
-                    for tp in pos.take_profits
-                ],
+                "original_take_profits": sanitized_tps,
                 "entry_price": pos.entry_price,
                 "stop_loss": pos.stop_loss,
                 "leverage": pos.leverage,
+                "processed_tx_hashes": list(pos.processed_tx_hashes),
+                "verified_decreases": pos.verified_decreases,
+                "signal_id": pos.signal_id,
+                "tp_tx_hashes": list(pos.tp_tx_hashes),
+                "sl_tx_hash": pos.sl_tx_hash,
+                "order_history": pos.order_history,
             }
         try:
-            with open(self.POSITION_STATE_FILE, "w") as f:
-                json.dump(state, f, indent=2)
+            atomic_json_write(self.POSITION_STATE_FILE, state)
         except Exception as e:
             self.logger.warning(f"Failed to save position state: {e}")
 
     def _load_position_state(self) -> dict:
         """Load persisted position state from disk. Returns dict keyed by composite key."""
-        if not os.path.exists(self.POSITION_STATE_FILE):
-            return {}
-        try:
-            with open(self.POSITION_STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger.warning(f"Failed to load position state: {e}")
-            return {}
+        return safe_json_read(self.POSITION_STATE_FILE, default={})
 
     def _clear_position_state(self, pos):
         """Remove a closed position's entry from the state file."""
@@ -391,15 +401,56 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             return
         key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
         try:
-            if os.path.exists(self.POSITION_STATE_FILE):
-                with open(self.POSITION_STATE_FILE, "r") as f:
-                    state = json.load(f)
-                if key in state:
-                    del state[key]
-                    with open(self.POSITION_STATE_FILE, "w") as f:
-                        json.dump(state, f, indent=2)
+            state = safe_json_read(self.POSITION_STATE_FILE, default={})
+            if key in state:
+                del state[key]
+                atomic_json_write(self.POSITION_STATE_FILE, state)
         except Exception as e:
             self.logger.warning(f"Failed to clear position state: {e}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Failed order queue persistence
+    # ──────────────────────────────────────────────────────────────────────
+    FAILED_ORDERS_FILE = "failed_orders.json"
+
+    def _save_failed_orders(self):
+        """Persist the failed order queue to disk (atomic write)."""
+        from dataclasses import asdict
+        data = []
+        for order in self.failed_order_queue:
+            d = {
+                "position_id": order.position_id,
+                "symbol": order.symbol,
+                "side": order.side,
+                "market_addr": order.market_addr,
+                "wallet_id": order.wallet_id,
+                "order_kind": order.order_kind,
+                "price": order.price,
+                "size_usd": order.size_usd,
+                "close_pct": order.close_pct,
+                "is_long": order.is_long,
+                "attempts": order.attempts,
+                "max_attempts": order.max_attempts,
+                "last_attempt": order.last_attempt,
+                "error": order.error,
+                "created_at": order.created_at,
+            }
+            data.append(d)
+        try:
+            atomic_json_write(self.FAILED_ORDERS_FILE, data)
+        except Exception as e:
+            self.logger.warning(f"Failed to save failed orders: {e}")
+
+    def _load_failed_orders(self) -> List[FailedOrder]:
+        """Load failed orders from disk on startup."""
+        data = safe_json_read(self.FAILED_ORDERS_FILE, default=[])
+        orders = []
+        for d in data:
+            try:
+                orders.append(FailedOrder(**d))
+            except Exception as e:
+                self.logger.warning(f"Skipping corrupt failed order entry: {e}")
+        return orders
 
     # ──────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -416,12 +467,48 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # skip_sl_check=True: SL is already correct on-chain, don't infer & move
         await self._sync_on_chain_positions(skip_sl_check=True)
 
+        # Load persisted failed orders for retry
+        self.failed_order_queue = self._load_failed_orders()
+        if self.failed_order_queue:
+            self.logger.info(f"Loaded {len(self.failed_order_queue)} failed orders from disk for retry")
+
+        # Startup TP catch-up: extended lookback to catch events missed while offline
+        try:
+            await self.check_tp_hits(lookback_override=3600)  # 1 hour
+            self.logger.info("Startup TP catch-up check completed")
+        except Exception as e:
+            self.logger.warning(f"Startup TP catch-up failed: {e}")
+
+        # Verify SL orders exist for all synced positions
+        for pos in list(self.positions.values()):
+            if not pos.is_open or not pos.market_addr or not pos.stop_loss:
+                continue
+            try:
+                acct = self._get_account(pos.wallet_id)
+                orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
+                market_lower = pos.market_addr.lower()
+                sl_orders = [
+                    o for o in orders
+                    if o["market"].lower() == market_lower
+                    and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                ]
+                if not sl_orders:
+                    self.logger.warning(
+                        f"STARTUP: {pos.symbol} {pos.side} [W{pos.wallet_id}] has no on-chain SL "
+                        f"(expected @ ${pos.stop_loss:,.0f})"
+                    )
+                    await self.notify(
+                        f"⚠️ WARNING: {pos.symbol} {pos.side} [W{pos.wallet_id}] has no SL on-chain! "
+                        f"Expected SL @ ${pos.stop_loss:,.0f}. Use /sl to place one."
+                    )
+            except Exception as e:
+                self.logger.warning(f"SL verification failed for {pos.symbol}: {e}")
+
         self.price_update_task = asyncio.create_task(self.price_update_loop())
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         self.tp_monitor_task = asyncio.create_task(self.tp_monitor_loop())
         self.daily_summary_task = asyncio.create_task(self.daily_summary_loop())
         self.rebalance_task = asyncio.create_task(self.rebalance_loop())
-        self.reconcile_task = asyncio.create_task(self.reconcile_loop())
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
         self.hourly_pnl_task = asyncio.create_task(self.hourly_pnl_loop())
@@ -468,10 +555,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.daily_summary_task.cancel()
         if self.rebalance_task:
             self.rebalance_task.cancel()
-        if self.reconcile_task:
-            self.reconcile_task.cancel()
         if self.order_retry_task:
             self.order_retry_task.cancel()
+        if getattr(self, 'gas_check_task', None):
+            self.gas_check_task.cancel()
+        if getattr(self, 'hourly_pnl_task', None):
+            self.hourly_pnl_task.cancel()
         if self.bot_polling_task:
             self.bot_polling_task.cancel()
 
@@ -605,8 +694,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     unrealized_pnl=cp.unrealized_pnl,
                     stop_loss=reconstructed_sl,
                     market_addr=cp.market,
+                    collateral_token=cp.collateral_token,
                     wallet_id=wid,
-                    last_known_tp_count=tp_count,
                     take_profits=take_profits,
                 )
 
@@ -617,7 +706,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 # Restore basic fields from hint
                 if saved:
                     pos.original_size_usd = saved.get("original_size_usd", pos.size_usd)
-                    pos.expected_tp_count = saved.get("expected_tp_count", 0)
+                    pos.processed_tx_hashes = set(saved.get("processed_tx_hashes", []))
+                    pos.verified_decreases = saved.get("verified_decreases", [])
                     if saved.get("opened_at"):
                         pos.opened_at = saved["opened_at"]
                     else:
@@ -627,19 +717,41 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         pos.entry_price = saved["entry_price"]
                     if saved.get("leverage"):
                         pos.leverage = saved["leverage"]
+                    # Restore signal & order linkage fields
+                    pos.signal_id = saved.get("signal_id")
+                    pos.tp_tx_hashes = saved.get("tp_tx_hashes", [])
+                    pos.sl_tx_hash = saved.get("sl_tx_hash")
+                    pos.order_history = saved.get("order_history", [])
 
                 # ── Path A: Original signal TPs available → ground truth ──
                 original_tps = saved.get("original_take_profits") if saved else None
                 reconstructed = False
 
                 if original_tps:
+                    # Filter out corrupted entries (price=0 or negative)
+                    valid_tps = [tp for tp in original_tps if tp.get("price", 0) > 0]
+                    saved_expected = saved.get("expected_tp_count", 0) if saved else 0
+
+                    # If saved list has more entries than expected, state is corrupted
+                    # (orphaned TPs were prepended before being saved) — discard and
+                    # fall through to Path B which rebuilds from on-chain data.
+                    if saved_expected > 0 and len(valid_tps) > saved_expected:
+                        self.logger.warning(
+                            f"Sync: {symbol} {side} [W{wid}] original_take_profits has "
+                            f"{len(valid_tps)} entries but expected_tp_count={saved_expected} "
+                            f"— discarding corrupted state, falling through to Path B"
+                        )
+                        original_tps = None
+
+                if original_tps:
+                    valid_tps = [tp for tp in original_tps if tp.get("price", 0) > 0]
                     # Rebuild full TP list from signal data
                     signal_tps = [
                         TakeProfitLevel(price=tp["price"], percentage=tp["close_pct"])
-                        for tp in original_tps
+                        for tp in valid_tps
                     ]
                     pos.take_profits = signal_tps
-                    pos.expected_tp_count = len(signal_tps)
+                    # expected_tp_count removed — derive from len(take_profits)
 
                     # Build set of on-chain TP prices (still pending)
                     on_chain_tp_prices = set()
@@ -677,6 +789,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                     # Match each missing TP to a PositionDecrease event
                     used_events = set()
+                    verified_decrease_list = []
                     for idx, stp in missing_from_chain:
                         event_match = None
                         for j, evt in enumerate(decreases):
@@ -690,43 +803,47 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                                     break
 
                         if event_match:
-                            stp.executed = True
-                            stp.executed_at = event_match.get("timestamp", pos.opened_at)
-                            stp.realized_pnl_usd = event_match.get("net_pnl_usd")
-                            verified_hits += 1
+                            verified_decrease_list.append({
+                                "execution_price": event_match.get("execution_price", 0),
+                                "net_pnl_usd": event_match.get("net_pnl_usd", 0),
+                                "timestamp": event_match.get("timestamp", pos.opened_at),
+                                "tx_hash": event_match.get("tx_hash", ""),
+                                "log_index": event_match.get("log_index", 0),
+                                "size_delta_usd": event_match.get("size_delta_usd", 0),
+                                "matched_tp_price": stp.price,
+                            })
                             total_realized += event_match.get("net_pnl_usd", 0)
                         else:
-                            # TP is not on-chain AND no event found → NOT a verified hit
                             self.logger.debug(
                                 f"Sync: {symbol} TP ${stp.price:,.2f} missing from chain "
                                 f"but no PositionDecrease event found — not marking as hit"
                             )
 
-                    pos.tp_hits_count = verified_hits
+                    pos.verified_decreases = verified_decrease_list
                     pos.realized_pnl = total_realized
                     pos.original_size_usd = (
                         cp.size_usd + sum(
-                            e.get("size_delta_usd", 0) for j, e in enumerate(decreases)
-                            if j in used_events
+                            d["size_delta_usd"] for d in verified_decrease_list
                         )
                     )
 
                     # Derive SL state from on-chain SL price
+                    verified_tp_prices = {d["matched_tp_price"] for d in verified_decrease_list}
                     if reconstructed_sl and cp.entry_price:
                         entry = cp.entry_price
                         if entry > 0 and abs(reconstructed_sl - entry) / entry < 0.005:
                             pos.sl_moved_to_entry = True
                             pos.sl_move_label = "Entry"
                         else:
-                            for stp in signal_tps:
-                                if stp.executed and stp.price > 0:
+                            for i, stp in enumerate(signal_tps):
+                                if stp.price in verified_tp_prices and stp.price > 0:
                                     if abs(reconstructed_sl - stp.price) / stp.price < 0.005:
-                                        tp_idx = signal_tps.index(stp) + 1
-                                        pos.sl_move_label = f"TP{tp_idx}"
+                                        pos.sl_move_label = f"TP{i + 1}"
                                         pos.sl_moved_to_entry = True
                                         break
 
                     reconstructed = True
+                    verified_hits = len(verified_decrease_list)
                     self.logger.info(
                         f"Sync: {symbol} {side} [W{wid}] cross-checked with signal: "
                         f"{len(signal_tps)} TPs, {verified_hits} verified hit(s), "
@@ -766,9 +883,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         if not matched:
                             missing_tps_b.append((i, tp_lvl))
 
-                    verified_hits_b = 0
                     total_realized_b = 0.0
                     used_events_b = set()
+                    verified_decrease_list_b = []
 
                     # Step 2: Verify missing TPs against decrease events
                     for idx, tp_lvl in missing_tps_b:
@@ -778,154 +895,59 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                             exec_price = evt.get("execution_price", 0)
                             if exec_price and tp_lvl.price > 0:
                                 if abs(exec_price - tp_lvl.price) / tp_lvl.price < 0.01:
-                                    tp_lvl.executed = True
-                                    tp_lvl.executed_at = evt.get("timestamp", pos.opened_at)
-                                    tp_lvl.realized_pnl_usd = evt.get("net_pnl_usd")
-                                    verified_hits_b += 1
+                                    verified_decrease_list_b.append({
+                                        "execution_price": exec_price,
+                                        "net_pnl_usd": evt.get("net_pnl_usd", 0),
+                                        "timestamp": evt.get("timestamp", pos.opened_at),
+                                        "tx_hash": evt.get("tx_hash", ""),
+                                        "log_index": evt.get("log_index", 0),
+                                        "size_delta_usd": evt.get("size_delta_usd", 0),
+                                        "matched_tp_price": tp_lvl.price,
+                                    })
                                     total_realized_b += evt.get("net_pnl_usd", 0)
                                     used_events_b.add(j)
                                     break
 
-                    # Step 3: Detect orphaned decrease events — historical TP hits
-                    # whose on-chain orders were consumed by the keeper.
-                    # Conservative: only look if we know expected TP count and some are missing.
-                    expected = pos.expected_tp_count or saved.get("expected_tp_count", 0)
-                    on_chain_count = len(take_profits)  # currently on-chain TPs
-                    max_orphans = max(0, expected - on_chain_count) if expected else 0
+                    # Sort TPs for consistent SL target resolution
+                    if side == "LONG":
+                        pos.take_profits.sort(key=lambda t: t.price)
+                    else:
+                        pos.take_profits.sort(key=lambda t: t.price, reverse=True)
 
-                    orphaned_tps = []
-                    if max_orphans > 0 and cp.entry_price and cp.entry_price > 0:
-                        all_known_tp_prices = set(on_chain_tp_prices_b)
-                        for tp_lvl in pos.take_profits:
-                            if tp_lvl.price > 0:
-                                all_known_tp_prices.add(round(tp_lvl.price, 2))
-
-                        for j, evt in enumerate(decreases_b):
-                            if len(orphaned_tps) >= max_orphans:
-                                break
-                            if j in used_events_b:
-                                continue
-                            exec_price = evt.get("execution_price", 0)
-                            if not exec_price or exec_price <= 0:
-                                continue
-                            # Must be after position opened
-                            evt_ts = evt.get("timestamp", 0)
-                            if evt_ts and evt_ts < pos.opened_at:
-                                continue
-                            # Must be in valid TP direction (SHORT: below entry, LONG: above)
-                            if side == "SHORT" and exec_price >= cp.entry_price:
-                                continue
-                            if side == "LONG" and exec_price <= cp.entry_price:
-                                continue
-                            # Must not match any known TP price
-                            matches_known = any(
-                                abs(exec_price - ktp) / ktp < 0.01
-                                for ktp in all_known_tp_prices
-                                if ktp > 0
-                            )
-                            if matches_known:
-                                continue
-                            # Passed all filters — this is likely a consumed TP
-                            size_delta = evt.get("size_delta_usd", 0)
-                            pct = size_delta / pos.original_size_usd if pos.original_size_usd > 0 else 0
-                            orphan_tp = TakeProfitLevel(
-                                price=exec_price,
-                                percentage=pct,
-                                executed=True,
-                                executed_at=evt_ts or pos.opened_at,
-                                realized_pnl_usd=evt.get("net_pnl_usd"),
-                            )
-                            orphaned_tps.append(orphan_tp)
-                            verified_hits_b += 1
-                            total_realized_b += evt.get("net_pnl_usd", 0)
-                            used_events_b.add(j)
-                            self.logger.info(
-                                f"Sync Path B: {symbol} {side} [W{wid}] found orphaned TP hit "
-                                f"@ ${exec_price:,.2f}, pnl=${evt.get('net_pnl_usd', 0):,.2f}"
-                            )
-
-                    # Prepend orphaned TPs so they appear before on-chain TPs
-                    if orphaned_tps:
-                        if side == "LONG":
-                            orphaned_tps.sort(key=lambda t: t.price)
-                        else:
-                            orphaned_tps.sort(key=lambda t: t.price, reverse=True)
-                        pos.take_profits = orphaned_tps + pos.take_profits
-
-                    pos.tp_hits_count = verified_hits_b
+                    pos.verified_decreases = verified_decrease_list_b
                     pos.realized_pnl = total_realized_b
 
                     # Derive SL state from on-chain SL price + verified hits
+                    verified_tp_prices_b = {d["matched_tp_price"] for d in verified_decrease_list_b}
+                    verified_hits_b = len(verified_decrease_list_b)
                     if reconstructed_sl and cp.entry_price and verified_hits_b > 0:
                         entry = cp.entry_price
                         if entry > 0 and abs(reconstructed_sl - entry) / entry < 0.005:
                             pos.sl_moved_to_entry = True
                             pos.sl_move_label = "Entry"
                         else:
-                            # Check if SL matches any executed TP price
                             for i, tp_lvl in enumerate(pos.take_profits):
-                                if tp_lvl.executed and tp_lvl.price > 0:
+                                if tp_lvl.price in verified_tp_prices_b and tp_lvl.price > 0:
                                     if abs(reconstructed_sl - tp_lvl.price) / tp_lvl.price < 0.005:
                                         pos.sl_move_label = f"TP{i + 1}"
                                         pos.sl_moved_to_entry = True
                                         break
                     elif saved.get("sl_move_label") and verified_hits_b > 0:
-                        # Fall back to saved hint only if hits are verified
                         pos.sl_move_label = saved["sl_move_label"]
                         pos.sl_moved_to_entry = saved.get("sl_moved_to_entry", False)
 
                     self.logger.info(
                         f"Sync: {symbol} {side} [W{wid}] Path B event-verified: "
                         f"tp_hits={pos.tp_hits_count}, realized=${pos.realized_pnl:,.2f}"
-                        + (f", {len(orphaned_tps)} orphaned TP(s) recovered" if orphaned_tps else "")
                     )
 
-                # ── Ground truth: reconcile tp_hits with on-chain reality ──
-                # Invariant 1: tp_hits_count must equal sum(executed flags)
-                actual_executed = sum(1 for tp in pos.take_profits if tp.executed)
-                if pos.tp_hits_count != actual_executed:
+                # Sanity: cap verified_decreases to total TPs
+                if pos.tp_hits_count > len(pos.take_profits) and pos.take_profits:
                     self.logger.warning(
-                        f"Sync: {symbol} {side} [W{wid}] tp_hits_count={pos.tp_hits_count} "
-                        f"disagrees with executed flags={actual_executed} — correcting"
+                        f"Sync: {symbol} {side} [W{wid}] verified_decreases={pos.tp_hits_count} "
+                        f"> total TPs={len(pos.take_profits)} — trimming"
                     )
-                    pos.tp_hits_count = actual_executed
-
-                # Invariant 2: if all non-executed TPs are on-chain, no additional
-                # hits should exist beyond event-verified ones (orphaned TPs are valid)
-                non_executed_tps = sum(1 for tp in pos.take_profits if not tp.executed)
-                event_verified_hits = sum(1 for tp in pos.take_profits if tp.executed)
-                if tp_count >= non_executed_tps and non_executed_tps > 0:
-                    # All pending TPs are on-chain — only event-verified hits are valid
-                    if pos.tp_hits_count > event_verified_hits:
-                        self.logger.warning(
-                            f"Sync: {symbol} {side} [W{wid}] all {non_executed_tps} pending TPs "
-                            f"on-chain but tp_hits_count={pos.tp_hits_count} > verified={event_verified_hits} "
-                            f"— correcting to {event_verified_hits}"
-                        )
-                        pos.tp_hits_count = event_verified_hits
-                elif tp_count == 0 and len(pos.take_profits) > 0 and event_verified_hits == 0:
-                    # No TPs on-chain and no event-verified hits — suspicious, reset
-                    if pos.tp_hits_count > 0:
-                        self.logger.warning(
-                            f"Sync: {symbol} {side} [W{wid}] no TPs on-chain, "
-                            f"no event-verified hits but tp_hits_count={pos.tp_hits_count} — resetting to 0"
-                        )
-                        pos.tp_hits_count = 0
-                        pos.realized_pnl = 0.0
-                        pos.sl_move_label = None
-                        pos.sl_moved_to_entry = False
-                        for tp in pos.take_profits:
-                            tp.executed = False
-                            tp.executed_at = None
-                            tp.realized_pnl_usd = None
-
-                # Invariant 3: cannot have more hits than total TPs
-                if pos.tp_hits_count > len(pos.take_profits):
-                    self.logger.warning(
-                        f"Sync: {symbol} {side} [W{wid}] tp_hits_count={pos.tp_hits_count} "
-                        f"> total TPs={len(pos.take_profits)} — capping"
-                    )
-                    pos.tp_hits_count = len(pos.take_profits)
+                    pos.verified_decreases = pos.verified_decreases[:len(pos.take_profits)]
 
                 self.positions[pos.id] = pos
                 synced += 1
@@ -952,7 +974,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 pos.is_open = False
                 pos.closed_at = time.time()
                 pos.exit_reason = "closed_while_offline"
-                self._record_trade(pos, exit_reason="closed_while_offline")
+                await self._record_trade(pos, exit_reason="closed_while_offline")
                 self._clear_position_state(pos)
                 stale_count += 1
 
@@ -1054,383 +1076,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 )
 
     # ──────────────────────────────────────────────────────────────────────
-    # Periodic On-Chain Reconciliation
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def reconcile_loop(self):
-        """Background loop that runs reconcile_positions every 60 seconds."""
-        while True:
-            try:
-                await asyncio.sleep(60)
-                await self.reconcile_positions()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Reconcile loop error: {e}")
-
-    async def reconcile_positions(self):
-        """Periodic on-chain reconciliation.
-
-        For each tracked open position, fetches current on-chain orders
-        and corrects internal state:
-          1. Reconstructs/updates stop_loss price from on-chain SL orders
-          2. Cancels duplicate SL orders (keeps newest)
-          3. Cancels duplicate TP orders at the same price
-          4. Infers tp_hits_count from TPs no longer on-chain
-          5. Keeps last_known_tp_count accurate
-          6. Reconstructs sl_moved_to_entry state
-        """
-        # Skip during cooldown (e.g. after manual order changes or sync)
-        if self._in_orders_cooldown():
-            self.logger.debug("Reconcile skipped: orders cooldown active")
-            return
-
-        corrections = []
-
-        open_positions = [
-            pos for pos in self.positions.values()
-            if pos.is_open and not pos.pending_fill and pos.market_addr
-        ]
-        if not open_positions:
-            return
-
-        # Fetch on-chain data once per wallet to minimize RPC calls
-        wallet_data: Dict[int, tuple] = {}
-        for pos in open_positions:
-            wid = pos.wallet_id
-            if wid in wallet_data:
-                continue
-            try:
-                acct = self._get_account(wid)
-                chain_orders = await asyncio.to_thread(
-                    fetch_open_orders, self.w3, acct.address
-                )
-                wallet_data[wid] = chain_orders
-            except Exception as e:
-                self.logger.warning(f"Reconcile: failed to fetch W{wid} orders: {e}")
-
-        for pos in open_positions:
-            if not pos.is_open:  # guard against concurrent close
-                continue
-            wid = pos.wallet_id
-            if wid not in wallet_data:
-                continue
-
-            chain_orders = wallet_data[wid]
-            market_lower = pos.market_addr.lower()
-
-            # Filter orders for THIS market + side
-            market_orders = [
-                o for o in chain_orders
-                if o["market"].lower() == market_lower
-                and o["is_long"] == (pos.side == "LONG")
-            ]
-            sl_orders = [o for o in market_orders if o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE]
-            tp_orders = [o for o in market_orders if o["order_type"] == ORDER_TYPE_LIMIT_DECREASE]
-
-            # ── 1. Reconstruct / update stop_loss from on-chain SL ──
-            if sl_orders:
-                on_chain_sl = sl_orders[-1]["trigger_price"]  # newest
-                if pos.stop_loss is None:
-                    pos.stop_loss = on_chain_sl
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"Reconstructed SL = ${on_chain_sl:,.2f}"
-                    )
-                elif pos.stop_loss and abs(on_chain_sl - pos.stop_loss) / max(pos.stop_loss, 1) > 0.001:
-                    old_sl = pos.stop_loss
-                    pos.stop_loss = on_chain_sl
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"SL updated ${old_sl:,.2f} -> ${on_chain_sl:,.2f}"
-                    )
-
-            # ── 2. Cancel duplicate SL orders (keep newest) ──
-            if len(sl_orders) > 1:
-                self.logger.warning(
-                    f"Reconcile: {pos.symbol} {pos.side} [W{wid}] has "
-                    f"{len(sl_orders)} SL orders — cancelling duplicates"
-                )
-                to_cancel = sl_orders[:-1]
-                keep = sl_orders[-1]
-
-                acct = self._get_account(wid)
-                exchange = self.w3.eth.contract(
-                    address=Web3.to_checksum_address(self.cfg.exchange_router),
-                    abi=EXCHANGE_ROUTER_ABI,
-                )
-                wallet_addr = Web3.to_checksum_address(acct.address)
-
-                cancelled_sl = 0
-                for dup_sl in to_cancel:
-                    if not dup_sl.get("key_hex"):
-                        self.logger.warning(
-                            f"Reconcile: cannot cancel duplicate SL "
-                            f"@ ${dup_sl.get('trigger_price', 0):,.2f} — missing key_hex"
-                        )
-                        continue
-                    try:
-                        key_bytes = bytes.fromhex(dup_sl["key_hex"])
-                        data = exchange.encode_abi("cancelOrder", [key_bytes])
-                        tx = _open_mod.build_tx(self.w3, wallet_addr, exchange.address, data, value=0)
-                        txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=self.cfg.dry_run)
-                        if not self.cfg.dry_run:
-                            _open_mod.wait_receipt(self.w3, txh)
-                        cancelled_sl += 1
-                        self.logger.info(
-                            f"Reconcile: cancelled duplicate SL "
-                            f"@ ${dup_sl['trigger_price']:,.2f} key={dup_sl['key_hex'][:16]}..."
-                        )
-                    except Exception as e:
-                        self.logger.warning(f"Reconcile: failed to cancel duplicate SL: {e}")
-
-                if cancelled_sl:
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"Cancelled {cancelled_sl} duplicate SL(s), "
-                        f"kept SL @ ${keep['trigger_price']:,.2f}"
-                    )
-                pos.stop_loss = keep["trigger_price"]
-
-            # ── 3. Cancel duplicate TP orders at same price ──
-            if len(tp_orders) > 1:
-                price_groups: Dict[float, list] = defaultdict(list)
-                for tp_o in tp_orders:
-                    price_groups[round(tp_o["trigger_price"], 6)].append(tp_o)
-
-                for price_key, group in price_groups.items():
-                    if len(group) <= 1:
-                        continue
-
-                    to_cancel_tps = group[:-1]
-                    acct = self._get_account(wid)
-                    exchange = self.w3.eth.contract(
-                        address=Web3.to_checksum_address(self.cfg.exchange_router),
-                        abi=EXCHANGE_ROUTER_ABI,
-                    )
-                    wallet_addr = Web3.to_checksum_address(acct.address)
-
-                    tp_cancelled = 0
-                    for dup_tp in to_cancel_tps:
-                        if not dup_tp.get("key_hex"):
-                            self.logger.warning(
-                                f"Reconcile: cannot cancel duplicate TP "
-                                f"@ ${dup_tp.get('trigger_price', 0):,.2f} — missing key_hex"
-                            )
-                            continue
-                        try:
-                            key_bytes = bytes.fromhex(dup_tp["key_hex"])
-                            data = exchange.encode_abi("cancelOrder", [key_bytes])
-                            tx = _open_mod.build_tx(self.w3, wallet_addr, exchange.address, data, value=0)
-                            txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=self.cfg.dry_run)
-                            if not self.cfg.dry_run:
-                                _open_mod.wait_receipt(self.w3, txh)
-                            tp_cancelled += 1
-                        except Exception as e:
-                            self.logger.warning(f"Reconcile: failed to cancel duplicate TP: {e}")
-
-                    if tp_cancelled:
-                        corrections.append(
-                            f"{pos.symbol} {pos.side} [W{wid}]: "
-                            f"Cancelled {tp_cancelled} duplicate TP(s) @ ${price_key:,.2f}"
-                        )
-
-            # ── 4. Infer executed TPs and correct tp_hits_count ──
-            # Only mark a TP as executed if:
-            #   a) its price is verified (current or historical), AND
-            #   b) it has been missing for 2 consecutive reconcile cycles.
-            # This prevents false positives from transient RPC glitches.
-            on_chain_tp_prices = {round(o["trigger_price"], 6) for o in tp_orders}
-            is_long = pos.side == "LONG"
-
-            try:
-                current_price = await self.get_current_price(pos.symbol)
-            except Exception:
-                current_price = pos.current_price or 0.0
-
-            newly_marked = 0
-            for tp_level in pos.take_profits:
-                if tp_level.executed:
-                    continue
-                miss_key = f"{pos.id}:{tp_level.price}"
-                if round(tp_level.price, 6) not in on_chain_tp_prices:
-                    # TP not on-chain — track consecutive misses
-                    miss_count = self._reconcile_missing_tps.get(miss_key, 0) + 1
-                    self._reconcile_missing_tps[miss_key] = miss_count
-
-                    if miss_count < 2:
-                        self.logger.info(
-                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
-                            f"not on-chain (miss {miss_count}/2) — waiting for confirmation"
-                        )
-                        continue
-
-                    # 2nd miss — verify price before marking executed
-                    price_confirmed = False
-                    if current_price and current_price > 0:
-                        price_confirmed = verify_tp_hit_by_price(
-                            is_long, tp_level.price, current_price, tolerance_pct=0.0015
-                        )
-                    if not price_confirmed:
-                        try:
-                            price_confirmed = await asyncio.to_thread(
-                                fetch_price_touched_in_window,
-                                pos.symbol, tp_level.price, is_long,
-                                self.w3, 600, 0.003,
-                            )
-                        except Exception:
-                            pass
-
-                    if price_confirmed:
-                        tp_level.executed = True
-                        tp_level.executed_at = tp_level.executed_at or time.time()
-                        newly_marked += 1
-                        self._reconcile_missing_tps.pop(miss_key, None)
-                        self.logger.info(
-                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
-                            f"not on-chain (2 cycles) — price verified, marking executed"
-                        )
-                    else:
-                        self.logger.warning(
-                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
-                            f"not on-chain (2 cycles) but price NOT verified "
-                            f"(current=${current_price:,.0f}). "
-                            f"Possible cancellation/resync — NOT marking as executed."
-                        )
-                else:
-                    # TP is on-chain — clear any miss counter
-                    self._reconcile_missing_tps.pop(miss_key, None)
-
-            actual_hits = sum(1 for tp in pos.take_profits if tp.executed)
-            if actual_hits != pos.tp_hits_count:
-                old_count = pos.tp_hits_count
-                pos.tp_hits_count = actual_hits
-                if newly_marked:
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"tp_hits_count {old_count} -> {actual_hits} "
-                        f"({newly_marked} TP(s) executed)"
-                    )
-                    # Set cooldown so check_tp_hits doesn't re-process the
-                    # same TP disappearance as a separate hit.
-                    self._set_orders_cooldown(30)
-
-            # ── 5. Keep last_known_tp_count accurate ──
-            current_tp_count = len(tp_orders)
-            if pos.last_known_tp_count != current_tp_count:
-                pos.last_known_tp_count = current_tp_count
-
-            # ── 6. Reconstruct SL move state if TPs were hit ──
-            if pos.tp_hits_count > 0 and not pos.sl_moved_to_entry:
-                if pos.stop_loss and pos.entry_price:
-                    sl_at_or_past_entry = (
-                        (pos.side == "LONG" and pos.stop_loss >= pos.entry_price * 0.998)
-                        or (pos.side == "SHORT" and pos.stop_loss <= pos.entry_price * 1.002)
-                    )
-                    if sl_at_or_past_entry:
-                        pos.sl_moved_to_entry = True
-                        pos.sl_move_label = pos.sl_move_label or "Entry"
-                        corrections.append(
-                            f"{pos.symbol} {pos.side} [W{wid}]: "
-                            f"Reconstructed sl_moved_to_entry "
-                            f"(SL ${pos.stop_loss:,.2f}, entry ${pos.entry_price:,.2f})"
-                        )
-
-            # ── 7. Move SL if TPs were hit but SL is still at original price ──
-            # This catches the scenario where a TP was executed on-chain (by a keeper)
-            # but the bot missed it — e.g. due to price bounce, restart, or the old bug.
-            # If reconciliation discovered newly executed TPs AND the SL hasn't been
-            # properly moved yet, trigger an automatic SL move now.
-            if newly_marked > 0 and pos.tp_hits_count > 0:
-                sorted_tps = sorted(
-                    pos.take_profits,
-                    key=lambda t: t.price,
-                    reverse=(pos.side == "SHORT"),
-                )
-                target_sl, target_label = determine_new_sl_target(
-                    pos.tp_hits_count, pos.entry_price, sorted_tps,
-                )
-                # None means no SL move for this TP hit count (trailing strategy)
-                if target_sl is None:
-                    continue
-
-                # Only move if current SL is NOT already at/past the target
-                should_move = False
-                if pos.stop_loss is None:
-                    should_move = True
-                elif pos.side == "LONG":
-                    should_move = pos.stop_loss < target_sl * 0.998
-                else:
-                    should_move = pos.stop_loss > target_sl * 1.002
-
-                if should_move:
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"Stale TP hit detected — moving SL to {target_label} "
-                        f"(${target_sl:,.2f})"
-                    )
-                    try:
-                        acct = self._get_account(wid)
-                        fresh_orders = await asyncio.to_thread(
-                            fetch_open_orders, self.w3, acct.address
-                        )
-                        await self.move_sl(
-                            pos, fresh_orders, target_sl, target_label
-                        )
-                        self.logger.info(
-                            f"Reconcile: moved SL for {pos.symbol} {pos.side} [W{wid}] "
-                            f"to {target_label} (${target_sl:,.2f}) after stale TP detection"
-                        )
-                    except Exception as e:
-                        self.logger.error(f"Reconcile: failed to move SL for {pos.symbol}: {e}")
-                        corrections.append(
-                            f"{pos.symbol} {pos.side} [W{wid}]: "
-                            f"FAILED to move SL: {e}"
-                        )
-
-            # ── 7b. Recover from failed SL moves ──
-            # If sl_move_failed is True and no SL exists on-chain, attempt placement.
-            if pos.sl_move_failed and not sl_orders and pos.tp_hits_count > 0:
-                sorted_tps = sorted(
-                    pos.take_profits,
-                    key=lambda t: t.price,
-                    reverse=(pos.side == "SHORT"),
-                )
-                target_sl, target_label = determine_new_sl_target(
-                    pos.tp_hits_count, pos.entry_price, sorted_tps,
-                )
-                if target_sl is not None:
-                    corrections.append(
-                        f"{pos.symbol} {pos.side} [W{wid}]: "
-                        f"No SL on-chain (sl_move_failed) — "
-                        f"attempting SL at {target_label} (${target_sl:,.2f})"
-                    )
-                    try:
-                        acct = self._get_account(wid)
-                        fresh_orders = await asyncio.to_thread(
-                            fetch_open_orders, self.w3, acct.address
-                        )
-                        await self.move_sl(
-                            pos, fresh_orders, target_sl, target_label
-                        )
-                        self.logger.info(
-                            f"Reconcile: recovered SL for {pos.symbol} {pos.side} [W{wid}] "
-                            f"at {target_label} (${target_sl:,.2f})"
-                        )
-                    except Exception as e:
-                        self.logger.error(
-                            f"Reconcile: failed to recover SL for {pos.symbol}: {e}"
-                        )
-
-        # Send batched notification if any corrections were made
-        if corrections:
-            msg = "**Reconciliation Report**\n\n"
-            for c in corrections:
-                msg += f"  {c}\n"
-            self.logger.info(f"Reconcile: {len(corrections)} correction(s) applied")
-            await self.notify(msg)
-
-    # ──────────────────────────────────────────────────────────────────────
     # Failed Order Retry Queue
     # ──────────────────────────────────────────────────────────────────────
 
@@ -1511,9 +1156,15 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.take_profits.append(
                         TakeProfitLevel(price=order.price, percentage=order.close_pct)
                     )
-                    # Don't increment last_known_tp_count here — the cooldown
-                    # prevents check_tp_hits from running, and next cycle it will
-                    # fetch the correct on-chain count automatically.
+                    pos.tp_tx_hashes.append(txh)
+                    pos.order_history.append({
+                        "order_type": "tp_retry",
+                        "tx_hash": txh,
+                        "price": order.price,
+                        "status": "placed",
+                        "timestamp": time.time(),
+                        "attempt": order.attempts,
+                    })
                     self._set_orders_cooldown(30)
                     await self.notify(
                         f"✅ Retry succeeded: {order.symbol} {order.side} [W{order.wallet_id}] "
@@ -1536,6 +1187,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     pos.stop_loss = order.price
                     pos.sl_tx_hash = txh
+                    pos.order_history.append({
+                        "order_type": "sl_retry",
+                        "tx_hash": txh,
+                        "price": order.price,
+                        "status": "placed",
+                        "timestamp": time.time(),
+                        "attempt": order.attempts,
+                    })
                     await self.notify(
                         f"✅ Retry succeeded: {order.symbol} {order.side} [W{order.wallet_id}] "
                         f"SL @ ${order.price:,.2f} placed (attempt {order.attempts})\n"
@@ -1543,18 +1202,43 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
 
                 # Success — don't re-add to queue
+                self._save_position_state()
                 continue
 
-            except Exception as e:
-                order.error = str(e)
+            except RuntimeError as e:
+                # Transaction reverted on-chain — don't retry, it will keep reverting
+                order.error = f"REVERT: {e}"
+                order.attempts = order.max_attempts  # force permanent failure
+                self.logger.error(
+                    f"Retry PERMANENT FAIL (revert): {order.order_kind.upper()} "
+                    f"@ ${order.price:,.2f} ({order.symbol}): {e}"
+                )
+                still_pending.append(order)
+            except (ConnectionError, TimeoutError, OSError) as e:
+                # Retryable network error
+                order.error = f"RPC: {e}"
                 self.logger.warning(
                     f"Retry attempt {order.attempts}/{order.max_attempts} "
-                    f"for {order.order_kind.upper()} @ ${order.price:,.2f} "
-                    f"({order.symbol}): {e}"
+                    f"(network error) for {order.order_kind.upper()} "
+                    f"@ ${order.price:,.2f} ({order.symbol}): {e}"
                 )
+                still_pending.append(order)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ["nonce too low", "replacement", "already known"]):
+                    order.error = f"NONCE: {e}"
+                    self.logger.warning(f"Nonce error on retry, will retry with fresh nonce: {e}")
+                else:
+                    order.error = str(e)
+                    self.logger.error(
+                        f"Retry attempt {order.attempts}/{order.max_attempts} "
+                        f"for {order.order_kind.upper()} @ ${order.price:,.2f} "
+                        f"({order.symbol}): {e}"
+                    )
                 still_pending.append(order)
 
         self.failed_order_queue = still_pending
+        self._save_failed_orders()
 
     async def cmd_sync(self, chat_id: int):
         """Telegram /sync command — force re-sync internal state from on-chain.
@@ -1575,18 +1259,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             await self._sync_on_chain_positions(skip_sl_check=True)
             new_count = sum(1 for p in self.positions.values() if p.is_open)
 
-            # Post-sync sanity: ensure tp_hits_count matches executed flags
-            for pos in self.positions.values():
-                if not pos.is_open:
-                    continue
-                actual_hits = sum(1 for tp in pos.take_profits if tp.executed)
-                if pos.tp_hits_count != actual_hits:
-                    self.logger.warning(
-                        f"Post-sync sanity: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
-                        f"tp_hits_count={pos.tp_hits_count} != executed={actual_hits} — correcting"
-                    )
-                    pos.tp_hits_count = actual_hits
-
             # Refresh on-chain trade history BEFORE saving state — use as cross-validation
             all_trades = []
             try:
@@ -1595,14 +1267,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             except Exception as e:
                 self.logger.warning(f"Sync: trade history refresh failed: {e}")
 
-            # Cross-validate realized PnL and tp_hits against on-chain trade history
+            # Cross-validate verified_decreases against on-chain trade history
             if all_trades:
                 for pos in self.positions.values():
                     if not pos.is_open or not pos.market_addr:
                         continue
                     market_lower = pos.market_addr.lower()
                     is_long = pos.side == "LONG"
-                    # Filter trades to this position's market, direction, and lifetime
                     pos_trades = [
                         t for t in all_trades
                         if t.get("market_address", "").lower() == market_lower
@@ -1612,20 +1283,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     trade_count = len(pos_trades)
                     trade_pnl = sum(t.get("net_pnl_usd", 0) for t in pos_trades)
 
-                    # If more TP hits than actual on-chain decreases, correct
+                    # If more verified decreases than on-chain trades, trim
                     if pos.tp_hits_count > trade_count:
                         self.logger.warning(
                             f"Trade history cross-check: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
-                            f"tp_hits={pos.tp_hits_count} but only {trade_count} on-chain decrease(s) — "
-                            f"correcting to {trade_count}"
+                            f"verified_decreases={pos.tp_hits_count} but only {trade_count} on-chain decrease(s) — "
+                            f"trimming"
                         )
-                        pos.tp_hits_count = trade_count
-                        # Clear executed flags beyond what trade history supports
-                        executed_tps = [tp for tp in pos.take_profits if tp.executed]
-                        for tp in executed_tps[trade_count:]:
-                            tp.executed = False
-                            tp.executed_at = None
-                            tp.realized_pnl_usd = None
+                        pos.verified_decreases = pos.verified_decreases[:trade_count]
 
                     # If realized PnL doesn't match on-chain trades, correct
                     if pos.tp_hits_count > 0 and abs(pos.realized_pnl - trade_pnl) > 1.0:
@@ -1857,29 +1522,33 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Re-place TPs using current on-chain size and collateral
             collateral_usd = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
             placed = 0
-            # Safety: if a TP is marked executed but was still on-chain
-            # (just cancelled above), clear the executed flag
+            # Safety: if a TP has a verified decrease but its order was still
+            # on-chain (just cancelled), remove the stale verified decrease
             on_chain_tp_prices_resync = {
                 round(o["trigger_price"], 2) for o in tp_orders
             }
-            for tp_lvl in pos.take_profits:
-                if tp_lvl.executed and tp_lvl.price > 0:
-                    still_on_chain = any(
-                        abs(tp_lvl.price - ocp) / tp_lvl.price < 0.01
-                        for ocp in on_chain_tp_prices_resync
-                    )
-                    if still_on_chain:
-                        self.logger.warning(
-                            f"Resync TPs: {pos.symbol} TP @ ${tp_lvl.price:,.2f} "
-                            f"marked executed but was on-chain — clearing flag"
-                        )
-                        tp_lvl.executed = False
-                        tp_lvl.executed_at = None
-                        tp_lvl.realized_pnl_usd = None
-            pos.tp_hits_count = sum(1 for tp in pos.take_profits if tp.executed)
+            pos.verified_decreases = [
+                d for d in pos.verified_decreases
+                if not any(
+                    abs(d.get("matched_tp_price", 0) - ocp) / ocp < 0.01
+                    for ocp in on_chain_tp_prices_resync
+                    if ocp > 0
+                )
+            ]
 
-            # Use the non-executed TPs from internal tracking
-            remaining_tps = [tp for tp in pos.take_profits if not tp.executed]
+            # Re-place TPs that are NOT verified as hit
+            verified_tp_prices_resync = {
+                d.get("matched_tp_price") for d in pos.verified_decreases
+                if d.get("matched_tp_price") is not None
+            }
+            remaining_tps = [
+                tp for tp in pos.take_profits
+                if not any(
+                    abs(tp.price - vtp) / tp.price < 0.01
+                    for vtp in verified_tp_prices_resync
+                    if tp.price > 0
+                )
+            ]
             for tp_level in remaining_tps:
                 tp_obj = TakeProfit(price=tp_level.price, close_pct=tp_level.percentage)
                 try:
@@ -1898,9 +1567,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 except Exception as e:
                     self.logger.warning(f"Resync TPs: place failed for {pos.symbol} TP @ ${tp_level.price:,.2f}: {e}")
             total_placed += placed
-
-            # Update last known TP count
-            pos.last_known_tp_count = placed
 
         if total_cancelled > 0 or total_placed > 0:
             await self.send_message(
@@ -1951,9 +1617,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self.logger.debug(f"Could not parse signal: {e}")
                 return
 
+            # Record signal in persistent store (before any filtering)
+            signal_id = self.signal_store.record_signal(signal, text)
+
             # Only trade BTC, ETH, SOL
             if signal.symbol not in ALLOWED_SYMBOLS:
                 self.logger.debug(f"Ignored signal for {signal.symbol} — not in allowed pairs (BTC/ETH/SOL)")
+                self.signal_store.mark_rejected(signal_id, f"{signal.symbol} not in allowed pairs")
                 return
 
             # Dedup: skip if same signal text was processed within the dedup window
@@ -1969,16 +1639,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             if sig_hash in self._recent_signal_hashes:
                 elapsed = now - self._recent_signal_hashes[sig_hash]
                 self.logger.info(f"Duplicate signal ignored (same text {elapsed:.0f}s ago, window={self._signal_dedup_window:.0f}s)")
+                self.signal_store.mark_rejected(signal_id, "duplicate signal")
                 return
             self._recent_signal_hashes[sig_hash] = now
 
             # Store for /lastsignal replay
             self.last_signal_text = text
 
-            self.logger.info(f"Signal parsed: {signal.symbol} {signal.side} [{signal.trade_type}]")
+            self.logger.info(f"Signal parsed: {signal.symbol} {signal.side} [{signal.trade_type}] (sig={signal_id[:8]})")
 
             # Validation
             if not await self.validate_signal(signal):
+                self.signal_store.mark_rejected(signal_id, "validation failed")
                 return
 
             # Pick wallet based on trade type:
@@ -1986,6 +1658,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             #   scalp → W2, W3, W4 (first available)
             wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type)
             if not acct:
+                self.signal_store.mark_rejected(signal_id, "no available wallets")
                 await self.notify(
                     f"Rejected {signal.symbol} {signal.side} [{signal.trade_type}]: "
                     "no available wallets"
@@ -2000,6 +1673,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             free_usdc = await self._get_combined_usdc()
 
             if total_portfolio <= 0:
+                self.signal_store.mark_rejected(signal_id, "portfolio value is $0")
                 await self.notify(f"Rejected {signal.symbol}: total portfolio value is $0")
                 return
 
@@ -2013,6 +1687,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 collateral_usd, self.cfg.min_position_usd, self.cfg.portfolio_pct, total_portfolio
             )
             if min_collateral_err:
+                self.signal_store.mark_rejected(signal_id, min_collateral_err)
                 await self.notify(f"Rejected {signal.symbol}: {min_collateral_err}")
                 return
 
@@ -2070,6 +1745,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                                     f"Duplicate blocked: {signal.symbol} {signal.side} already open "
                                     f"on W{wid_chk} ({acct_chk.address[:10]}...)"
                                 )
+                                self.signal_store.mark_rejected(signal_id, f"duplicate on W{wid_chk}")
                                 await self.notify(
                                     f"Blocked duplicate {signal.symbol} {signal.side}: "
                                     f"already open on W{wid_chk}"
@@ -2081,6 +1757,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Execute on-chain with the selected wallet
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
             if position:
+                position.signal_id = signal_id
+                self.signal_store.mark_executed(signal_id, position.id, wallet_id)
                 self.positions[position.id] = position
                 self._save_position_state()
                 self.health_stats["trades_executed"] += 1
@@ -2181,7 +1859,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self.logger.error(f"Failed to cancel orders during override: {e}")
 
             # Mark internal position as closed
-            self._record_trade(pos, exit_reason="override")
+            await self._record_trade(pos, exit_reason="override")
             self._clear_position_state(pos)
             pos.is_open = False
             pos.closed_at = time.time()
@@ -2302,10 +1980,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     for tp in signal.take_profits
                 ],
                 market_addr=market_addr,
+                collateral_token=self.cfg.collateral_token or None,
                 opened_at=time.time(),
                 wallet_id=wallet_id,
                 original_size_usd=size_usd,
-                expected_tp_count=len(signal.take_profits),
             )
 
             # Try to execute on-chain
@@ -2330,6 +2008,15 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 tx_hash = results.get("open", "")
                 position.tx_hash = tx_hash
 
+                # Record open order in history
+                position.order_history.append({
+                    "order_type": "open",
+                    "tx_hash": tx_hash,
+                    "price": signal.entry_mid,
+                    "status": "placed",
+                    "timestamp": time.time(),
+                })
+
                 # Filter take_profits to only include TPs that were actually placed on-chain.
                 # This prevents the notification from showing TPs that failed to place,
                 # and keeps check_tp_hits from tracking phantom TP orders.
@@ -2345,11 +2032,24 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         tp for tp in position.take_profits
                         if tp.price in successfully_placed_prices
                     ]
-                position.last_known_tp_count = len(position.take_profits)
+                # Populate tp_tx_hashes and record order history for all TP results
+                position.tp_tx_hashes = [
+                    tp_r["tx"] for tp_r in tp_results if tp_r.get("tx")
+                ]
+                for tp_r in tp_results:
+                    position.order_history.append({
+                        "order_type": "tp",
+                        "tx_hash": tp_r.get("tx"),
+                        "price": tp_r["price"],
+                        "close_pct": tp_r.get("pct", 0),
+                        "status": "placed" if tp_r.get("tx") else "failed",
+                        "error": tp_r.get("error"),
+                        "timestamp": time.time(),
+                    })
 
                 # TP count verification: expected vs actually placed
                 placed_count = len(position.take_profits)
-                expected_count = position.expected_tp_count
+                expected_count = len(signal.take_profits)
                 if placed_count == expected_count:
                     self.logger.info(
                         f"{signal.symbol} {signal.side}: All {expected_count}/{expected_count} TPs placed successfully"
@@ -2381,8 +2081,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         f"({signal.symbol} {signal.side}): {tp_r.get('error', '?')}"
                     )
 
-                # Queue failed SL order for retry
+                # Record SL order result
                 sl_result = results.get("sl")
+                if sl_result:
+                    position.sl_tx_hash = sl_result
+                position.order_history.append({
+                    "order_type": "sl",
+                    "tx_hash": sl_result,
+                    "price": signal.stop_loss,
+                    "status": "placed" if sl_result else "failed",
+                    "timestamp": time.time(),
+                })
+
+                # Queue failed SL order for retry
                 if sl_result is None and signal.stop_loss:
                     failed_sl = FailedOrder(
                         position_id=position.id,
@@ -2407,6 +2118,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 n_failed_tp = len(failed_tp_results)
                 n_failed_sl = 1 if (sl_result is None and signal.stop_loss) else 0
                 if n_failed_tp > 0 or n_failed_sl > 0:
+                    self._save_failed_orders()
                     parts = []
                     if n_failed_tp > 0:
                         parts.append(f"{n_failed_tp} TP(s)")
@@ -2421,8 +2133,22 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self._set_orders_cooldown(30)
                 return position, order_type
 
+            except RuntimeError as e:
+                self.logger.error(f"Open order REVERTED for {signal.symbol}: {e}")
+                await self.notify(
+                    f"❌ REVERTED {signal.symbol} {signal.side}: transaction reverted on-chain.\n"
+                    f"Error: {e}\nThis order will NOT be retried."
+                )
+                return None, None
+            except (ConnectionError, TimeoutError, OSError) as e:
+                self.logger.error(f"RPC error opening {signal.symbol}: {e}")
+                await self.notify(
+                    f"❌ RPC ERROR opening {signal.symbol} {signal.side}: {e}\n"
+                    f"Network issue — signal was NOT executed. Try /lastsignal to retry."
+                )
+                return None, None
             except Exception as e:
-                self.logger.error(f"Failed to execute open: {e}")
+                self.logger.error(f"Failed to execute open: {e}\n{traceback.format_exc()}")
                 await self.notify(f"❌ Failed to open {signal.symbol} {signal.side}: {e}")
                 return None, None
 
@@ -2502,7 +2228,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             nonce = self.w3.eth.get_transaction_count(acct.address, "pending")
             base_fee = self.w3.eth.get_block("latest").get("baseFeePerGas", 0)
             priority_fee = self.w3.to_wei(0.1, "gwei")
-            max_fee = base_fee + priority_fee * 2
+            max_fee = base_fee * 2 + priority_fee
             tx = {
                 'to': Web3.to_checksum_address(to_addr),
                 'from': acct.address,
@@ -2712,8 +2438,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     current_price = await self.get_current_price(pos.symbol)
                     if current_price and current_price > 0:
                         pos.current_price = current_price
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch price for {pos.symbol} during close detection: {e}")
 
                 # Classify exit reason (SL hit, TP filled, liquidation, etc.)
                 exit_reason = classify_exit_reason(
@@ -2721,7 +2447,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     current_price=pos.current_price,
                     stop_loss=pos.stop_loss,
                     tp_hits_count=pos.tp_hits_count,
-                    last_known_tp_count=pos.last_known_tp_count,
                     sl_moved_to_entry=pos.sl_moved_to_entry,
                     sl_move_label=pos.sl_move_label,
                     sl_orders_remaining=sl_orders_remaining,
@@ -2736,13 +2461,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 if "SL" in exit_reason and pos.stop_loss:
                     exit_price = pos.stop_loss
 
-                # Calculate total PnL: realized (from executed TPs) + remaining
+                # Calculate total PnL: realized (from verified decreases) + remaining
                 realized_pnl = pos.realized_pnl or 0.0
-                remaining_pct = 1.0
-                if pos.take_profits:
-                    executed_tps = [tp for tp in pos.take_profits if tp.executed]
-                    remaining_pct = 1.0 - sum(tp.percentage for tp in executed_tps)
-                remaining_size = pos.size_usd * max(remaining_pct, 0.0)
+                total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
+                base_size = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
+                remaining_size = max(base_size - total_decreased, 0.0)
 
                 remaining_pnl = 0.0
                 if pos.entry_price and pos.entry_price > 0 and exit_price > 0:
@@ -2763,7 +2486,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 pos.is_open = False
                 pos.closed_at = time.time()
                 pos.exit_reason = exit_reason
-                self._record_trade(pos, exit_reason=exit_reason)
+                await self._record_trade(pos, exit_reason=exit_reason)
                 self._clear_position_state(pos)
 
                 # Cancel orphaned SL/TP orders left behind after close/liquidation
@@ -2825,8 +2548,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         )
                     msg += (
                         f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
-                        f"Duration: {duration:.1f}h\n"
-                        f"Reason: {exit_reason}"
+                        f"Duration: {duration:.1f}h"
                     )
                 await self.notify(msg)
 
