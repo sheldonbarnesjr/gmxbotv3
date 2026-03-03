@@ -335,6 +335,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
     def _save_position_state(self):
         """Persist realized PnL and TP hit state for all open positions."""
+        # Load existing state to preserve original_take_profits from first save
+        existing_state = self._load_position_state()
+
         state = {}
         for pos in self.positions.values():
             if not pos.is_open or not pos.market_addr:
@@ -343,6 +346,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             executed_indices = [
                 i for i, tp in enumerate(pos.take_profits) if tp.executed
             ]
+
+            # Preserve original TPs from first save — never overwrite
+            existing_entry = existing_state.get(key, {})
+            preserved_original_tps = existing_entry.get("original_take_profits")
+
             state[key] = {
                 "realized_pnl": pos.realized_pnl,
                 "tp_hits_count": pos.tp_hits_count,
@@ -352,7 +360,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 "sl_moved_to_entry": pos.sl_moved_to_entry,
                 "expected_tp_count": pos.expected_tp_count,
                 "opened_at": pos.opened_at,
-                "original_take_profits": [
+                "original_take_profits": preserved_original_tps if preserved_original_tps else [
                     {"price": tp.price, "close_pct": tp.percentage}
                     for tp in pos.take_profits
                 ],
@@ -723,36 +731,107 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         f"realized=${total_realized:,.2f}"
                     )
 
-                # ── Path B: No original signal → fallback to JSON hint with cap ──
+                # ── Path B: No original signal → verify via on-chain events ──
                 if not reconstructed and saved:
-                    saved_hits = saved.get("tp_hits_count", 0)
-                    max_possible_hits = max(pos.expected_tp_count - tp_count, 0)
-                    if saved_hits > max_possible_hits:
-                        self.logger.warning(
-                            f"Sync: {symbol} {side} [W{wid}] hint tp_hits={saved_hits} "
-                            f"exceeds max possible {max_possible_hits}, capping"
-                        )
-                        saved_hits = max_possible_hits
-                        pos.realized_pnl = 0.0
+                    # Identify TPs in our internal list that are NOT on-chain
+                    on_chain_tp_prices_b = set()
+                    for otp in take_profits:
+                        on_chain_tp_prices_b.add(round(otp.price, 2))
+
+                    missing_tps_b = []
+                    for i, tp_lvl in enumerate(pos.take_profits):
+                        matched = any(
+                            abs(tp_lvl.price - otp) / tp_lvl.price < 0.01
+                            for otp in on_chain_tp_prices_b
+                        ) if tp_lvl.price > 0 else False
+                        if not matched:
+                            missing_tps_b.append((i, tp_lvl))
+
+                    if missing_tps_b:
+                        # Query PositionDecrease events to verify missing TPs
+                        try:
+                            from history import fetch_recent_position_decreases
+                            lookback_b = int(time.time() - pos.opened_at) + 300
+                            lookback_b = max(lookback_b, 600)
+                            lookback_b = min(lookback_b, 30 * 86400)
+                            decreases_b = await asyncio.to_thread(
+                                fetch_recent_position_decreases,
+                                self.w3, acct.address, market_lower,
+                                side == "LONG", lookback_b,
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Sync Path B: {symbol} event query failed: {e}")
+                            decreases_b = []
+
+                        verified_hits_b = 0
+                        total_realized_b = 0.0
+                        used_events_b = set()
+                        for idx, tp_lvl in missing_tps_b:
+                            for j, evt in enumerate(decreases_b):
+                                if j in used_events_b:
+                                    continue
+                                exec_price = evt.get("execution_price", 0)
+                                if exec_price and tp_lvl.price > 0:
+                                    if abs(exec_price - tp_lvl.price) / tp_lvl.price < 0.01:
+                                        tp_lvl.executed = True
+                                        tp_lvl.executed_at = evt.get("timestamp", pos.opened_at)
+                                        tp_lvl.realized_pnl_usd = evt.get("net_pnl_usd")
+                                        verified_hits_b += 1
+                                        total_realized_b += evt.get("net_pnl_usd", 0)
+                                        used_events_b.add(j)
+                                        break
+
+                        pos.tp_hits_count = verified_hits_b
+                        pos.realized_pnl = total_realized_b
                     else:
-                        pos.realized_pnl = saved.get("realized_pnl", 0.0)
+                        # All TPs are on-chain — no hits
+                        pos.tp_hits_count = 0
+                        pos.realized_pnl = 0.0
 
-                    pos.tp_hits_count = saved_hits if saved_hits > 0 else pos.tp_hits_count
-
+                    # Restore SL state from saved hint
                     if saved.get("sl_move_label"):
                         pos.sl_move_label = saved["sl_move_label"]
                     if saved.get("sl_moved_to_entry"):
                         pos.sl_moved_to_entry = True
 
-                    executed_indices = saved.get("executed_tp_indices", [])[:max_possible_hits]
-                    for idx in executed_indices:
-                        if idx < len(pos.take_profits):
-                            pos.take_profits[idx].executed = True
-                            pos.take_profits[idx].executed_at = pos.opened_at
                     self.logger.info(
-                        f"Sync: {symbol} {side} [W{wid}] restored from JSON hint: "
-                        f"realized=${pos.realized_pnl:,.2f}, tp_hits={pos.tp_hits_count}"
+                        f"Sync: {symbol} {side} [W{wid}] Path B event-verified: "
+                        f"tp_hits={pos.tp_hits_count}, realized=${pos.realized_pnl:,.2f}"
                     )
+
+                # ── Ground truth: reconcile tp_hits with on-chain reality ──
+                # Invariant 1: tp_hits_count must equal sum(executed flags)
+                actual_executed = sum(1 for tp in pos.take_profits if tp.executed)
+                if pos.tp_hits_count != actual_executed:
+                    self.logger.warning(
+                        f"Sync: {symbol} {side} [W{wid}] tp_hits_count={pos.tp_hits_count} "
+                        f"disagrees with executed flags={actual_executed} — correcting"
+                    )
+                    pos.tp_hits_count = actual_executed
+
+                # Invariant 2: if all TPs are still on-chain, hits must be 0
+                if tp_count >= len(pos.take_profits) and len(pos.take_profits) > 0:
+                    if pos.tp_hits_count > 0:
+                        self.logger.warning(
+                            f"Sync: {symbol} {side} [W{wid}] all {tp_count} TPs "
+                            f"still on-chain but tp_hits_count={pos.tp_hits_count} — resetting to 0"
+                        )
+                        pos.tp_hits_count = 0
+                        pos.realized_pnl = 0.0
+                        pos.sl_move_label = None
+                        pos.sl_moved_to_entry = False
+                        for tp in pos.take_profits:
+                            tp.executed = False
+                            tp.executed_at = None
+                            tp.realized_pnl_usd = None
+
+                # Invariant 3: cannot have more hits than total TPs
+                if pos.tp_hits_count > len(pos.take_profits):
+                    self.logger.warning(
+                        f"Sync: {symbol} {side} [W{wid}] tp_hits_count={pos.tp_hits_count} "
+                        f"> total TPs={len(pos.take_profits)} — capping"
+                    )
+                    pos.tp_hits_count = len(pos.take_profits)
 
                 self.positions[pos.id] = pos
                 synced += 1
@@ -1402,15 +1481,70 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             await self._sync_on_chain_positions(skip_sl_check=True)
             new_count = sum(1 for p in self.positions.values() if p.is_open)
 
-            # Persist corrected state to JSON (tp_hits, realized_pnl, original_take_profits)
-            self._save_position_state()
+            # Post-sync sanity: ensure tp_hits_count matches executed flags
+            for pos in self.positions.values():
+                if not pos.is_open:
+                    continue
+                actual_hits = sum(1 for tp in pos.take_profits if tp.executed)
+                if pos.tp_hits_count != actual_hits:
+                    self.logger.warning(
+                        f"Post-sync sanity: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                        f"tp_hits_count={pos.tp_hits_count} != executed={actual_hits} — correcting"
+                    )
+                    pos.tp_hits_count = actual_hits
 
-            # Refresh on-chain trade history (used by /pnl, /winrate, hourly PnL)
+            # Refresh on-chain trade history BEFORE saving state — use as cross-validation
+            all_trades = []
             try:
-                await self._fetch_and_store_trades()
+                all_trades = await self._fetch_and_store_trades()
                 self.logger.info("Sync: refreshed on-chain trade history")
             except Exception as e:
                 self.logger.warning(f"Sync: trade history refresh failed: {e}")
+
+            # Cross-validate realized PnL and tp_hits against on-chain trade history
+            if all_trades:
+                for pos in self.positions.values():
+                    if not pos.is_open or not pos.market_addr:
+                        continue
+                    market_lower = pos.market_addr.lower()
+                    is_long = pos.side == "LONG"
+                    # Filter trades to this position's market, direction, and lifetime
+                    pos_trades = [
+                        t for t in all_trades
+                        if t.get("market_address", "").lower() == market_lower
+                        and t.get("is_long") == is_long
+                        and t.get("timestamp", 0) >= pos.opened_at
+                    ]
+                    trade_count = len(pos_trades)
+                    trade_pnl = sum(t.get("net_pnl_usd", 0) for t in pos_trades)
+
+                    # If more TP hits than actual on-chain decreases, correct
+                    if pos.tp_hits_count > trade_count:
+                        self.logger.warning(
+                            f"Trade history cross-check: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                            f"tp_hits={pos.tp_hits_count} but only {trade_count} on-chain decrease(s) — "
+                            f"correcting to {trade_count}"
+                        )
+                        pos.tp_hits_count = trade_count
+                        # Clear executed flags beyond what trade history supports
+                        executed_tps = [tp for tp in pos.take_profits if tp.executed]
+                        for tp in executed_tps[trade_count:]:
+                            tp.executed = False
+                            tp.executed_at = None
+                            tp.realized_pnl_usd = None
+
+                    # If realized PnL doesn't match on-chain trades, correct
+                    if pos.tp_hits_count > 0 and abs(pos.realized_pnl - trade_pnl) > 1.0:
+                        self.logger.warning(
+                            f"Trade history cross-check: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                            f"realized_pnl=${pos.realized_pnl:,.2f} but on-chain=${trade_pnl:,.2f} — correcting"
+                        )
+                        pos.realized_pnl = trade_pnl
+                    elif pos.tp_hits_count == 0 and pos.realized_pnl != 0:
+                        pos.realized_pnl = 0.0
+
+            # Persist corrected state to JSON (tp_hits, realized_pnl, original_take_profits)
+            self._save_position_state()
 
             lines = []
             for pos in self.positions.values():
@@ -1629,6 +1763,27 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Re-place TPs using current on-chain size and collateral
             collateral_usd = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
             placed = 0
+            # Safety: if a TP is marked executed but was still on-chain
+            # (just cancelled above), clear the executed flag
+            on_chain_tp_prices_resync = {
+                round(o["trigger_price"], 2) for o in tp_orders
+            }
+            for tp_lvl in pos.take_profits:
+                if tp_lvl.executed and tp_lvl.price > 0:
+                    still_on_chain = any(
+                        abs(tp_lvl.price - ocp) / tp_lvl.price < 0.01
+                        for ocp in on_chain_tp_prices_resync
+                    )
+                    if still_on_chain:
+                        self.logger.warning(
+                            f"Resync TPs: {pos.symbol} TP @ ${tp_lvl.price:,.2f} "
+                            f"marked executed but was on-chain — clearing flag"
+                        )
+                        tp_lvl.executed = False
+                        tp_lvl.executed_at = None
+                        tp_lvl.realized_pnl_usd = None
+            pos.tp_hits_count = sum(1 for tp in pos.take_profits if tp.executed)
+
             # Use the non-executed TPs from internal tracking
             remaining_tps = [tp for tp in pos.take_profits if not tp.executed]
             for tp_level in remaining_tps:

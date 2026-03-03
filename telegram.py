@@ -60,34 +60,33 @@ logger = logging.getLogger("GMXBot.telegram")
 
 HELP_TEXT = """**GMX V2 Bot Commands**
 
-/addorder — Manually add a SL or TP to an open position
+/addorder — Add a SL or TP to an open position
 /balance — Wallet ETH & token balance
-/balance-wallets — Manually rebalance USDC between wallets (W1-W4)
-/cancel — Cancel a pending withdraw or close
-/cancelorder — List & cancel individual SL/TP orders by number
-/close [all|SYMBOL] — Close positions (/confirm to execute)
-/consolidate — Move ALL free USDC from W2-W4 into W1 (for withdrawals)
+/balance-wallets — Rebalance USDC between wallets
+/cancelorder — List & cancel individual SL/TP orders
+/close — Close positions
+/consolidate — Move all free USDC from W2-W4 into W1
+/deposit — Show W1 deposit address
 /gas — ETH gas balances for all wallets
-/halt [reason] — Halt trading
+/halt — Halt trading
 /health — System health
 /help — This message
 /increase — Add collateral to an open position
-/lastmsg — Print last message from monitored channel(s)
+/lastmsg — Last message from monitored channel(s)
 /lastsignal — Re-run the last parsed signal
 /pdf — Download trade history as PDF
-/pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
-/positions — Show on-chain positions
-/prices — Live GMX & Chainlink prices for all tracked assets
-/resume [reason] — Resume trading
-/sl [# entry|tp1|tp2] — Move SL to entry or TP level
+/pnl — PnL summary (today / 30d / all time)
+/positions — Show on-chain positions & orders
+/prices — Live GMX & Chainlink prices
+/resume — Resume trading
+/sl — Move stop loss
 /status — Bot status & mode
-/sync — Force re-sync positions from on-chain
 /summary — Send daily summary now
-/topup — Manual ETH top-up (swap USDC → ETH for gas)
-/tradesize — Show/change trade size (e.g. /tradesize 20 for 20%)
-/deposit — Show W1 deposit address (auto-rebalances when USDC arrives)
-/withdraw <amount> — Withdraw USDC to any Arbitrum address
-/winrate [SYMBOL] [N] — Win rate stats
+/sync — Re-sync positions & clean up stale orders
+/topup — Swap USDC to ETH for gas
+/tradesize — Show/change trade size
+/withdraw — Withdraw USDC to any Arbitrum address
+/winrate — Win rate stats
 
 **Wallets:** W1=swing, W2-W4=scalps"""
 
@@ -523,13 +522,14 @@ class CoreTelegramMixin:
                         internal = ip
                         break
 
-                # TP hit info from internal state
+                # TP hit info from internal state — use executed flags as source of truth
                 tp_hits = 0
                 total_tps = 0
                 sl_label = None
                 if internal:
-                    tp_hits = internal.tp_hits_count
+                    tp_hits = sum(1 for tp in internal.take_profits if tp.executed)
                     total_tps = len(internal.take_profits)
+                    tp_hits = min(tp_hits, total_tps)
                     sl_label = internal.sl_move_label
 
                 current_str = f"${display_price:,.2f}" if display_price else "N/A"

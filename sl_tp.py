@@ -220,7 +220,8 @@ class SLTPMixin:
                         )
 
                 if new_hits > 0:
-                    pos.tp_hits_count += new_hits
+                    # Derive count from executed flags (single source of truth)
+                    pos.tp_hits_count = sum(1 for tp in pos.take_profits if tp.executed)
                     self.logger.info(f"{pos.symbol} {pos.side}: {new_hits} new TP hits, total={pos.tp_hits_count}")
 
                     # Calculate realized PnL — prefer actual on-chain PnL over theoretical
