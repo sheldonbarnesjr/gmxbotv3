@@ -526,11 +526,14 @@ class CoreTelegramMixin:
                 tp_hits = 0
                 total_tps = 0
                 sl_label = None
+                realized_pnl = 0.0
                 if internal:
                     tp_hits = sum(1 for tp in internal.take_profits if tp.executed)
                     total_tps = len(internal.take_profits)
                     tp_hits = min(tp_hits, total_tps)
                     sl_label = internal.sl_move_label
+                    # Use verified realized PnL from internal state (validated by sync)
+                    realized_pnl = internal.realized_pnl if tp_hits > 0 else 0.0
 
                 current_str = f"${display_price:,.2f}" if display_price else "N/A"
                 entry_str = f"${pos.entry_price:,.2f}" if pos.entry_price else "N/A"
@@ -550,14 +553,23 @@ class CoreTelegramMixin:
                     fee_line = f"  Fees:    -${total_fees:,.2f} (borrow: ${pos.borrowing_fee_usd:,.2f}, fund: ${pos.funding_fee_usd:,.2f}, close: ${pos.closing_fee_usd:,.2f})\n"
 
                 if tp_hits > 0:
+                    total_pnl_combined = realized_pnl + pnl
+                    r_sign = "+" if realized_pnl >= 0 else ""
+                    t_sign = "+" if total_pnl_combined >= 0 else ""
                     msg += (
                         f"  TPs:     {tp_hits}/{total_tps} hit"
                         + (f" (SL → {sl_label})" if sl_label else "")
                         + "\n"
+                        f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
+                        f"  Unrealized: {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
                     )
-                msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
-                if fee_line:
-                    msg += fee_line
+                    if fee_line:
+                        msg += fee_line
+                    msg += f"  Total PnL: {t_sign}${total_pnl_combined:,.2f}\n"
+                else:
+                    msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                    if fee_line:
+                        msg += fee_line
 
                 if sl_orders or tp_orders or (internal and tp_hits > 0):
                     msg += "  TP & SL:\n"

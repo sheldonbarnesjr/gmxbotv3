@@ -620,6 +620,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.expected_tp_count = saved.get("expected_tp_count", 0)
                     if saved.get("opened_at"):
                         pos.opened_at = saved["opened_at"]
+                    else:
+                        # opened_at missing from old state format — assume at least 30 days
+                        pos.opened_at = time.time() - 30 * 86400
                     if saved.get("entry_price"):
                         pos.entry_price = saved["entry_price"]
                     if saved.get("leverage"):
@@ -733,11 +736,27 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 # ── Path B: No original signal → verify via on-chain events ──
                 if not reconstructed and saved:
-                    # Identify TPs in our internal list that are NOT on-chain
                     on_chain_tp_prices_b = set()
                     for otp in take_profits:
                         on_chain_tp_prices_b.add(round(otp.price, 2))
 
+                    # Always query PositionDecrease events — needed for both
+                    # missing-TP verification AND orphaned-event detection
+                    try:
+                        from history import fetch_recent_position_decreases
+                        lookback_b = int(time.time() - pos.opened_at) + 300
+                        lookback_b = max(lookback_b, 600)
+                        lookback_b = min(lookback_b, 30 * 86400)
+                        decreases_b = await asyncio.to_thread(
+                            fetch_recent_position_decreases,
+                            self.w3, acct.address, market_lower,
+                            side == "LONG", lookback_b,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Sync Path B: {symbol} event query failed: {e}")
+                        decreases_b = []
+
+                    # Step 1: Check if any internal TPs are missing from chain
                     missing_tps_b = []
                     for i, tp_lvl in enumerate(pos.take_profits):
                         matched = any(
@@ -747,56 +766,103 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         if not matched:
                             missing_tps_b.append((i, tp_lvl))
 
-                    if missing_tps_b:
-                        # Query PositionDecrease events to verify missing TPs
-                        try:
-                            from history import fetch_recent_position_decreases
-                            lookback_b = int(time.time() - pos.opened_at) + 300
-                            lookback_b = max(lookback_b, 600)
-                            lookback_b = min(lookback_b, 30 * 86400)
-                            decreases_b = await asyncio.to_thread(
-                                fetch_recent_position_decreases,
-                                self.w3, acct.address, market_lower,
-                                side == "LONG", lookback_b,
-                            )
-                        except Exception as e:
-                            self.logger.warning(f"Sync Path B: {symbol} event query failed: {e}")
-                            decreases_b = []
+                    verified_hits_b = 0
+                    total_realized_b = 0.0
+                    used_events_b = set()
 
-                        verified_hits_b = 0
-                        total_realized_b = 0.0
-                        used_events_b = set()
-                        for idx, tp_lvl in missing_tps_b:
-                            for j, evt in enumerate(decreases_b):
-                                if j in used_events_b:
-                                    continue
-                                exec_price = evt.get("execution_price", 0)
-                                if exec_price and tp_lvl.price > 0:
-                                    if abs(exec_price - tp_lvl.price) / tp_lvl.price < 0.01:
-                                        tp_lvl.executed = True
-                                        tp_lvl.executed_at = evt.get("timestamp", pos.opened_at)
-                                        tp_lvl.realized_pnl_usd = evt.get("net_pnl_usd")
-                                        verified_hits_b += 1
-                                        total_realized_b += evt.get("net_pnl_usd", 0)
-                                        used_events_b.add(j)
+                    # Step 2: Verify missing TPs against decrease events
+                    for idx, tp_lvl in missing_tps_b:
+                        for j, evt in enumerate(decreases_b):
+                            if j in used_events_b:
+                                continue
+                            exec_price = evt.get("execution_price", 0)
+                            if exec_price and tp_lvl.price > 0:
+                                if abs(exec_price - tp_lvl.price) / tp_lvl.price < 0.01:
+                                    tp_lvl.executed = True
+                                    tp_lvl.executed_at = evt.get("timestamp", pos.opened_at)
+                                    tp_lvl.realized_pnl_usd = evt.get("net_pnl_usd")
+                                    verified_hits_b += 1
+                                    total_realized_b += evt.get("net_pnl_usd", 0)
+                                    used_events_b.add(j)
+                                    break
+
+                    # Step 3: Detect orphaned decrease events — historical TP hits
+                    # whose on-chain orders were consumed by the keeper.
+                    # These won't be in pos.take_profits (built from on-chain orders only).
+                    all_known_tp_prices = set(on_chain_tp_prices_b)
+                    for tp_lvl in pos.take_profits:
+                        if tp_lvl.price > 0:
+                            all_known_tp_prices.add(round(tp_lvl.price, 2))
+
+                    orphaned_tps = []
+                    for j, evt in enumerate(decreases_b):
+                        if j in used_events_b:
+                            continue
+                        exec_price = evt.get("execution_price", 0)
+                        if not exec_price:
+                            continue
+                        # Check if this event matches any known TP (on-chain or internal)
+                        matches_known = any(
+                            abs(exec_price - ktp) / ktp < 0.01
+                            for ktp in all_known_tp_prices
+                            if ktp > 0
+                        )
+                        if matches_known:
+                            continue
+                        # This decrease doesn't match any current TP — it's a consumed TP
+                        size_delta = evt.get("size_delta_usd", 0)
+                        pct = size_delta / pos.original_size_usd if pos.original_size_usd > 0 else 0
+                        orphan_tp = TakeProfitLevel(
+                            price=exec_price,
+                            percentage=pct,
+                            executed=True,
+                            executed_at=evt.get("timestamp", pos.opened_at),
+                            realized_pnl_usd=evt.get("net_pnl_usd"),
+                        )
+                        orphaned_tps.append(orphan_tp)
+                        verified_hits_b += 1
+                        total_realized_b += evt.get("net_pnl_usd", 0)
+                        used_events_b.add(j)
+                        self.logger.info(
+                            f"Sync Path B: {symbol} {side} [W{wid}] found orphaned TP hit "
+                            f"@ ${exec_price:,.2f}, pnl=${evt.get('net_pnl_usd', 0):,.2f}"
+                        )
+
+                    # Prepend orphaned TPs so they appear before on-chain TPs
+                    # Sort by execution price (closest to entry first for display)
+                    if orphaned_tps:
+                        if side == "LONG":
+                            orphaned_tps.sort(key=lambda t: t.price)
+                        else:
+                            orphaned_tps.sort(key=lambda t: t.price, reverse=True)
+                        pos.take_profits = orphaned_tps + pos.take_profits
+
+                    pos.tp_hits_count = verified_hits_b
+                    pos.realized_pnl = total_realized_b
+
+                    # Derive SL state from on-chain SL price + verified hits
+                    if reconstructed_sl and cp.entry_price and verified_hits_b > 0:
+                        entry = cp.entry_price
+                        if entry > 0 and abs(reconstructed_sl - entry) / entry < 0.005:
+                            pos.sl_moved_to_entry = True
+                            pos.sl_move_label = "Entry"
+                        else:
+                            # Check if SL matches any executed TP price
+                            for i, tp_lvl in enumerate(pos.take_profits):
+                                if tp_lvl.executed and tp_lvl.price > 0:
+                                    if abs(reconstructed_sl - tp_lvl.price) / tp_lvl.price < 0.005:
+                                        pos.sl_move_label = f"TP{i + 1}"
+                                        pos.sl_moved_to_entry = True
                                         break
-
-                        pos.tp_hits_count = verified_hits_b
-                        pos.realized_pnl = total_realized_b
-                    else:
-                        # All TPs are on-chain — no hits
-                        pos.tp_hits_count = 0
-                        pos.realized_pnl = 0.0
-
-                    # Restore SL state from saved hint
-                    if saved.get("sl_move_label"):
+                    elif saved.get("sl_move_label") and verified_hits_b > 0:
+                        # Fall back to saved hint only if hits are verified
                         pos.sl_move_label = saved["sl_move_label"]
-                    if saved.get("sl_moved_to_entry"):
-                        pos.sl_moved_to_entry = True
+                        pos.sl_moved_to_entry = saved.get("sl_moved_to_entry", False)
 
                     self.logger.info(
                         f"Sync: {symbol} {side} [W{wid}] Path B event-verified: "
                         f"tp_hits={pos.tp_hits_count}, realized=${pos.realized_pnl:,.2f}"
+                        + (f", {len(orphaned_tps)} orphaned TP(s) recovered" if orphaned_tps else "")
                     )
 
                 # ── Ground truth: reconcile tp_hits with on-chain reality ──
@@ -809,12 +875,25 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     pos.tp_hits_count = actual_executed
 
-                # Invariant 2: if all TPs are still on-chain, hits must be 0
-                if tp_count >= len(pos.take_profits) and len(pos.take_profits) > 0:
+                # Invariant 2: if all non-executed TPs are on-chain, no additional
+                # hits should exist beyond event-verified ones (orphaned TPs are valid)
+                non_executed_tps = sum(1 for tp in pos.take_profits if not tp.executed)
+                event_verified_hits = sum(1 for tp in pos.take_profits if tp.executed)
+                if tp_count >= non_executed_tps and non_executed_tps > 0:
+                    # All pending TPs are on-chain — only event-verified hits are valid
+                    if pos.tp_hits_count > event_verified_hits:
+                        self.logger.warning(
+                            f"Sync: {symbol} {side} [W{wid}] all {non_executed_tps} pending TPs "
+                            f"on-chain but tp_hits_count={pos.tp_hits_count} > verified={event_verified_hits} "
+                            f"— correcting to {event_verified_hits}"
+                        )
+                        pos.tp_hits_count = event_verified_hits
+                elif tp_count == 0 and len(pos.take_profits) > 0 and event_verified_hits == 0:
+                    # No TPs on-chain and no event-verified hits — suspicious, reset
                     if pos.tp_hits_count > 0:
                         self.logger.warning(
-                            f"Sync: {symbol} {side} [W{wid}] all {tp_count} TPs "
-                            f"still on-chain but tp_hits_count={pos.tp_hits_count} — resetting to 0"
+                            f"Sync: {symbol} {side} [W{wid}] no TPs on-chain, "
+                            f"no event-verified hits but tp_hits_count={pos.tp_hits_count} — resetting to 0"
                         )
                         pos.tp_hits_count = 0
                         pos.realized_pnl = 0.0
