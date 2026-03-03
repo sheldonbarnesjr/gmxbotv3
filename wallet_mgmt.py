@@ -547,12 +547,10 @@ class WalletMixin:
         """Check ETH balance for all wallets and auto-topup if low.
 
         Swaps USDC → ETH via Uniswap V3 SwapRouter02 if any wallet's ETH
-        balance drops below ~$2 worth. Sends Telegram notification for low
-        balances and insufficient USDC.
+        balance drops below ~$5 worth.
         """
-        MIN_ETH_USD = 2.0     # trigger topup below this
+        MIN_ETH_USD = 5.0     # trigger topup below this
         TOPUP_USD = 5.0       # swap this much USDC → ETH
-        WARN_ETH_USD = 3.0    # notify user below this (even if above topup threshold)
 
         UNISWAP_ROUTER = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
         WETH_ARBITRUM = Web3.to_checksum_address("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
@@ -592,11 +590,6 @@ class WalletMixin:
                 eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet_addr)
                 eth_usd = (eth_bal / 10**18) * eth_price
 
-                # Notify if gas is getting low (even if not yet critical)
-                if eth_usd < WARN_ETH_USD and eth_usd >= MIN_ETH_USD:
-                    await self.notify(f"⚠️ W{wid} gas getting low: ${eth_usd:.2f} ETH")
-                    continue
-
                 if eth_usd >= MIN_ETH_USD:
                     continue
 
@@ -604,7 +597,6 @@ class WalletMixin:
                     f"W{wid} ETH low: ${eth_usd:.2f} (< ${MIN_ETH_USD}) — "
                     f"auto-swapping ${TOPUP_USD:.0f} USDC → ETH"
                 )
-                await self.notify(f"⛽ W{wid} ETH critically low: ${eth_usd:.2f} — attempting auto top-up...")
 
                 usdc_token = self.w3.eth.contract(address=USDC_ARBITRUM, abi=ERC20_ABI)
                 # Bind wallet_addr early to avoid lambda closure bug
@@ -615,10 +607,6 @@ class WalletMixin:
 
                 if usdc_bal < TOPUP_USD:
                     self.logger.warning(f"W{wid} insufficient USDC for auto-topup (${usdc_bal:.2f} < ${TOPUP_USD})")
-                    await self.notify(
-                        f"🚨 W{wid} ETH critically low (${eth_usd:.2f}) and insufficient USDC "
-                        f"(${usdc_bal:.2f}) for auto top-up! Manual /topup needed."
-                    )
                     continue
 
                 usdc_amount_in = int(TOPUP_USD * (10 ** usdc_decimals))
@@ -649,14 +637,11 @@ class WalletMixin:
                     new_eth_bal = await asyncio.to_thread(self.w3.eth.get_balance, wallet_addr)
                     new_eth_usd = (new_eth_bal / 10**18) * eth_price
                     self.logger.info(f"W{wid} auto-topup OK: ${TOPUP_USD:.0f} USDC → ETH (now ${new_eth_usd:.2f})")
-                    await self.notify(f"⛽ W{wid} auto-topped up: ${TOPUP_USD:.0f} USDC → ETH (balance: ${new_eth_usd:.2f})")
                 else:
                     self.logger.error(f"W{wid} auto-topup swap reverted: {txh}")
-                    await self.notify(f"❌ W{wid} auto top-up swap REVERTED. Manual /topup needed.")
 
         except Exception as e:
             self.logger.warning(f"topup_eth_if_needed error: {e}")
-            await self.notify(f"⚠️ Auto top-up error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command handlers
@@ -738,7 +723,6 @@ class WalletMixin:
             wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
             lines = ["**Gas Balances (ETH)**\n"]
             total_eth = 0.0
-            low_wallets = []
 
             for wid, acct in self._all_wallets():
                 try:
@@ -747,17 +731,13 @@ class WalletMixin:
                     eth_usd = eth_amount * eth_price if eth_price else 0
                     total_eth += eth_amount
                     role = wallet_roles.get(wid, "scalp")
-                    status = "⚠️" if eth_usd < 2.0 else "✅"
-                    lines.append(f"{status} W{wid} ({role}): {eth_amount:.6f} ETH (${eth_usd:.2f})")
-                    if eth_usd < 2.0:
-                        low_wallets.append(f"W{wid}")
+                    lines.append(f"W{wid} ({role}): {eth_amount:.6f} ETH (${eth_usd:.2f})")
                 except Exception as e:
                     lines.append(f"❌ W{wid}: error ({e})")
 
             total_usd = total_eth * eth_price if eth_price else 0
             lines.append(f"\nTotal: {total_eth:.6f} ETH (${total_usd:.2f})")
-            if low_wallets:
-                lines.append(f"\n⚠️ Low gas: {', '.join(low_wallets)} — use /topup to refill")
+            lines.append("\nAuto top-up is active (swaps USDC → ETH when balance < $5).")
 
             await self.send_message(chat_id, "\n".join(lines))
         except Exception as e:

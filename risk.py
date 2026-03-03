@@ -311,10 +311,10 @@ def determine_new_sl_target(
     """Determine where SL should move after TP hit(s).
 
     Trailing strategy (lets positions run):
-      TP1 hit → SL to Entry (breakeven)
-      TP2 hit → no move (stay at Entry)
+      TP1 hit → no move (let the trade run)
+      TP2 hit → SL to Entry (breakeven)
       TP3 hit → SL to TP1
-      TP4+ hit → SL stays at TP2
+      TP4+ hit → no move (stays at TP1 from TP3)
 
     Returns (new_sl_price, sl_label), or (None, None) if no move needed.
     """
@@ -326,21 +326,18 @@ def determine_new_sl_target(
         return None, None
 
     if tp_hits_count == 1:
-        return entry_price, "Entry"
-
-    if tp_hits_count == 2:
-        # No move — let it run, SL stays at Entry
+        # TP1 hit → no move (let the trade run)
         return None, None
 
+    if tp_hits_count == 2:
+        # TP2 hit → SL to Entry (breakeven)
+        return entry_price, "Entry"
+
     if tp_hits_count == 3:
-        # SL to TP1
+        # TP3 hit → SL to TP1
         if len(sorted_tps) >= 1:
             return _tp_price(0), "TP1"
         return entry_price, "Entry"
 
-    # TP4+ → SL to TP2 (and stays there)
-    if len(sorted_tps) >= 2:
-        return _tp_price(1), "TP2"
-    if len(sorted_tps) >= 1:
-        return _tp_price(0), "TP1"
-    return entry_price, "Entry"
+    # TP4+ → no move (stays at TP1, which was set at TP3)
+    return None, None

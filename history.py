@@ -256,3 +256,169 @@ def fetch_trade_history(
 
     log.info(f"fetch_trade_history: {len(results)} trade(s) for {account[:10]}...")
     return results
+
+
+def fetch_recent_position_decreases(
+    w3: Web3,
+    account: str,
+    market: str,
+    is_long: bool,
+    lookback_seconds: int = 600,
+) -> List[Dict[str, Any]]:
+    """Fetch recent PositionDecrease events for a specific market+wallet.
+
+    Lightweight version of fetch_trade_history — only scans a short block
+    window (default 10 min) and filters to a single market+direction.
+    Used by check_tp_hits to verify that a TP order disappearance
+    corresponds to an actual keeper execution, not a cancellation.
+
+    Returns list of dicts with: size_delta_usd, execution_price, is_long,
+    market_address, timestamp, tx_hash.
+    """
+    emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
+    wallet_topic = "0x" + "0" * 24 + account.lower().replace("0x", "")
+    market_lower = market.lower()
+
+    current_block = w3.eth.block_number
+    lookback_blocks = lookback_seconds * _BLOCKS_PER_SECOND
+    from_block = max(0, current_block - int(lookback_blocks))
+
+    order_executed_topic = "0x" + Web3.keccak(text="OrderExecuted").hex()
+
+    try:
+        exec_logs = w3.eth.get_logs({
+            "address": emitter_addr,
+            "fromBlock": from_block,
+            "toBlock": current_block,
+            "topics": [
+                _EVENT_LOG2_TOPIC,
+                order_executed_topic,
+                None,
+                wallet_topic,
+            ],
+        })
+    except Exception as e:
+        log.warning(f"fetch_recent_position_decreases: get_logs failed: {e}")
+        return []
+
+    if not exec_logs:
+        return []
+
+    el1_abi = _get_event_log1_abi()
+    emitter1 = w3.eth.contract(address=emitter_addr, abi=el1_abi)
+
+    results = []
+    processed_receipts = {}
+    account_lower = account.lower()
+
+    for exec_log in exec_logs:
+        tx_hash = exec_log["transactionHash"].hex()
+        block_num = exec_log["blockNumber"]
+
+        if tx_hash in processed_receipts:
+            continue
+
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+        except Exception as e:
+            log.debug(f"Failed to fetch receipt for {tx_hash}: {e}")
+            continue
+        processed_receipts[tx_hash] = True
+
+        for rlog in receipt["logs"]:
+            topics = [t.hex() if isinstance(t, bytes) else t for t in rlog["topics"]]
+            if not (rlog["address"].lower() == emitter_addr.lower()
+                    and topics[0] == _EVENT_LOG1_TOPIC[2:]):
+                continue
+
+            try:
+                decoded = emitter1.events.EventLog1().process_log(rlog)
+                event_name = decoded["args"].get("eventName", "")
+                if event_name != "PositionDecrease":
+                    continue
+
+                ed = decoded["args"]["eventData"]
+
+                event_market = None
+                event_account = None
+                collateral_token = None
+                for item in ed["addressItems"]["items"]:
+                    if item["key"] == "market":
+                        event_market = item["value"].lower()
+                    elif item["key"] == "account":
+                        event_account = item["value"].lower()
+                    elif item["key"] == "collateralToken":
+                        collateral_token = item["value"].lower()
+
+                if event_account and event_account != account_lower:
+                    continue
+                if event_market and event_market != market_lower:
+                    continue
+
+                event_is_long = None
+                for item in ed["boolItems"]["items"]:
+                    if item["key"] == "isLong":
+                        event_is_long = item["value"]
+
+                if event_is_long is not None and event_is_long != is_long:
+                    continue
+
+                size_delta = 0
+                execution_price_raw = 0
+                borrowing_fee_raw = 0
+                position_fee_raw = 0
+                for item in ed["uintItems"]["items"]:
+                    k = item["key"]
+                    if k == "sizeDeltaUsd":
+                        size_delta = item["value"] / _P30
+                    elif k == "executionPrice":
+                        execution_price_raw = item["value"]
+                    elif k == "borrowingFeeAmount":
+                        borrowing_fee_raw = item["value"]
+                    elif k == "positionFeeAmount":
+                        position_fee_raw = item["value"]
+
+                # PnL from intItems
+                base_pnl = 0
+                price_impact = 0
+                for item in ed["intItems"]["items"]:
+                    k = item["key"]
+                    if k == "basePnlUsd":
+                        base_pnl = item["value"] / _P30
+                    elif k == "priceImpactUsd":
+                        price_impact = item["value"] / _P30
+
+                # Convert fees to USD (same logic as fetch_trade_history)
+                fees_usd = 0.0
+                if collateral_token and (borrowing_fee_raw or position_fee_raw):
+                    decimals = _TOKEN_DECIMALS.get(collateral_token, 6)
+                    fee_tokens = (borrowing_fee_raw + position_fee_raw) / (10 ** decimals)
+                    if collateral_token in _STABLECOINS:
+                        fees_usd = fee_tokens
+                    elif execution_price_raw > 0:
+                        fees_usd = fee_tokens * (execution_price_raw / _P30)
+
+                net_pnl = base_pnl + price_impact - fees_usd
+                execution_price = execution_price_raw / _P30 if execution_price_raw else 0
+
+                blk = w3.eth.get_block(block_num)
+
+                results.append({
+                    "market_address": event_market or "",
+                    "is_long": event_is_long,
+                    "size_delta_usd": size_delta,
+                    "execution_price": execution_price,
+                    "net_pnl_usd": net_pnl,
+                    "timestamp": blk["timestamp"],
+                    "tx_hash": tx_hash,
+                })
+
+            except Exception as e:
+                log.debug(f"Failed to decode event log: {e}")
+                continue
+
+    log.info(
+        f"fetch_recent_position_decreases: {len(results)} decrease(s) "
+        f"for {account[:10]} market={market_lower[:10]}..."
+    )
+    return results

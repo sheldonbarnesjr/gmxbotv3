@@ -108,7 +108,7 @@ class NotificationsMixin:
             self.cfg.telegram_bot_token, self.cfg.bot_admin_chat_id, file_path, caption
         )
 
-    async def notify_position_opened(self, position, order_type: str = "market", signal_tp_count: int = 0):
+    async def notify_position_opened(self, position, order_type: str = "market"):
         """Notify about a newly opened position."""
         tp_lines = ""
         for i, tp in enumerate(position.take_profits):
@@ -117,9 +117,12 @@ class NotificationsMixin:
         sl_str = f"${position.stop_loss:,.2f}" if position.stop_loss is not None else "None"
         wallet_label = f" [W{position.wallet_id}]" if hasattr(position, 'wallet_id') else ""
         placed_count = len(position.take_profits)
-        tp_header = f"TPs on-chain: {placed_count}"
-        if signal_tp_count > placed_count:
-            tp_header += f" (of {signal_tp_count} from signal — {signal_tp_count - placed_count} failed)"
+        expected = getattr(position, 'expected_tp_count', 0) or placed_count
+        if placed_count >= expected:
+            tp_header = f"TPs: {expected}/{expected} placed"
+        else:
+            failed = expected - placed_count
+            tp_header = f"TPs: {placed_count}/{expected} placed — {failed} failed, queued for retry"
         msg = (
             f"**Position Opened ({order_label})**\n\n"
             f"{position.symbol} {position.side}{wallet_label}\n"

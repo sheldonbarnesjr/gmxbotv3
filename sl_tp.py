@@ -33,6 +33,7 @@ from open import (
 )
 import open as _open_mod
 from close import fetch_positions as chain_fetch_positions, GMXPosition
+from history import fetch_recent_position_decreases
 from risk import verify_tp_hit_by_price, determine_new_sl_target, calculate_unrealized_pnl
 
 
@@ -92,9 +93,17 @@ class SLTPMixin:
                 # First run: initialize baseline count, don't trigger hits
                 if pos.last_known_tp_count == 0 and current_tp_count > 0:
                     pos.last_known_tp_count = current_tp_count
-                    self.logger.debug(
-                        f"{pos.symbol}: initialized TP count baseline = {current_tp_count}"
-                    )
+                    # Sanity check: on-chain should match internal tracking
+                    internal_count = len([tp for tp in pos.take_profits if not tp.executed])
+                    if abs(current_tp_count - internal_count) > 1:
+                        self.logger.warning(
+                            f"{pos.symbol}: TP baseline mismatch — on-chain={current_tp_count}, "
+                            f"internal={internal_count}. Possible stale RPC."
+                        )
+                    else:
+                        self.logger.debug(
+                            f"{pos.symbol}: initialized TP count baseline = {current_tp_count}"
+                        )
                     continue
 
                 # Check if on-chain TP orders decreased (keepers executed one)
@@ -161,50 +170,74 @@ class SLTPMixin:
                             except Exception as e:
                                 self.logger.debug(f"Historical price check failed for TP{i+1}: {e}")
 
-                # Layer 3: Trust on-chain state (final fallback)
-                # If on-chain TP orders disappeared but neither current nor historical
-                # price verified, STILL mark TPs as hit. The GMX keeper executed them
-                # — that's on-chain proof. NOT moving SL would leave the position
-                # unprotected, which is far worse than a false positive.
+                # Layer 3: Verify via on-chain PositionDecrease events
+                # Price didn't confirm, but TP orders disappeared. Check if a
+                # keeper actually executed a decrease (vs cancellation/resync).
                 if new_hits < on_chain_hits:
                     remaining_to_match = on_chain_hits - new_hits
-                    self.logger.warning(
-                        f"{pos.symbol}: {remaining_to_match} TP(s) confirmed by on-chain state "
-                        f"(keeper executed) but price ${current_price:,.0f} bounced. "
-                        f"Trusting on-chain — marking as hit and moving SL."
-                    )
-                    for i, tp in enumerate(sorted_tps):
-                        if remaining_to_match <= 0:
-                            break
-                        if not tp.executed:
-                            tp.executed = True
-                            tp.executed_at = time.time()
-                            new_hits += 1
-                            remaining_to_match -= 1
-                            self.logger.info(
-                                f"{pos.symbol} TP{i+1} HIT @ ${tp.price:,.0f} "
-                                f"(on-chain keeper confirmed, price bounced to ${current_price:,.0f})"
-                            )
-                    await self.notify(
-                        f"🎯 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                        f"TP executed on-chain by keeper (price bounced to ${current_price:,.0f})\n"
-                        f"On-chain state is source of truth — moving SL as planned."
-                    )
+                    try:
+                        decreases = await asyncio.to_thread(
+                            fetch_recent_position_decreases,
+                            self.w3, acct.address, pos.market_addr,
+                            pos.side == "LONG", 600,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"{pos.symbol}: failed to fetch position decreases: {e}")
+                        decreases = []
+
+                    if decreases:
+                        # Match decrease events to unexecuted TPs by execution price
+                        for decrease in decreases:
+                            if remaining_to_match <= 0:
+                                break
+                            exec_price = decrease.get("execution_price", 0)
+                            if not exec_price:
+                                continue
+                            for i, tp in enumerate(sorted_tps):
+                                if tp.executed:
+                                    continue
+                                # Match if execution price is within 1% of TP trigger
+                                if tp.price > 0 and abs(exec_price - tp.price) / tp.price < 0.01:
+                                    tp.executed = True
+                                    tp.executed_at = time.time()
+                                    tp.realized_pnl_usd = decrease.get("net_pnl_usd")
+                                    new_hits += 1
+                                    remaining_to_match -= 1
+                                    self.logger.info(
+                                        f"{pos.symbol} TP{i+1} HIT @ ${exec_price:,.0f} "
+                                        f"(PositionDecrease event confirmed, "
+                                        f"pnl=${decrease.get('net_pnl_usd', 0):,.2f}, "
+                                        f"price bounced to ${current_price:,.0f})"
+                                    )
+                                    break
+
+                    if remaining_to_match > 0:
+                        # No on-chain event found — likely cancellation/resync, not a real hit
+                        self.logger.warning(
+                            f"{pos.symbol}: {remaining_to_match} TP order(s) disappeared "
+                            f"but NO PositionDecrease event found and price didn't verify. "
+                            f"NOT marking as hit (likely cancellation/resync)."
+                        )
 
                 if new_hits > 0:
                     pos.tp_hits_count += new_hits
                     self.logger.info(f"{pos.symbol} {pos.side}: {new_hits} new TP hits, total={pos.tp_hits_count}")
 
-                    # Calculate realized PnL from all executed TPs
+                    # Calculate realized PnL — prefer actual on-chain PnL over theoretical
                     executed_tps = [tp for tp in pos.take_profits if tp.executed]
                     remaining_tps = [tp for tp in pos.take_profits if not tp.executed]
                     realized_pnl = 0.0
                     for tp in executed_tps:
-                        tp_size = pos.size_usd * tp.percentage
-                        if pos.side == "LONG":
-                            realized_pnl += ((tp.price - pos.entry_price) / pos.entry_price) * tp_size
+                        if tp.realized_pnl_usd is not None:
+                            # Actual PnL from on-chain PositionDecrease event
+                            realized_pnl += tp.realized_pnl_usd
                         else:
-                            realized_pnl += ((pos.entry_price - tp.price) / pos.entry_price) * tp_size
+                            # Theoretical estimate (corrected on next sync)
+                            tp_size = pos.size_usd * tp.percentage
+                            if pos.side == "LONG":
+                                realized_pnl += ((tp.price - pos.entry_price) / pos.entry_price) * tp_size
+                            else:
+                                realized_pnl += ((pos.entry_price - tp.price) / pos.entry_price) * tp_size
                     pos.realized_pnl = realized_pnl
                     self._save_position_state()
 
@@ -305,12 +338,18 @@ class SLTPMixin:
             cancelled = 0
             for cleanup_round in range(3):
                 fresh_orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
-                sl_orders = [
+                all_sl_orders = [
                     o for o in fresh_orders
                     if o["market"].lower() == market_lower
                     and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
-                    and o.get("key_hex")
                 ]
+                keyless = [o for o in all_sl_orders if not o.get("key_hex")]
+                if keyless:
+                    self.logger.warning(
+                        f"{pos.symbol}: {len(keyless)} SL order(s) missing key_hex — "
+                        f"cannot cancel. May leave orphaned SL on-chain."
+                    )
+                sl_orders = [o for o in all_sl_orders if o.get("key_hex")]
                 if not sl_orders:
                     break
                 for sl_order in sl_orders:
@@ -327,33 +366,85 @@ class SLTPMixin:
                         self.logger.warning(f"Cancel SL failed for {pos.symbol}: {e}")
                 await asyncio.sleep(2)
 
-            # 2. Create new SL order at new price
             order_vault = Web3.to_checksum_address(cfg.order_vault)
             collateral_token = Web3.to_checksum_address(cfg.collateral_token)
 
-            # Calculate remaining position size after executed TPs
-            remaining_size = pos.size_usd
+            # Calculate remaining position size after executed TPs.
+            # Use original_size_usd (pre-TP) as the base, because after a restart
+            # pos.size_usd is synced from on-chain (already reduced by TPs).
+            # Applying executed_pct to the already-reduced size would double-count.
+            base_size = pos.original_size_usd or pos.size_usd
+            remaining_size = base_size
             if pos.take_profits:
                 executed_pct = sum(tp.percentage for tp in pos.take_profits if tp.executed)
-                remaining_size = pos.size_usd * max(1.0 - executed_pct, 0.01)
+                remaining_size = base_size * max(1.0 - executed_pct, 0.01)
 
-            try:
-                new_sl_txh = await asyncio.to_thread(
-                    create_sl_order,
-                    self.w3, acct, exchange, acct.address,
-                    pos.market_addr, collateral_token, order_vault,
-                    new_sl_price, remaining_size, pos.symbol, pos.side == "LONG",
-                    cfg.slippage_bps, cfg.execution_fee_wei, cfg.dry_run,
+            # 2. Create new SL order at new price (with retry)
+            MAX_SL_ATTEMPTS = 3
+            SL_RETRY_DELAY = 5  # seconds
+            new_sl_txh = None
+            last_sl_error = None
+
+            for attempt in range(1, MAX_SL_ATTEMPTS + 1):
+                try:
+                    if attempt > 1:
+                        self.logger.info(
+                            f"{pos.symbol} {pos.side}: SL move attempt {attempt}/{MAX_SL_ATTEMPTS}..."
+                        )
+                    new_sl_txh = await asyncio.to_thread(
+                        create_sl_order,
+                        self.w3, acct, exchange, acct.address,
+                        pos.market_addr, collateral_token, order_vault,
+                        new_sl_price, remaining_size, pos.symbol, pos.side == "LONG",
+                        cfg.slippage_bps, cfg.execution_fee_wei, cfg.dry_run,
+                    )
+                    self.logger.info(
+                        f"New SL order created for {pos.symbol} at ${new_sl_price:,.0f} "
+                        f"size=${remaining_size:,.2f}: {new_sl_txh}"
+                    )
+                    break  # success
+                except Exception as e:
+                    last_sl_error = e
+                    self.logger.warning(
+                        f"SL move attempt {attempt}/{MAX_SL_ATTEMPTS} failed for "
+                        f"{pos.symbol}: {e}"
+                    )
+                    if attempt < MAX_SL_ATTEMPTS:
+                        await asyncio.sleep(SL_RETRY_DELAY)
+
+            if new_sl_txh is None:
+                self.logger.error(
+                    f"Failed to create new SL order for {pos.symbol} after "
+                    f"{MAX_SL_ATTEMPTS} attempts: {last_sl_error}"
                 )
-                self.logger.info(f"New SL order created for {pos.symbol} at ${new_sl_price:,.0f} size=${remaining_size:,.2f}: {new_sl_txh}")
-            except Exception as e:
-                self.logger.error(f"Failed to create new SL order for {pos.symbol}: {e}")
                 pos.sl_move_failed = True
+
+                # Queue for automatic retry via order_retry_loop
+                from gmx import FailedOrder  # late import to avoid circular dep
+                self.failed_order_queue.append(FailedOrder(
+                    position_id=pos.id,
+                    symbol=pos.symbol,
+                    side=pos.side,
+                    market_addr=pos.market_addr,
+                    wallet_id=pos.wallet_id,
+                    order_kind="sl",
+                    price=new_sl_price,
+                    size_usd=remaining_size,
+                    close_pct=1.0,
+                    is_long=(pos.side == "LONG"),
+                    error=str(last_sl_error),
+                ))
+                self.logger.info(
+                    f"Queued failed SL for retry: {pos.symbol} {pos.side} "
+                    f"@ ${new_sl_price:,.2f} size=${remaining_size:,.2f}"
+                )
+
                 await self.notify(
                     f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                    f"Failed to move SL to {sl_label} (${new_sl_price:,.2f})\n"
-                    f"Error: {e}\n"
-                    f"Old SL cancelled ({cancelled}). Manual intervention may be needed."
+                    f"Failed to move SL to {sl_label} (${new_sl_price:,.2f}) "
+                    f"after {MAX_SL_ATTEMPTS} attempts\n"
+                    f"Error: {last_sl_error}\n"
+                    f"Old SL cancelled ({cancelled}). Queued for automatic retry."
                 )
                 return
 
@@ -753,6 +844,8 @@ class SLTPMixin:
             tp_pct = tp_size / pos.size_usd
             tp_allocations.append((tp_price, tp_size, tp_pct))
 
+        collateral_usd = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+
         results = []
         for tp_price, tp_size, tp_pct in tp_allocations:
             tp = TakeProfit(price=tp_price, close_pct=tp_pct)
@@ -761,7 +854,8 @@ class SLTPMixin:
                     create_tp_order,
                     self.w3, acct, exchange, acct.address,
                     pos.market, collateral_token, order_vault,
-                    tp, pos.size_usd, pos.symbol, pos.is_long,
+                    tp, pos.size_usd, collateral_usd,
+                    pos.symbol, pos.is_long,
                     cfg.slippage_bps, cfg.execution_fee_wei, cfg.dry_run,
                 )
                 results.append((tp_price, tp_size, tp_pct * 100, txh, None))
@@ -786,8 +880,21 @@ class SLTPMixin:
         else:
             msg += "\nAll TPs failed."
 
-        # Set cooldown so reconcile/TP monitor don't interfere with new orders
+        # Update internal position state with successfully placed TPs
         if ok:
+            internal_pos = self._find_internal_position(pos.market, pos.is_long, pos._wallet_id if hasattr(pos, '_wallet_id') else 0)
+            if internal_pos:
+                for tp_price, tp_size, tp_pct_100, txh, err in results:
+                    if txh:
+                        internal_pos.take_profits.append(
+                            TakeProfitLevel(price=tp_price, percentage=tp_pct_100 / 100.0)
+                        )
+                internal_pos.last_known_tp_count = len([
+                    tp for tp in internal_pos.take_profits if not tp.executed
+                ])
+                self._save_position_state()
+
+            # Set cooldown so reconcile/TP monitor don't interfere with new orders
             self._set_orders_cooldown(30)
 
         await self.send_message(chat_id, msg)

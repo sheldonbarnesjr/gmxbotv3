@@ -219,18 +219,19 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # Fetch on-chain trades (merged with local store)
-        all_stored = await self._fetch_and_store_trades()
-        reset_ts = self._get_pnl_reset_ts()
-        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+        all_trades = await self._fetch_and_store_trades()
+
+        def _net(t):
+            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
 
         # Tag with symbol, exclude dust (< $1)
         trades = []
         for t in all_trades:
-            if abs(t.get("pnl_usd", 0)) < 1:
+            if abs(_net(t)) < 1:
                 continue
             sym = market_to_sym.get((t.get("market_address") or "").lower())
             if sym:
-                trades.append({"pnl_usd": t["pnl_usd"], "sym": sym})
+                trades.append({"pnl": _net(t), "sym": sym})
 
         if symbol:
             trades = [t for t in trades if t["sym"] == symbol.upper()]
@@ -243,12 +244,12 @@ class AnalyticsMixin:
             await self.send_message(chat_id, f"No closed trades{label} yet.")
             return
 
-        wins = [t for t in trades if t["pnl_usd"] > 0]
-        losses = [t for t in trades if t["pnl_usd"] < 0]
-        total_pnl = sum(t["pnl_usd"] for t in trades)
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] < 0]
+        total_pnl = sum(t["pnl"] for t in trades)
         win_rate = len(wins) / len(trades) * 100
-        avg_win = sum(t["pnl_usd"] for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0
+        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
 
         title = "Win Rate"
         if symbol:
@@ -269,24 +270,6 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command: /pnl
     # ──────────────────────────────────────────────────────────────────────
-
-    # ── PnL reset timestamp persistence ──
-
-    PNL_RESET_FILE = "pnl_reset.json"
-
-    def _get_pnl_reset_ts(self) -> int:
-        """Load the PnL reset timestamp. Returns 0 if never reset."""
-        try:
-            with open(self.PNL_RESET_FILE, "r") as f:
-                data = json.load(f)
-                return int(data.get("reset_ts", 0))
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return 0
-
-    def _set_pnl_reset_ts(self, ts: int):
-        """Save the PnL reset timestamp."""
-        with open(self.PNL_RESET_FILE, "w") as f:
-            json.dump({"reset_ts": ts}, f)
 
     # ── On-chain trade local storage ──
 
@@ -372,7 +355,6 @@ class AnalyticsMixin:
         now = datetime.now(ET)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_cutoff = int(today_start.timestamp())
-        reset_ts = self._get_pnl_reset_ts()
 
         # Build reverse map: market_address (lower) → symbol
         market_to_sym = {}
@@ -381,9 +363,7 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # ── Fetch on-chain trades (merged with local store) ──
-        all_stored = await self._fetch_and_store_trades()
-        # Apply reset timestamp filter
-        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+        all_trades = await self._fetch_and_store_trades()
 
         def _net(t):
             return t.get("net_pnl_usd", t.get("pnl_usd", 0))
@@ -475,33 +455,6 @@ class AnalyticsMixin:
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
-    # Telegram command: /reset
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def cmd_reset(self, chat_id: int):
-        """Telegram /reset command handler.
-
-        Saves a reset timestamp so /pnl only queries trades after this point.
-        Also clears local trade history and health stats.
-        """
-        count = len(self.trade_history)
-        self.trade_history.clear()
-        self._save_trade_history()
-        self.health_stats["trades_executed"] = 0
-        self.health_stats["signals_processed"] = 0
-
-        # Save reset timestamp — /pnl will only show trades after this
-        reset_ts = int(time.time())
-        self._set_pnl_reset_ts(reset_ts)
-
-        self.logger.info(f"Trade history reset: cleared {count} trade(s), reset_ts={reset_ts}")
-        await self.send_message(
-            chat_id,
-            f"PnL reset. Only trades from now onward will appear in /pnl.\n"
-            f"(Cleared {count} local trade records)"
-        )
-
-    # ──────────────────────────────────────────────────────────────────────
     # Telegram command: /health
     # ──────────────────────────────────────────────────────────────────────
 
@@ -543,9 +496,7 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # Fetch on-chain trades (merged with local store)
-        all_stored = await self._fetch_and_store_trades()
-        reset_ts = self._get_pnl_reset_ts()
-        on_chain = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+        on_chain = await self._fetch_and_store_trades()
 
         if not on_chain and not self.trade_history:
             await self.send_message(chat_id, "No trades to export.")

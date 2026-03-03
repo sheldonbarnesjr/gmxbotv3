@@ -551,7 +551,7 @@ def parse_signal(text: str) -> Signal:
 
     # ── Entry ──
     entry_match = re.search(
-        r'(?:ENTRY|ENTER|ENTRY\s*ZONE)\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?([\d,]+(?:\.\d+)?)',
+        r'(?:ENTRY|ENTER|ENTRY\s*ZONE)\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*[a-zA-Z]*\s*[-–]\s*\$?([\d,]+(?:\.\d+)?)',
         txt, re.IGNORECASE
     )
     if entry_match:
@@ -579,7 +579,7 @@ def parse_signal(text: str) -> Signal:
     # The separator [:=@\-$] is REQUIRED to prevent backtracking where
     # the TP number (e.g. "1") gets captured as the price ($1).
     tp_pattern = re.compile(
-        r'TP\s*(\d+)?\s*[:=@\-$]\s*\$?([\d,]+(?:\.\d+)?)\s*'
+        r'\bTP\s*(\d+)?\s*[:=@\-$]\s*\$?([\d,]+(?:\.\d+)?)\s*'
         r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
         re.IGNORECASE
     )
@@ -592,7 +592,7 @@ def parse_signal(text: str) -> Signal:
 
     # Pattern 2: TARGET 1: 48000, TAKE PROFIT: 48000
     target_pattern = re.compile(
-        r'(?:TARGET|TAKE\s*PROFIT)\s*\d?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
+        r'(?:TARGET|TAKE\s*PROFIT)\s*\d*\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
         r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
         re.IGNORECASE
     )
@@ -603,8 +603,18 @@ def parse_signal(text: str) -> Signal:
         pct = float(pct_str) / 100.0 if pct_str else None
         tp_from_target.append(TakeProfit(price=price, close_pct=pct or 0))
 
-    # Use whichever pattern found more TPs
-    take_profits = tp_from_tp if len(tp_from_tp) >= len(tp_from_target) else tp_from_target
+    # Merge both pattern results and deduplicate by price.
+    # If both patterns found results, combine them (handles mixed-format signals).
+    # Dedup by price to avoid doubles when both patterns match the same line.
+    if tp_from_tp and tp_from_target:
+        seen_prices = set()
+        take_profits = []
+        for tp in tp_from_tp + tp_from_target:
+            if tp.price not in seen_prices:
+                seen_prices.add(tp.price)
+                take_profits.append(tp)
+    else:
+        take_profits = tp_from_tp or tp_from_target
 
     # Sanity check: filter out TP prices that are absurdly far from entry.
     # This catches regex backtracking bugs (e.g. TP number parsed as price: $1, $2, $3)
@@ -694,7 +704,7 @@ def parse_signal(text: str) -> Signal:
 
     # ── Stop Loss ──
     sl_match = re.search(
-        r'(?:SL|STOP\s*LOSS|STOP)\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)',
+        r'(?:SL|STOP\s*LOSS|STOP(?=\s*[:=@\-$]))\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)',
         txt, re.IGNORECASE
     )
     if not sl_match:
@@ -1368,6 +1378,13 @@ def fetch_open_orders(w3: Web3, wallet_addr: str) -> list:
         if key_idx >= 0 and key_idx < len(active_keys):
             result.append({**o, "key_hex": active_keys[key_idx].hex()})
         else:
+            log.warning(
+                f"fetch_open_orders: order #{i} has no key_hex — "
+                f"market={o.get('market', '?')[:10]}, "
+                f"type={o.get('order_type_name', o.get('order_type', '?'))}, "
+                f"trigger=${o.get('trigger_price', 0):,.2f}. "
+                f"This order cannot be cancelled by the bot."
+            )
             result.append({**o, "key_hex": None})
 
     return result
@@ -2443,19 +2460,27 @@ if __name__ == "__main__":
                     f"capping to {MAX_LEV}x")
         signal.leverage = MAX_LEV
 
-    # Validate TP/SL makes sense
+    # Validate TP/SL makes sense — actually remove invalid TPs
+    valid_tps = []
     if signal.is_long:
         for tp in signal.take_profits:
             if tp.price <= signal.entry_low:
-                log.warning(f"TP ${tp.price:,.2f} is below entry — skipping")
+                log.warning(f"TP ${tp.price:,.2f} is below entry — removing")
+            else:
+                valid_tps.append(tp)
         if signal.stop_loss >= signal.entry_low:
             log.warning(f"SL ${signal.stop_loss:,.2f} is above entry range — risky!")
     else:
         for tp in signal.take_profits:
             if tp.price >= signal.entry_high:
-                log.warning(f"TP ${tp.price:,.2f} is above entry — skipping")
+                log.warning(f"TP ${tp.price:,.2f} is above entry — removing")
+            else:
+                valid_tps.append(tp)
         if signal.stop_loss <= signal.entry_high:
             log.warning(f"SL ${signal.stop_loss:,.2f} is below entry range — risky!")
+    if len(valid_tps) < len(signal.take_profits):
+        log.warning(f"Removed {len(signal.take_profits) - len(valid_tps)} invalid TP(s)")
+        signal.take_profits = valid_tps
 
     # Check ETH balance covers all execution fees
     num_orders = 1 + len(signal.take_profits) + (1 if signal.stop_loss else 0)

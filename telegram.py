@@ -12,7 +12,7 @@ Other Telegram features have been moved to specialized mixins:
   - SLTPMixin (sl_tp.py): cmd_sl(), cmd_addorder(), cmd_cancelorder()
   - WalletMixin (wallet_mgmt.py): cmd_balance(), cmd_gas(), cmd_topup(), cmd_balance_wallets()
   - PriceFeedsMixin (price_feeds.py): cmd_prices()
-  - AnalyticsMixin (analytics.py): cmd_winrate(), cmd_pnl(), cmd_reset(), cmd_health()
+  - AnalyticsMixin (analytics.py): cmd_winrate(), cmd_pnl(), cmd_health()
 
 GMXBot inherits from all mixins to get full command coverage.
 """
@@ -65,10 +65,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /balance-wallets — Manually rebalance USDC between wallets (W1-W4)
 /cancel — Cancel a pending withdraw or close
 /cancelorder — List & cancel individual SL/TP orders by number
-/close — Show positions + open orders
-/close all — Close all positions + cancel all orders
-/close BTC — Close by symbol
-/confirm — Confirm pending close
+/close [all|SYMBOL] — Close positions (/confirm to execute)
 /consolidate — Move ALL free USDC from W2-W4 into W1 (for withdrawals)
 /gas — ETH gas balances for all wallets
 /halt [reason] — Halt trading
@@ -81,12 +78,8 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /pnl — PnL summary (today / 30d / all time) for BTC, SOL, ETH
 /positions — Show on-chain positions
 /prices — Live GMX & Chainlink prices for all tracked assets
-/reset — Clear all trade history & PnL stats
 /resume [reason] — Resume trading
-/retryqueue — Show pending failed order retries
-/sl — Move SL to entry or TP level
-/sl 1 entry — Move #1 SL to entry (breakeven)
-/sl 1 tp2 — Move #1 SL to TP2 price
+/sl [# entry|tp1|tp2] — Move SL to entry or TP level
 /status — Bot status & mode
 /sync — Force re-sync positions from on-chain
 /summary — Send daily summary now
@@ -123,7 +116,7 @@ class CoreTelegramMixin:
         cmd_sl(), cmd_addorder(), cmd_cancelorder() — from SLTPMixin
         cmd_balance(), cmd_gas(), cmd_topup(), cmd_balance_wallets() — from WalletMixin
         cmd_prices() — from PriceFeedsMixin
-        cmd_winrate(), cmd_pnl(), cmd_reset(), cmd_health() — from AnalyticsMixin
+        cmd_winrate(), cmd_pnl(), cmd_health() — from AnalyticsMixin
     """
 
     # ──────────────────────────────────────────────────────────────────────
@@ -327,8 +320,6 @@ class CoreTelegramMixin:
                 await self.cmd_balance(chat_id)
             elif cmd == "/pnl":
                 await self.cmd_pnl(chat_id)
-            elif cmd == "/reset":
-                await self.cmd_reset(chat_id)
             elif cmd == "/summary":
                 await self.send_daily_summary()
             elif cmd in ("/balance-wallets", "/rebalance"):
@@ -361,8 +352,6 @@ class CoreTelegramMixin:
             elif cmd == "/tradesize":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_tradesize(chat_id, arg)
-            elif cmd == "/retryqueue":
-                await self.cmd_retryqueue(chat_id)
             elif cmd == "/pdf":
                 await self.cmd_pdf(chat_id)
             elif cmd == "/sync":
@@ -534,8 +523,7 @@ class CoreTelegramMixin:
                         internal = ip
                         break
 
-                # Calculate realized PnL from filled TPs
-                realized_pnl = 0.0
+                # TP hit info from internal state
                 tp_hits = 0
                 total_tps = 0
                 sl_label = None
@@ -543,13 +531,6 @@ class CoreTelegramMixin:
                     tp_hits = internal.tp_hits_count
                     total_tps = len(internal.take_profits)
                     sl_label = internal.sl_move_label
-                    for tp in internal.take_profits:
-                        if tp.executed and pos.entry_price and pos.entry_price > 0:
-                            tp_size = internal.size_usd * tp.percentage
-                            if pos.is_long:
-                                realized_pnl += ((tp.price - pos.entry_price) / pos.entry_price) * tp_size
-                            else:
-                                realized_pnl += ((pos.entry_price - tp.price) / pos.entry_price) * tp_size
 
                 current_str = f"${display_price:,.2f}" if display_price else "N/A"
                 entry_str = f"${pos.entry_price:,.2f}" if pos.entry_price else "N/A"
@@ -569,34 +550,40 @@ class CoreTelegramMixin:
                     fee_line = f"  Fees:    -${total_fees:,.2f} (borrow: ${pos.borrowing_fee_usd:,.2f}, fund: ${pos.funding_fee_usd:,.2f}, close: ${pos.closing_fee_usd:,.2f})\n"
 
                 if tp_hits > 0:
-                    total_pnl_combined = realized_pnl + pnl
-                    r_sign = "+" if realized_pnl >= 0 else ""
-                    t_sign = "+" if total_pnl_combined >= 0 else ""
                     msg += (
                         f"  TPs:     {tp_hits}/{total_tps} hit"
                         + (f" (SL → {sl_label})" if sl_label else "")
                         + "\n"
-                        f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
-                        f"  Unrealized: {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
                     )
-                    if fee_line:
-                        msg += fee_line
-                    msg += f"  **Total PnL: {t_sign}${total_pnl_combined:,.2f}**\n"
-                else:
-                    msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
-                    if fee_line:
-                        msg += fee_line
+                msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                if fee_line:
+                    msg += fee_line
 
-                if sl_orders or tp_orders:
+                if sl_orders or tp_orders or (internal and tp_hits > 0):
                     msg += "  TP & SL:\n"
-                    # Shorts: sort TPs highest→lowest (price drops toward targets)
-                    # Longs: sort TPs lowest→highest (price rises toward targets)
+
+                    # Show executed (hit) TPs first with checkmark
+                    hit_tp_num = 0
+                    if internal:
+                        internal_sorted = sorted(
+                            internal.take_profits,
+                            key=lambda t: t.price,
+                            reverse=(not pos.is_long),
+                        )
+                        for tp_level in internal_sorted:
+                            if tp_level.executed:
+                                hit_tp_num += 1
+                                msg += f"  TP{hit_tp_num} ✅ ${tp_level.price:,.2f} — HIT\n"
+
+                    # Remaining on-chain TPs — numbered after hit TPs
                     sorted_tps = sorted(
                         tp_orders,
                         key=lambda x: x.get("trigger_price", 0) or 0,
                         reverse=not pos.is_long,
                     )
+                    tp_num_offset = hit_tp_num  # offset so TP numbering continues
                     for j, o in enumerate(sorted_tps, 1):
+                        tp_num = tp_num_offset + j
                         tp_price = o.get("trigger_price", 0) or 0
 
                         # % of position closing at this TP
@@ -606,17 +593,14 @@ class CoreTelegramMixin:
                             close_pct = (tp_size / pos.size_usd) * 100
                             close_pct_str = f" (closes {close_pct:.0f}%)"
                         elif internal:
-                            # Fall back to internal TP percentage if available
                             remaining_tps = [t for t in internal.take_profits if not t.executed]
                             remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
                             if j - 1 < len(remaining_tps_sorted):
                                 close_pct_str = f" (closes {remaining_tps_sorted[j-1].percentage:.0%})"
 
                         if tp_price and pos.entry_price and pos.entry_price > 0:
-                            # Token price change % — raw direction (negative for shorts)
                             price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
 
-                            # Projected PnL — only for the portion closing at this TP
                             if pos.is_long:
                                 pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
                             else:
@@ -625,7 +609,6 @@ class CoreTelegramMixin:
                             tp_close_size = tp_size if tp_size > 0 else pos.size_usd
                             proj = pnl_per_dollar * tp_close_size
 
-                            # PnL % on collateral for this TP portion
                             collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
                             tp_collateral = collateral * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else collateral
                             pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
@@ -635,13 +618,13 @@ class CoreTelegramMixin:
                             chg_sign = "+" if price_chg >= 0 else ""
                             sym = pos.symbol or ""
                             msg += (
-                                f"  TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
+                                f"  TP{tp_num}{close_pct_str} @ ${tp_price:,.2f}\n"
                                 f"     ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
                             )
                         elif tp_price:
-                            msg += f"  TP{j}{close_pct_str} @ ${tp_price:,.2f}\n"
+                            msg += f"  TP{tp_num}{close_pct_str} @ ${tp_price:,.2f}\n"
                         else:
-                            msg += f"  TP{j} @ unknown\n"
+                            msg += f"  TP{tp_num} @ unknown\n"
 
                     # SL at the bottom — deduplicate if multiple exist on-chain
                     if len(sl_orders) > 1:
@@ -1299,11 +1282,8 @@ class CoreTelegramMixin:
                 market_to_sym[addr.lower()] = sym
 
         # ── Today's realized trades from on-chain (all wallets, stored locally) ──
-        reset_ts = self._get_pnl_reset_ts()
-        since = max(today_cutoff, reset_ts) if reset_ts else today_cutoff
-
         all_stored = await self._fetch_and_store_trades()
-        today_trades = [t for t in all_stored if t.get("timestamp", 0) >= since]
+        today_trades = [t for t in all_stored if t.get("timestamp", 0) >= today_cutoff]
 
         # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum.
         # Use net_pnl_usd (includes fees + price impact) with fallback to
@@ -1333,29 +1313,14 @@ class CoreTelegramMixin:
                     unrealized_pnl += cp.unrealized_pnl
                     open_count += 1
                     side = "LONG" if cp.is_long else "SHORT"
-                    # Realized PnL from executed TPs (calculate from TP data)
-                    pos_realized = 0.0
-                    for ip in self.positions.values():
-                        if (ip.is_open and ip.market_addr
-                                and ip.market_addr.lower() == cp.market.lower()
-                                and ip.side == side and ip.wallet_id == wid):
-                            for tp in ip.take_profits:
-                                if tp.executed and cp.entry_price and cp.entry_price > 0:
-                                    tp_size = ip.size_usd * tp.percentage
-                                    if cp.is_long:
-                                        pos_realized += ((tp.price - cp.entry_price) / cp.entry_price) * tp_size
-                                    else:
-                                        pos_realized += ((cp.entry_price - tp.price) / cp.entry_price) * tp_size
-                            break
-                    total_pos = cp.unrealized_pnl + pos_realized
+                    # Use on-chain unrealized PnL directly. After partial TP
+                    # fills the position size is reduced on-chain, so this
+                    # already reflects the remaining position. Realized PnL
+                    # from TP fills shows up in the "Closed" section.
+                    total_pos = cp.unrealized_pnl
                     t_sign = "+" if total_pos >= 0 else ""
-                    detail = ""
-                    if pos_realized:
-                        r_s = "+" if pos_realized >= 0 else ""
-                        u_s = "+" if cp.unrealized_pnl >= 0 else ""
-                        detail = f" (rlz: {r_s}${pos_realized:,.2f}, unrlz: {u_s}${cp.unrealized_pnl:,.2f})"
                     open_lines.append(
-                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f}{detail}"
+                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f}"
                     )
         except Exception as e:
             self.logger.warning(f"PnL Update: could not fetch positions: {e}")
@@ -1412,9 +1377,7 @@ class CoreTelegramMixin:
                 market_to_sym[addr.lower()] = sym
 
         # ── Fetch on-chain trades (merged with local store) ──
-        all_stored = await self._fetch_and_store_trades()
-        reset_ts = self._get_pnl_reset_ts()
-        all_trades = [t for t in all_stored if t.get("timestamp", 0) >= reset_ts] if reset_ts else all_stored
+        all_trades = await self._fetch_and_store_trades()
 
         def _net(t):
             return t.get("net_pnl_usd", t.get("pnl_usd", 0))
@@ -1439,7 +1402,7 @@ class CoreTelegramMixin:
         daily_count = len(todays_trades)
         daily_winrate = (daily_wins / daily_count * 100) if daily_count else 0.0
 
-        # ── Lifetime stats (since reset) ──
+        # ── Lifetime stats ──
         lifetime_pnl = sum(_net(t) for t in tagged)
         lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
         lifetime_losses = sum(1 for t in tagged if _net(t) <= 0)

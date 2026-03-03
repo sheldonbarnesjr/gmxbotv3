@@ -59,6 +59,7 @@ from risk import (
     classify_exit_reason,
     calculate_unrealized_pnl,
     determine_new_sl_target,
+    verify_tp_hit_by_price,
 )
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -89,6 +90,7 @@ from open import (  # type: ignore[assignment]  # noqa: A004
     create_sl_order,
     create_tp_order,
     fetch_current_price,
+    fetch_price_touched_in_window,
     cancel_orders_for_market,
     cancel_all_orders,
     fetch_open_orders,
@@ -121,6 +123,7 @@ class TakeProfitLevel:
     percentage: float
     executed: bool = False
     executed_at: Optional[float] = None
+    realized_pnl_usd: Optional[float] = None  # actual PnL from on-chain event
 
 
 @dataclass
@@ -181,6 +184,7 @@ class Position:
     pending_fill_since: Optional[float] = None  # timestamp when limit order was placed
     current_sl_key: Optional[str] = None  # hex key of the SL order we placed (to avoid cancelling it accidentally)
     original_size_usd: float = 0.0  # position size at open (before any partial TP closes)
+    expected_tp_count: int = 0  # count of TPs from the parsed signal (before placement)
 
     @property
     def short_id(self) -> str:
@@ -278,6 +282,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # to prevent false TP-hit detection from manual order changes.
         self._orders_cooldown_until: float = 0.0
 
+        # 2-cycle confirmation: track TPs missing from on-chain across reconcile cycles.
+        # Key = "pos_id:tp_price", value = miss count. Only mark executed after 2 misses.
+        self._reconcile_missing_tps: dict = {}
+
+        # 2-check guard: track positions missing from on-chain across check cycles.
+        # Key = pos_id, value = consecutive miss count. Only close after 2 misses.
+        self._position_missing_count: dict = {}
+
         self.setup_logging()
 
     def setup_logging(self):
@@ -304,6 +316,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     def _in_orders_cooldown(self) -> bool:
         return time.time() < self._orders_cooldown_until
 
+    def _find_internal_position(self, market_addr: str, is_long: bool, wallet_id: int = 0):
+        """Find the internal Position matching a market+side+wallet."""
+        market_lower = market_addr.lower()
+        side = "LONG" if is_long else "SHORT"
+        for pos in self.positions.values():
+            if (pos.is_open and pos.market_addr
+                    and pos.market_addr.lower() == market_lower
+                    and pos.side == side
+                    and (wallet_id == 0 or pos.wallet_id == wallet_id)):
+                return pos
+        return None
+
     # ──────────────────────────────────────────────────────────────────────
     # Position state persistence (realized PnL survives restarts)
     # ──────────────────────────────────────────────────────────────────────
@@ -326,6 +350,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 "executed_tp_indices": executed_indices,
                 "sl_move_label": pos.sl_move_label,
                 "sl_moved_to_entry": pos.sl_moved_to_entry,
+                "expected_tp_count": pos.expected_tp_count,
+                "opened_at": pos.opened_at,
             }
         try:
             with open(self.POSITION_STATE_FILE, "w") as f:
@@ -569,52 +595,134 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     take_profits=take_profits,
                 )
 
-                # ── Infer TP hits from SL position ──
-                # New trailing strategy:
-                #   SL at entry → 2 hits (TP1+TP2, both leave SL at entry)
-                #   SL past entry → 3+ hits (SL at TP1 or TP2)
-                if reconstructed_sl and cp.entry_price and cp.entry_price > 0 and take_profits:
-                    inferred_hits = self._infer_tp_hits(
-                        side, cp.entry_price, reconstructed_sl, take_profits
-                    )
-                    if inferred_hits > 0:
-                        pos.tp_hits_count = inferred_hits
-                        pos.sl_moved_to_entry = True
-                        # Label mapping for new trailing strategy:
-                        #   1-2 hits → SL at "Entry"
-                        #   3 hits → SL at "TP1"
-                        #   4+ hits → SL at "TP2"
-                        if inferred_hits <= 2:
-                            pos.sl_move_label = "Entry"
-                        elif inferred_hits == 3:
-                            pos.sl_move_label = "TP1"
-                        else:
-                            pos.sl_move_label = "TP2"
-                        self.logger.info(
-                            f"Sync: inferred {inferred_hits} TP hit(s) for {symbol} {side} [W{wid}] "
-                            f"(SL @ ${reconstructed_sl:,.2f}, label={pos.sl_move_label})"
-                        )
-
-                # ── Overlay persisted state (realized PnL, executed TPs) ──
+                # ── Reconstruct TP state from on-chain events (JSON as fallback) ──
                 state_key = f"{wid}:{market_lower}:{side}"
                 saved = saved_state.get(state_key)
+
+                # Restore non-event fields from hint
                 if saved:
-                    pos.realized_pnl = saved.get("realized_pnl", 0.0)
                     pos.original_size_usd = saved.get("original_size_usd", pos.size_usd)
-                    # Persisted state is ground truth — prefer it over inference
+                    pos.expected_tp_count = saved.get("expected_tp_count", 0)
+                    if saved.get("opened_at"):
+                        pos.opened_at = saved["opened_at"]
+
+                # Try on-chain event reconstruction
+                events_ok = False
+                try:
+                    from history import fetch_recent_position_decreases
+                    lookback = int(time.time() - pos.opened_at) + 300  # + 5 min buffer
+                    lookback = max(lookback, 600)  # at least 10 min
+                    lookback = min(lookback, 30 * 86400)  # cap at 30 days
+                    decreases = await asyncio.to_thread(
+                        fetch_recent_position_decreases,
+                        self.w3, acct.address, market_lower,
+                        side == "LONG", lookback,
+                    )
+
+                    # Match events to TP levels by execution price
+                    matched_events = []
+                    on_chain_tp_prices = {round(tp.price, 2) for tp in take_profits}
+                    for evt in decreases:
+                        exec_price = evt.get("execution_price", 0)
+                        if not exec_price:
+                            continue
+                        # Skip events that match current on-chain TP prices
+                        # (those haven't been filled yet — this is a partial close or manual)
+                        if round(exec_price, 2) in on_chain_tp_prices:
+                            continue
+                        matched_events.append(evt)
+
+                    if matched_events or (saved and saved.get("expected_tp_count", 0) > 0):
+                        # Reconstruct hit TPs from events — insert back into take_profits
+                        is_long = side == "LONG"
+                        hit_tps = []
+                        for evt in matched_events:
+                            exec_price = evt["execution_price"]
+                            size_delta = evt.get("size_delta_usd", 0)
+                            pct = size_delta / pos.original_size_usd if pos.original_size_usd else 0
+                            tp_level = TakeProfitLevel(
+                                price=exec_price,
+                                percentage=pct,
+                                executed=True,
+                                executed_at=evt.get("timestamp", pos.opened_at),
+                                realized_pnl_usd=evt.get("net_pnl_usd"),
+                            )
+                            hit_tps.append(tp_level)
+
+                        # Merge hit TPs into the list (sorted by price)
+                        all_tps = list(take_profits) + hit_tps
+                        all_tps.sort(
+                            key=lambda t: t.price,
+                            reverse=(side == "SHORT"),
+                        )
+                        pos.take_profits = all_tps
+
+                        # Set counts and PnL from events
+                        pos.tp_hits_count = len(matched_events)
+                        pos.expected_tp_count = len(all_tps)
+                        pos.realized_pnl = sum(
+                            evt.get("net_pnl_usd", 0) for evt in matched_events
+                        )
+                        pos.original_size_usd = (
+                            cp.size_usd + sum(e.get("size_delta_usd", 0) for e in matched_events)
+                        )
+
+                        # Derive SL state from on-chain SL price
+                        if reconstructed_sl and cp.entry_price:
+                            entry = cp.entry_price
+                            if abs(reconstructed_sl - entry) / entry < 0.005:
+                                pos.sl_moved_to_entry = True
+                                pos.sl_move_label = "Entry"
+                            else:
+                                # Check if SL matches a hit TP execution price
+                                for i, evt in enumerate(matched_events):
+                                    ep = evt["execution_price"]
+                                    if ep > 0 and abs(reconstructed_sl - ep) / ep < 0.005:
+                                        pos.sl_move_label = f"TP{i+1}"
+                                        pos.sl_moved_to_entry = True
+                                        break
+
+                        events_ok = True
+                        self.logger.info(
+                            f"Sync: {symbol} {side} [W{wid}] rebuilt from on-chain events: "
+                            f"tp_hits={pos.tp_hits_count}, realized=${pos.realized_pnl:,.2f}, "
+                            f"total_tps={len(all_tps)}"
+                        )
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"Sync: {symbol} {side} [W{wid}] event query failed ({e}), "
+                        f"falling back to JSON hint"
+                    )
+
+                # Fallback to JSON hint if event reconstruction failed
+                if not events_ok and saved:
                     saved_hits = saved.get("tp_hits_count", 0)
+                    max_possible_hits = max(pos.expected_tp_count - tp_count, 0)
+                    if saved_hits > max_possible_hits:
+                        self.logger.warning(
+                            f"Sync: {symbol} {side} [W{wid}] hint tp_hits={saved_hits} "
+                            f"exceeds max possible {max_possible_hits}, capping"
+                        )
+                        saved_hits = max_possible_hits
+                        pos.realized_pnl = 0.0
+                    else:
+                        pos.realized_pnl = saved.get("realized_pnl", 0.0)
+
                     pos.tp_hits_count = saved_hits if saved_hits > 0 else pos.tp_hits_count
+
                     if saved.get("sl_move_label"):
                         pos.sl_move_label = saved["sl_move_label"]
                     if saved.get("sl_moved_to_entry"):
                         pos.sl_moved_to_entry = True
-                    # Mark executed TPs from saved indices
-                    for idx in saved.get("executed_tp_indices", []):
+
+                    executed_indices = saved.get("executed_tp_indices", [])[:max_possible_hits]
+                    for idx in executed_indices:
                         if idx < len(pos.take_profits):
                             pos.take_profits[idx].executed = True
                             pos.take_profits[idx].executed_at = pos.opened_at
                     self.logger.info(
-                        f"Sync: restored state for {symbol} {side} [W{wid}]: "
+                        f"Sync: {symbol} {side} [W{wid}] restored from JSON hint: "
                         f"realized=${pos.realized_pnl:,.2f}, tp_hits={pos.tp_hits_count}"
                     )
 
@@ -744,58 +852,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     f"— manual /sl needed. Error: {e}"
                 )
 
-    def _infer_tp_hits(
-        self, side: str, entry_price: float, sl_price: float,
-        take_profits: List[TakeProfitLevel],
-    ) -> int:
-        """Infer how many TPs have been hit based on current SL position.
-
-        New trailing SL strategy:
-          TP1 hit → SL to Entry
-          TP2 hit → no move (SL stays at Entry)
-          TP3 hit → SL to TP1
-          TP4+ hit → SL to TP2
-
-        Inference:
-          SL at original (not near entry) → 0 hits
-          SL at entry → 2 hits (stable state; both TP1 and TP2 leave SL at entry)
-          SL past entry (at a filled TP price) → 3+ hits
-
-        Note: take_profits only contains REMAINING on-chain TP orders (filled TPs
-        are removed). We use remaining count to disambiguate 3 vs 4+ hits.
-        """
-        tolerance = entry_price * 0.003  # 0.3% tolerance for rounding
-
-        def sl_at_or_past_entry():
-            if side == "LONG":
-                return sl_price >= entry_price - tolerance
-            return sl_price <= entry_price + tolerance
-
-        # SL not at/past entry → 0 hits
-        if not sl_at_or_past_entry():
-            return 0
-
-        # Check if SL is strictly PAST entry (moved to a TP price)
-        if side == "LONG":
-            past_entry = sl_price > entry_price + tolerance
-        else:
-            past_entry = sl_price < entry_price - tolerance
-
-        if not past_entry:
-            # SL is at entry (within tolerance) → default to 2 hits
-            # Both TP1 and TP2 leave SL at entry. 2 is the stable state.
-            return 2
-
-        # SL is past entry → moved to a TP price → at least 3 hits
-        # With new strategy: SL at TP1 → 3 hits, SL at TP2 → 4+ hits
-        # Use remaining TP count as heuristic (typical signals have 5 TPs):
-        #   2+ remaining → probably 3 hits (SL at TP1)
-        #   0-1 remaining → probably 4+ hits (SL at TP2)
-        num_remaining = len(take_profits)
-        if num_remaining <= 1:
-            return 4
-        return 3
-
     # ──────────────────────────────────────────────────────────────────────
     # Periodic On-Chain Reconciliation
     # ──────────────────────────────────────────────────────────────────────
@@ -907,6 +963,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 cancelled_sl = 0
                 for dup_sl in to_cancel:
                     if not dup_sl.get("key_hex"):
+                        self.logger.warning(
+                            f"Reconcile: cannot cancel duplicate SL "
+                            f"@ ${dup_sl.get('trigger_price', 0):,.2f} — missing key_hex"
+                        )
                         continue
                     try:
                         key_bytes = bytes.fromhex(dup_sl["key_hex"])
@@ -935,7 +995,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             if len(tp_orders) > 1:
                 price_groups: Dict[float, list] = defaultdict(list)
                 for tp_o in tp_orders:
-                    price_groups[round(tp_o["trigger_price"], 2)].append(tp_o)
+                    price_groups[round(tp_o["trigger_price"], 6)].append(tp_o)
 
                 for price_key, group in price_groups.items():
                     if len(group) <= 1:
@@ -952,6 +1012,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     tp_cancelled = 0
                     for dup_tp in to_cancel_tps:
                         if not dup_tp.get("key_hex"):
+                            self.logger.warning(
+                                f"Reconcile: cannot cancel duplicate TP "
+                                f"@ ${dup_tp.get('trigger_price', 0):,.2f} — missing key_hex"
+                            )
                             continue
                         try:
                             key_bytes = bytes.fromhex(dup_tp["key_hex"])
@@ -971,20 +1035,70 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         )
 
             # ── 4. Infer executed TPs and correct tp_hits_count ──
-            on_chain_tp_prices = {round(o["trigger_price"], 2) for o in tp_orders}
+            # Only mark a TP as executed if:
+            #   a) its price is verified (current or historical), AND
+            #   b) it has been missing for 2 consecutive reconcile cycles.
+            # This prevents false positives from transient RPC glitches.
+            on_chain_tp_prices = {round(o["trigger_price"], 6) for o in tp_orders}
+            is_long = pos.side == "LONG"
+
+            try:
+                current_price = await self.get_current_price(pos.symbol)
+            except Exception:
+                current_price = pos.current_price or 0.0
 
             newly_marked = 0
             for tp_level in pos.take_profits:
                 if tp_level.executed:
                     continue
-                if round(tp_level.price, 2) not in on_chain_tp_prices:
-                    tp_level.executed = True
-                    tp_level.executed_at = tp_level.executed_at or time.time()
-                    newly_marked += 1
-                    self.logger.info(
-                        f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
-                        f"not on-chain — marking executed"
-                    )
+                miss_key = f"{pos.id}:{tp_level.price}"
+                if round(tp_level.price, 6) not in on_chain_tp_prices:
+                    # TP not on-chain — track consecutive misses
+                    miss_count = self._reconcile_missing_tps.get(miss_key, 0) + 1
+                    self._reconcile_missing_tps[miss_key] = miss_count
+
+                    if miss_count < 2:
+                        self.logger.info(
+                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
+                            f"not on-chain (miss {miss_count}/2) — waiting for confirmation"
+                        )
+                        continue
+
+                    # 2nd miss — verify price before marking executed
+                    price_confirmed = False
+                    if current_price and current_price > 0:
+                        price_confirmed = verify_tp_hit_by_price(
+                            is_long, tp_level.price, current_price, tolerance_pct=0.0015
+                        )
+                    if not price_confirmed:
+                        try:
+                            price_confirmed = await asyncio.to_thread(
+                                fetch_price_touched_in_window,
+                                pos.symbol, tp_level.price, is_long,
+                                self.w3, 600, 0.003,
+                            )
+                        except Exception:
+                            pass
+
+                    if price_confirmed:
+                        tp_level.executed = True
+                        tp_level.executed_at = tp_level.executed_at or time.time()
+                        newly_marked += 1
+                        self._reconcile_missing_tps.pop(miss_key, None)
+                        self.logger.info(
+                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
+                            f"not on-chain (2 cycles) — price verified, marking executed"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Reconcile: {pos.symbol} TP @ ${tp_level.price:,.2f} "
+                            f"not on-chain (2 cycles) but price NOT verified "
+                            f"(current=${current_price:,.0f}). "
+                            f"Possible cancellation/resync — NOT marking as executed."
+                        )
+                else:
+                    # TP is on-chain — clear any miss counter
+                    self._reconcile_missing_tps.pop(miss_key, None)
 
             actual_hits = sum(1 for tp in pos.take_profits if tp.executed)
             if actual_hits != pos.tp_hits_count:
@@ -996,6 +1110,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         f"tp_hits_count {old_count} -> {actual_hits} "
                         f"({newly_marked} TP(s) executed)"
                     )
+                    # Set cooldown so check_tp_hits doesn't re-process the
+                    # same TP disappearance as a separate hit.
+                    self._set_orders_cooldown(30)
 
             # ── 5. Keep last_known_tp_count accurate ──
             current_tp_count = len(tp_orders)
@@ -1068,6 +1185,40 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         corrections.append(
                             f"{pos.symbol} {pos.side} [W{wid}]: "
                             f"FAILED to move SL: {e}"
+                        )
+
+            # ── 7b. Recover from failed SL moves ──
+            # If sl_move_failed is True and no SL exists on-chain, attempt placement.
+            if pos.sl_move_failed and not sl_orders and pos.tp_hits_count > 0:
+                sorted_tps = sorted(
+                    pos.take_profits,
+                    key=lambda t: t.price,
+                    reverse=(pos.side == "SHORT"),
+                )
+                target_sl, target_label = determine_new_sl_target(
+                    pos.tp_hits_count, pos.entry_price, sorted_tps,
+                )
+                if target_sl is not None:
+                    corrections.append(
+                        f"{pos.symbol} {pos.side} [W{wid}]: "
+                        f"No SL on-chain (sl_move_failed) — "
+                        f"attempting SL at {target_label} (${target_sl:,.2f})"
+                    )
+                    try:
+                        acct = self._get_account(wid)
+                        fresh_orders = await asyncio.to_thread(
+                            fetch_open_orders, self.w3, acct.address
+                        )
+                        await self.move_sl(
+                            pos, fresh_orders, target_sl, target_label
+                        )
+                        self.logger.info(
+                            f"Reconcile: recovered SL for {pos.symbol} {pos.side} [W{wid}] "
+                            f"at {target_label} (${target_sl:,.2f})"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Reconcile: failed to recover SL for {pos.symbol}: {e}"
                         )
 
         # Send batched notification if any corrections were made
@@ -1159,7 +1310,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.take_profits.append(
                         TakeProfitLevel(price=order.price, percentage=order.close_pct)
                     )
-                    pos.last_known_tp_count += 1
+                    # Don't increment last_known_tp_count here — the cooldown
+                    # prevents check_tp_hits from running, and next cycle it will
+                    # fetch the correct on-chain count automatically.
+                    self._set_orders_cooldown(30)
                     await self.notify(
                         f"✅ Retry succeeded: {order.symbol} {order.side} [W{order.wallet_id}] "
                         f"TP @ ${order.price:,.2f} placed (attempt {order.attempts})\n"
@@ -1200,24 +1354,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 still_pending.append(order)
 
         self.failed_order_queue = still_pending
-
-    async def cmd_retryqueue(self, chat_id: int):
-        """Telegram /retryqueue command — show pending failed order retries."""
-        if not self.failed_order_queue:
-            await self.send_message(chat_id, "Retry queue is empty — all orders placed successfully.")
-            return
-
-        msg = f"**Failed Order Retry Queue** ({len(self.failed_order_queue)} pending)\n\n"
-        for i, order in enumerate(self.failed_order_queue, 1):
-            age = time.time() - order.created_at
-            age_str = f"{age / 60:.0f}m" if age < 3600 else f"{age / 3600:.1f}h"
-            msg += (
-                f"**#{i}** {order.symbol} {order.side} [W{order.wallet_id}] "
-                f"— {order.order_kind.upper()} @ ${order.price:,.2f}\n"
-                f"  Attempts: {order.attempts}/{order.max_attempts} | Age: {age_str}\n"
-                f"  Error: {order.error[:80]}\n\n"
-            )
-        await self.send_message(chat_id, msg)
 
     async def cmd_sync(self, chat_id: int):
         """Telegram /sync command — force re-sync internal state from on-chain.
@@ -1534,13 +1670,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         self.logger.warning(f"Could not check W{wid_chk} for duplicates: {e}")
 
             # Execute on-chain with the selected wallet
-            signal_tp_count = len(signal.take_profits)
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
             if position:
                 self.positions[position.id] = position
                 self._save_position_state()
                 self.health_stats["trades_executed"] += 1
-                await self.notify_position_opened(position, order_type, signal_tp_count=signal_tp_count)
+                await self.notify_position_opened(position, order_type)
                 # Top up ETH for gas if balance is low
                 await self.topup_eth_if_needed()
                 # Rebalance USDC between wallets after opening
@@ -1761,6 +1896,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 opened_at=time.time(),
                 wallet_id=wallet_id,
                 original_size_usd=size_usd,
+                expected_tp_count=len(signal.take_profits),
             )
 
             # Try to execute on-chain
@@ -1801,6 +1937,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         if tp.price in successfully_placed_prices
                     ]
                 position.last_known_tp_count = len(position.take_profits)
+
+                # TP count verification: expected vs actually placed
+                placed_count = len(position.take_profits)
+                expected_count = position.expected_tp_count
+                if placed_count == expected_count:
+                    self.logger.info(
+                        f"{signal.symbol} {signal.side}: All {expected_count}/{expected_count} TPs placed successfully"
+                    )
+                else:
+                    self.logger.warning(
+                        f"{signal.symbol} {signal.side}: Placed {placed_count}/{expected_count} TPs "
+                        f"— {expected_count - placed_count} failed, queued for retry"
+                    )
 
                 # Queue failed TP orders for retry
                 for tp_r in failed_tp_results:
@@ -2097,167 +2246,184 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     for p in chain_pos
                 )
 
-                if not found:
-                    # Position no longer on-chain — closed by SL/TP/liquidation
-                    self.logger.info(f"{pos.symbol} {pos.side} [W{pos.wallet_id}] position closed on-chain")
+                if found:
+                    # Position still on-chain — reset miss counter
+                    self._position_missing_count.pop(pos_id, None)
+                    continue
 
-                    # Fetch remaining on-chain orders to distinguish liquidation
-                    # from SL/TP fills. If both SL and TP orders are still present,
-                    # neither was triggered → liquidation.
-                    sl_orders_remaining = -1
-                    tp_orders_remaining = -1
-                    try:
-                        chain_orders = await asyncio.to_thread(
-                            fetch_open_orders, self.w3, acct.address
-                        )
-                        market_lower = pos.market_addr.lower()
-                        is_long = pos.side == "LONG"
-                        market_orders = [
-                            o for o in chain_orders
-                            if o["market"].lower() == market_lower
-                            and o["is_long"] == is_long
-                        ]
-                        sl_orders_remaining = sum(
-                            1 for o in market_orders
-                            if o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
-                        )
-                        tp_orders_remaining = sum(
-                            1 for o in market_orders
-                            if o["order_type"] == ORDER_TYPE_LIMIT_DECREASE
-                        )
-                        self.logger.info(
-                            f"{pos.symbol} {pos.side} [W{pos.wallet_id}] "
-                            f"remaining orders: {sl_orders_remaining} SL, {tp_orders_remaining} TP"
-                        )
-                    except Exception as e:
-                        self.logger.warning(f"Could not fetch orders for exit classification: {e}")
+                # Position not found on-chain — require 2 consecutive misses
+                # to guard against stale RPC returning empty results.
+                miss_count = self._position_missing_count.get(pos_id, 0) + 1
+                self._position_missing_count[pos_id] = miss_count
 
-                    # Refresh current price for exit classification
-                    try:
-                        current_price = await self.get_current_price(pos.symbol)
-                        if current_price and current_price > 0:
-                            pos.current_price = current_price
-                    except Exception:
-                        pass
-
-                    # Classify exit reason (SL hit, TP filled, liquidation, etc.)
-                    exit_reason = classify_exit_reason(
-                        is_long=(pos.side == "LONG"),
-                        current_price=pos.current_price,
-                        stop_loss=pos.stop_loss,
-                        tp_hits_count=pos.tp_hits_count,
-                        last_known_tp_count=pos.last_known_tp_count,
-                        sl_moved_to_entry=pos.sl_moved_to_entry,
-                        sl_move_label=pos.sl_move_label,
-                        sl_orders_remaining=sl_orders_remaining,
-                        tp_orders_remaining=tp_orders_remaining,
+                if miss_count < 2:
+                    self.logger.warning(
+                        f"{pos.symbol} {pos.side} [W{pos.wallet_id}] not found on-chain "
+                        f"(miss {miss_count}/2) — waiting for confirmation before closing"
                     )
+                    continue
 
-                    is_liquidation = exit_reason == "Liquidation"
+                # 2nd consecutive miss — position is genuinely closed
+                self._position_missing_count.pop(pos_id, None)
+                self.logger.info(f"{pos.symbol} {pos.side} [W{pos.wallet_id}] position closed on-chain (confirmed)")
 
-                    # Determine exit price: SL exits use the SL trigger price
-                    # (more accurate than market price at detection time)
-                    exit_price = pos.current_price or pos.entry_price
-                    if "SL" in exit_reason and pos.stop_loss:
-                        exit_price = pos.stop_loss
+                # Fetch remaining on-chain orders to distinguish liquidation
+                # from SL/TP fills. If both SL and TP orders are still present,
+                # neither was triggered → liquidation.
+                sl_orders_remaining = -1
+                tp_orders_remaining = -1
+                try:
+                    chain_orders = await asyncio.to_thread(
+                        fetch_open_orders, self.w3, acct.address
+                    )
+                    market_lower = pos.market_addr.lower()
+                    is_long = pos.side == "LONG"
+                    market_orders = [
+                        o for o in chain_orders
+                        if o["market"].lower() == market_lower
+                        and o["is_long"] == is_long
+                    ]
+                    sl_orders_remaining = sum(
+                        1 for o in market_orders
+                        if o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                    )
+                    tp_orders_remaining = sum(
+                        1 for o in market_orders
+                        if o["order_type"] == ORDER_TYPE_LIMIT_DECREASE
+                    )
+                    self.logger.info(
+                        f"{pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                        f"remaining orders: {sl_orders_remaining} SL, {tp_orders_remaining} TP"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch orders for exit classification: {e}")
 
-                    # Calculate total PnL: realized (from executed TPs) + remaining
-                    realized_pnl = pos.realized_pnl or 0.0
-                    remaining_pct = 1.0
-                    if pos.take_profits:
-                        executed_tps = [tp for tp in pos.take_profits if tp.executed]
-                        remaining_pct = 1.0 - sum(tp.percentage for tp in executed_tps)
-                    remaining_size = pos.size_usd * max(remaining_pct, 0.0)
+                # Refresh current price for exit classification
+                try:
+                    current_price = await self.get_current_price(pos.symbol)
+                    if current_price and current_price > 0:
+                        pos.current_price = current_price
+                except Exception:
+                    pass
 
-                    remaining_pnl = 0.0
-                    if pos.entry_price and pos.entry_price > 0 and exit_price > 0:
-                        remaining_pnl = calculate_unrealized_pnl(
-                            pos.side, pos.entry_price, exit_price, remaining_size
+                # Classify exit reason (SL hit, TP filled, liquidation, etc.)
+                exit_reason = classify_exit_reason(
+                    is_long=(pos.side == "LONG"),
+                    current_price=pos.current_price,
+                    stop_loss=pos.stop_loss,
+                    tp_hits_count=pos.tp_hits_count,
+                    last_known_tp_count=pos.last_known_tp_count,
+                    sl_moved_to_entry=pos.sl_moved_to_entry,
+                    sl_move_label=pos.sl_move_label,
+                    sl_orders_remaining=sl_orders_remaining,
+                    tp_orders_remaining=tp_orders_remaining,
+                )
+
+                is_liquidation = exit_reason == "Liquidation"
+
+                # Determine exit price: SL exits use the SL trigger price
+                # (more accurate than market price at detection time)
+                exit_price = pos.current_price or pos.entry_price
+                if "SL" in exit_reason and pos.stop_loss:
+                    exit_price = pos.stop_loss
+
+                # Calculate total PnL: realized (from executed TPs) + remaining
+                realized_pnl = pos.realized_pnl or 0.0
+                remaining_pct = 1.0
+                if pos.take_profits:
+                    executed_tps = [tp for tp in pos.take_profits if tp.executed]
+                    remaining_pct = 1.0 - sum(tp.percentage for tp in executed_tps)
+                remaining_size = pos.size_usd * max(remaining_pct, 0.0)
+
+                remaining_pnl = 0.0
+                if pos.entry_price and pos.entry_price > 0 and exit_price > 0:
+                    remaining_pnl = calculate_unrealized_pnl(
+                        pos.side, pos.entry_price, exit_price, remaining_size
+                    )
+                total_pnl = realized_pnl + remaining_pnl
+
+                # Update pos so _record_trade and pnl_percentage use correct values
+                pos.current_price = exit_price
+                pos.unrealized_pnl = total_pnl
+
+                # Final guard: re-check that no other coroutine closed this
+                # position while we were classifying the exit.
+                if pos.closed_at is not None:
+                    continue
+
+                pos.is_open = False
+                pos.closed_at = time.time()
+                pos.exit_reason = exit_reason
+                self._record_trade(pos, exit_reason=exit_reason)
+                self._clear_position_state(pos)
+
+                # Cancel orphaned SL/TP orders left behind after close/liquidation
+                if sl_orders_remaining > 0 or tp_orders_remaining > 0:
+                    try:
+                        exchange = self.w3.eth.contract(
+                            address=Web3.to_checksum_address(self.cfg.exchange_router),
+                            abi=EXCHANGE_ROUTER_ABI,
                         )
-                    total_pnl = realized_pnl + remaining_pnl
-
-                    # Update pos so _record_trade and pnl_percentage use correct values
-                    pos.current_price = exit_price
-                    pos.unrealized_pnl = total_pnl
-
-                    # Final guard: re-check that no other coroutine closed this
-                    # position while we were classifying the exit.
-                    if pos.closed_at is not None:
-                        continue
-
-                    pos.is_open = False
-                    pos.closed_at = time.time()
-                    pos.exit_reason = exit_reason
-                    self._record_trade(pos, exit_reason=exit_reason)
-                    self._clear_position_state(pos)
-
-                    # Cancel orphaned SL/TP orders left behind after close/liquidation
-                    if sl_orders_remaining > 0 or tp_orders_remaining > 0:
-                        try:
-                            exchange = self.w3.eth.contract(
-                                address=Web3.to_checksum_address(self.cfg.exchange_router),
-                                abi=EXCHANGE_ROUTER_ABI,
-                            )
-                            n_cancelled = await asyncio.to_thread(
-                                cancel_orders_for_market,
-                                self.w3, acct, exchange, pos.market_addr, self.cfg.dry_run,
-                            )
-                            if n_cancelled:
-                                self.logger.info(
-                                    f"Cancelled {n_cancelled} orphaned order(s) for "
-                                    f"{pos.symbol} {pos.side} [W{pos.wallet_id}]"
-                                )
-                        except Exception as e:
-                            self.logger.warning(f"Failed to cancel orphaned orders: {e}")
-
-                    # Notify admin
-                    pnl_sign = "+" if total_pnl >= 0 else ""
-                    pnl_pct = pos.pnl_percentage
-                    duration = pos.duration_hours
-
-                    if is_liquidation:
-                        msg = (
-                            f"**LIQUIDATION DETECTED**\n\n"
-                            f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
-                            f"Entry: ${pos.entry_price:,.2f}\n"
-                            f"Exit: ${exit_price:,.2f}\n"
-                            f"Size: ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
-                            f"Collateral: ${pos.collateral_usd:,.2f}\n"
+                        n_cancelled = await asyncio.to_thread(
+                            cancel_orders_for_market,
+                            self.w3, acct, exchange, pos.market_addr, self.cfg.dry_run,
                         )
-                        if realized_pnl != 0:
-                            r_sign = "+" if realized_pnl >= 0 else ""
-                            msg += f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
+                        if n_cancelled:
+                            self.logger.info(
+                                f"Cancelled {n_cancelled} orphaned order(s) for "
+                                f"{pos.symbol} {pos.side} [W{pos.wallet_id}]"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to cancel orphaned orders: {e}")
+
+                # Notify admin
+                pnl_sign = "+" if total_pnl >= 0 else ""
+                pnl_pct = pos.pnl_percentage
+                duration = pos.duration_hours
+
+                if is_liquidation:
+                    msg = (
+                        f"**LIQUIDATION DETECTED**\n\n"
+                        f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
+                        f"Entry: ${pos.entry_price:,.2f}\n"
+                        f"Exit: ${exit_price:,.2f}\n"
+                        f"Size: ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
+                        f"Collateral: ${pos.collateral_usd:,.2f}\n"
+                    )
+                    if realized_pnl != 0:
+                        r_sign = "+" if realized_pnl >= 0 else ""
+                        msg += f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
+                    msg += (
+                        f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
+                        f"Duration: {duration:.1f}h\n"
+                    )
+                    if pos.stop_loss:
+                        msg += f"SL was: ${pos.stop_loss:,.2f}\n"
+                    msg += f"Orphaned orders cancelled: {sl_orders_remaining} SL + {tp_orders_remaining} TP"
+                else:
+                    msg = (
+                        f"**Position Closed**\n\n"
+                        f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
+                        f"Entry: ${pos.entry_price:,.2f}\n"
+                        f"Exit: ${exit_price:,.2f}\n"
+                    )
+                    if realized_pnl != 0:
+                        r_sign = "+" if realized_pnl >= 0 else ""
+                        rm_sign = "+" if remaining_pnl >= 0 else ""
                         msg += (
-                            f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
-                            f"Duration: {duration:.1f}h\n"
+                            f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
+                            f"Remaining:      {rm_sign}${remaining_pnl:,.2f}\n"
                         )
-                        if pos.stop_loss:
-                            msg += f"SL was: ${pos.stop_loss:,.2f}\n"
-                        msg += f"Orphaned orders cancelled: {sl_orders_remaining} SL + {tp_orders_remaining} TP"
-                    else:
-                        msg = (
-                            f"**Position Closed**\n\n"
-                            f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
-                            f"Entry: ${pos.entry_price:,.2f}\n"
-                            f"Exit: ${exit_price:,.2f}\n"
-                        )
-                        if realized_pnl != 0:
-                            r_sign = "+" if realized_pnl >= 0 else ""
-                            rm_sign = "+" if remaining_pnl >= 0 else ""
-                            msg += (
-                                f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
-                                f"Remaining:      {rm_sign}${remaining_pnl:,.2f}\n"
-                            )
-                        msg += (
-                            f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
-                            f"Duration: {duration:.1f}h\n"
-                            f"Reason: {exit_reason}"
-                        )
-                    await self.notify(msg)
+                    msg += (
+                        f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
+                        f"Duration: {duration:.1f}h\n"
+                        f"Reason: {exit_reason}"
+                    )
+                await self.notify(msg)
 
-                    # Track liquidation in health stats
-                    if is_liquidation:
-                        self.health_stats["liquidations"] = self.health_stats.get("liquidations", 0) + 1
+                # Track liquidation in health stats
+                if is_liquidation:
+                    self.health_stats["liquidations"] = self.health_stats.get("liquidations", 0) + 1
 
             except Exception as e:
                 self.logger.debug(f"Failed to check position close for {pos.symbol}: {e}")
