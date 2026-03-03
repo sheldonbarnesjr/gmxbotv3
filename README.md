@@ -126,7 +126,6 @@ All bot state files use **atomic JSON writes** via `state_io.py`:
 | `/signals [n]` | Recent signal history with status (executed/rejected) |
 | `/sl` | Move SL to entry or TP level (e.g., `/sl 1 entry`, `/sl 1 tp2`) |
 | `/status` | Bot status, wallets, uptime, trade stats |
-| `/sync` | Force re-sync positions from on-chain |
 | `/summary` | Send daily summary now |
 | `/topup` | Manual ETH top-up — per wallet or all (e.g., `/topup 3 10`) |
 | `/tradesize` | View or change trade size % (e.g., `/tradesize 20` for 20%) |
