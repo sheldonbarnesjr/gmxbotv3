@@ -571,8 +571,11 @@ def parse_signal(text: str) -> Signal:
             raise ValueError("Could not find entry price")
 
     # ── Take Profits ──
-    take_profits = []
-    # Match patterns like: TP1: 48000 (50% close)  or  TP 1: 48000 50%
+    # Try both TP patterns and use whichever finds more matches.
+    # This prevents a single accidental "TP" match (e.g. a summary line)
+    # from suppressing the richer "Target 1:", "Target 2:", ... matches.
+
+    # Pattern 1: TP1: 48000 (50% close)  or  TP 1: 48000 50%
     # The separator [:=@\-$] is REQUIRED to prevent backtracking where
     # the TP number (e.g. "1") gets captured as the price ($1).
     tp_pattern = re.compile(
@@ -580,24 +583,28 @@ def parse_signal(text: str) -> Signal:
         r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
         re.IGNORECASE
     )
+    tp_from_tp = []
     for m in tp_pattern.finditer(txt):
         price = float(m.group(2).replace(",", ""))
         pct_str = m.group(3)
         pct = float(pct_str) / 100.0 if pct_str else None
-        take_profits.append(TakeProfit(price=price, close_pct=pct or 0))
+        tp_from_tp.append(TakeProfit(price=price, close_pct=pct or 0))
 
-    # Also match: TARGET 1: 48000, TAKE PROFIT: 48000
-    if not take_profits:
-        target_pattern = re.compile(
-            r'(?:TARGET|TAKE\s*PROFIT)\s*\d?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
-            r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
-            re.IGNORECASE
-        )
-        for m in target_pattern.finditer(txt):
-            price = float(m.group(1).replace(",", ""))
-            pct_str = m.group(2)
-            pct = float(pct_str) / 100.0 if pct_str else None
-            take_profits.append(TakeProfit(price=price, close_pct=pct or 0))
+    # Pattern 2: TARGET 1: 48000, TAKE PROFIT: 48000
+    target_pattern = re.compile(
+        r'(?:TARGET|TAKE\s*PROFIT)\s*\d?\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)\s*'
+        r'(?:\(?\s*(\d+)\s*%\s*(?:close)?\s*\)?)?',
+        re.IGNORECASE
+    )
+    tp_from_target = []
+    for m in target_pattern.finditer(txt):
+        price = float(m.group(1).replace(",", ""))
+        pct_str = m.group(2)
+        pct = float(pct_str) / 100.0 if pct_str else None
+        tp_from_target.append(TakeProfit(price=price, close_pct=pct or 0))
+
+    # Use whichever pattern found more TPs
+    take_profits = tp_from_tp if len(tp_from_tp) >= len(tp_from_target) else tp_from_target
 
     # Sanity check: filter out TP prices that are absurdly far from entry.
     # This catches regex backtracking bugs (e.g. TP number parsed as price: $1, $2, $3)
