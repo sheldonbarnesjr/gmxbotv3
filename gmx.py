@@ -788,48 +788,63 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                     # Step 3: Detect orphaned decrease events — historical TP hits
                     # whose on-chain orders were consumed by the keeper.
-                    # These won't be in pos.take_profits (built from on-chain orders only).
-                    all_known_tp_prices = set(on_chain_tp_prices_b)
-                    for tp_lvl in pos.take_profits:
-                        if tp_lvl.price > 0:
-                            all_known_tp_prices.add(round(tp_lvl.price, 2))
+                    # Conservative: only look if we know expected TP count and some are missing.
+                    expected = pos.expected_tp_count or saved.get("expected_tp_count", 0)
+                    on_chain_count = len(take_profits)  # currently on-chain TPs
+                    max_orphans = max(0, expected - on_chain_count) if expected else 0
 
                     orphaned_tps = []
-                    for j, evt in enumerate(decreases_b):
-                        if j in used_events_b:
-                            continue
-                        exec_price = evt.get("execution_price", 0)
-                        if not exec_price:
-                            continue
-                        # Check if this event matches any known TP (on-chain or internal)
-                        matches_known = any(
-                            abs(exec_price - ktp) / ktp < 0.01
-                            for ktp in all_known_tp_prices
-                            if ktp > 0
-                        )
-                        if matches_known:
-                            continue
-                        # This decrease doesn't match any current TP — it's a consumed TP
-                        size_delta = evt.get("size_delta_usd", 0)
-                        pct = size_delta / pos.original_size_usd if pos.original_size_usd > 0 else 0
-                        orphan_tp = TakeProfitLevel(
-                            price=exec_price,
-                            percentage=pct,
-                            executed=True,
-                            executed_at=evt.get("timestamp", pos.opened_at),
-                            realized_pnl_usd=evt.get("net_pnl_usd"),
-                        )
-                        orphaned_tps.append(orphan_tp)
-                        verified_hits_b += 1
-                        total_realized_b += evt.get("net_pnl_usd", 0)
-                        used_events_b.add(j)
-                        self.logger.info(
-                            f"Sync Path B: {symbol} {side} [W{wid}] found orphaned TP hit "
-                            f"@ ${exec_price:,.2f}, pnl=${evt.get('net_pnl_usd', 0):,.2f}"
-                        )
+                    if max_orphans > 0 and cp.entry_price and cp.entry_price > 0:
+                        all_known_tp_prices = set(on_chain_tp_prices_b)
+                        for tp_lvl in pos.take_profits:
+                            if tp_lvl.price > 0:
+                                all_known_tp_prices.add(round(tp_lvl.price, 2))
+
+                        for j, evt in enumerate(decreases_b):
+                            if len(orphaned_tps) >= max_orphans:
+                                break
+                            if j in used_events_b:
+                                continue
+                            exec_price = evt.get("execution_price", 0)
+                            if not exec_price or exec_price <= 0:
+                                continue
+                            # Must be after position opened
+                            evt_ts = evt.get("timestamp", 0)
+                            if evt_ts and evt_ts < pos.opened_at:
+                                continue
+                            # Must be in valid TP direction (SHORT: below entry, LONG: above)
+                            if side == "SHORT" and exec_price >= cp.entry_price:
+                                continue
+                            if side == "LONG" and exec_price <= cp.entry_price:
+                                continue
+                            # Must not match any known TP price
+                            matches_known = any(
+                                abs(exec_price - ktp) / ktp < 0.01
+                                for ktp in all_known_tp_prices
+                                if ktp > 0
+                            )
+                            if matches_known:
+                                continue
+                            # Passed all filters — this is likely a consumed TP
+                            size_delta = evt.get("size_delta_usd", 0)
+                            pct = size_delta / pos.original_size_usd if pos.original_size_usd > 0 else 0
+                            orphan_tp = TakeProfitLevel(
+                                price=exec_price,
+                                percentage=pct,
+                                executed=True,
+                                executed_at=evt_ts or pos.opened_at,
+                                realized_pnl_usd=evt.get("net_pnl_usd"),
+                            )
+                            orphaned_tps.append(orphan_tp)
+                            verified_hits_b += 1
+                            total_realized_b += evt.get("net_pnl_usd", 0)
+                            used_events_b.add(j)
+                            self.logger.info(
+                                f"Sync Path B: {symbol} {side} [W{wid}] found orphaned TP hit "
+                                f"@ ${exec_price:,.2f}, pnl=${evt.get('net_pnl_usd', 0):,.2f}"
+                            )
 
                     # Prepend orphaned TPs so they appear before on-chain TPs
-                    # Sort by execution price (closest to entry first for display)
                     if orphaned_tps:
                         if side == "LONG":
                             orphaned_tps.sort(key=lambda t: t.price)
