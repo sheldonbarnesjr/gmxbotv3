@@ -58,6 +58,10 @@ class SLTPMixin:
 
         On-chain verification prevents false TP hits from price tolerance.
         """
+        # Skip during cooldown (e.g. after manual order changes or sync)
+        if self._in_orders_cooldown():
+            return
+
         for pos_id, pos in list(self.positions.items()):
             if not pos.is_open or not pos.take_profits:
                 continue
@@ -388,6 +392,9 @@ class SLTPMixin:
             pos.sl_move_label = sl_label
             pos.stop_loss = new_sl_price
             pos.sl_move_failed = False
+
+            # 4b. Set cooldown to prevent reconcile from interfering
+            self._set_orders_cooldown(30)
 
             # 5. Notify admin (auto mode only — manual callers send their own)
             if not manual:
@@ -779,6 +786,10 @@ class SLTPMixin:
         else:
             msg += "\nAll TPs failed."
 
+        # Set cooldown so reconcile/TP monitor don't interfere with new orders
+        if ok:
+            self._set_orders_cooldown(30)
+
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -931,6 +942,11 @@ class SLTPMixin:
             detail_lines.append(f"  #{idx+1} {o['symbol']} {label} @ ${o['trigger_price']:,.2f}")
 
         msg = f"**Cancel Orders: {summary}**\n" + "\n".join(detail_lines)
+
+        # Set cooldown so TP monitor doesn't misinterpret cancellations as hits
+        if cancelled:
+            self._set_orders_cooldown(30)
+
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────

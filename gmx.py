@@ -274,6 +274,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self._bot_update_offset: int = 0       # getUpdates offset
         self.bot_polling_task: Optional[asyncio.Task] = None
 
+        # Cooldown: after order placement, skip TP monitoring & reconciliation
+        # to prevent false TP-hit detection from manual order changes.
+        self._orders_cooldown_until: float = 0.0
+
         self.setup_logging()
 
     def setup_logging(self):
@@ -286,6 +290,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             ],
         )
         self.logger = logging.getLogger("GMXBot")
+
+    def _set_orders_cooldown(self, seconds: float = 30.0):
+        """Set a cooldown period after order placement.
+
+        During cooldown, check_tp_hits and reconcile_positions skip
+        all positions to avoid interpreting manual order changes as
+        TP hits or duplicates.
+        """
+        self._orders_cooldown_until = time.time() + seconds
+        self.logger.info(f"Orders cooldown set for {seconds:.0f}s")
+
+    def _in_orders_cooldown(self) -> bool:
+        return time.time() < self._orders_cooldown_until
 
     # ──────────────────────────────────────────────────────────────────────
     # Position state persistence (realized PnL survives restarts)
@@ -806,6 +823,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
           5. Keeps last_known_tp_count accurate
           6. Reconstructs sl_moved_to_entry state
         """
+        # Skip during cooldown (e.g. after manual order changes or sync)
+        if self._in_orders_cooldown():
+            self.logger.debug("Reconcile skipped: orders cooldown active")
+            return
+
         corrections = []
 
         open_positions = [
@@ -1201,12 +1223,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         """Telegram /sync command — force re-sync internal state from on-chain.
 
         Clears all internal position tracking and rebuilds from on-chain data.
-        Also re-places TP orders with corrected collateral withdrawal so
-        leverage is preserved on partial closes.
+        Does NOT cancel or re-place orders — only updates in-memory state
+        so the trailing stop loss and TP monitoring work correctly.
         """
         await self.send_message(chat_id, "Syncing positions from on-chain...")
 
         try:
+            # Set cooldown to prevent TP monitoring from misinterpreting
+            # the state transition as TP hits
+            self._set_orders_cooldown(30)
+
             old_count = sum(1 for p in self.positions.values() if p.is_open)
             self.positions.clear()
             await self._sync_on_chain_positions(skip_sl_check=True)
@@ -1230,9 +1256,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             else:
                 msg += "No open positions found on-chain."
             await self.send_message(chat_id, msg)
-
-            # Re-place TP orders with corrected collateral delta
-            await self._resync_tp_orders(chat_id)
 
         except Exception as e:
             self.logger.error(f"Sync failed: {e}")
@@ -1837,6 +1860,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
 
                 self.logger.info(f"Position opened: {position.symbol} {position.side} TX={tx_hash} ({order_type})")
+                self._set_orders_cooldown(30)
                 return position, order_type
 
             except Exception as e:
