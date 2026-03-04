@@ -1106,11 +1106,13 @@ class CoreTelegramMixin:
         from open import parse_signal
         from config import ALLOWED_SYMBOLS
 
-        # Get currently open symbols+sides (in-memory + on-chain)
-        open_pairs = set()
+        # Count how many wallets have each symbol+side open.
+        # A signal is only "fully occupied" if ALL eligible wallets are busy.
+        pair_wallet_count = {}  # (symbol, side) -> set of wallet_ids that have it
         for p in self.positions.values():
             if p.is_open:
-                open_pairs.add((p.symbol, p.side))
+                key = (p.symbol, p.side)
+                pair_wallet_count.setdefault(key, set()).add(p.wallet_id)
         for wid, acct in self._all_wallets():
             try:
                 chain_pos = await asyncio.to_thread(
@@ -1120,16 +1122,23 @@ class CoreTelegramMixin:
                     side = "LONG" if cp.is_long else "SHORT"
                     sym = cp.symbol if hasattr(cp, "symbol") else ""
                     if sym:
-                        open_pairs.add((sym, side))
+                        pair_wallet_count.setdefault((sym, side), set()).add(wid)
             except Exception:
                 pass
+
+        scalp_wallet_count = len(self._scalp_wallets()) or len(self._all_wallets())
+
+        def _is_fully_occupied(symbol: str, side: str) -> bool:
+            """True only if ALL eligible wallets already have this symbol+side."""
+            occupied = len(pair_wallet_count.get((symbol, side), set()))
+            return occupied >= scalp_wallet_count
 
         # ── Source 1: Signal store (already parsed & recorded) ──
         actionable = []  # list of (raw_text, parsed_signal, source_label, timestamp)
         seen_fingerprints = set()
 
         for sig in self.signal_store.get_recent(20):
-            if (sig.symbol, sig.side) in open_pairs:
+            if _is_fully_occupied(sig.symbol, sig.side):
                 continue
             tp_prices = tuple(sorted(tp["price"] for tp in sig.take_profits))
             fp = (sig.symbol, sig.side, tp_prices)
@@ -1166,7 +1175,7 @@ class CoreTelegramMixin:
                             continue
                         if signal.symbol not in ALLOWED_SYMBOLS:
                             continue
-                        if (signal.symbol, signal.side) in open_pairs:
+                        if _is_fully_occupied(signal.symbol, signal.side):
                             continue
                         tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
                         fp = (signal.symbol, signal.side, tp_prices)
