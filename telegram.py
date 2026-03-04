@@ -1101,20 +1101,16 @@ class CoreTelegramMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_signals(self, chat_id: int):
-        """Scan channel history for recent signals not already open, prompt to pick one."""
+        """Show last 5 actionable signals (store first, then channel scan), prompt to open."""
         from datetime import datetime
         from open import parse_signal
         from config import ALLOWED_SYMBOLS
 
-        await self.send_message(chat_id, "Scanning channel history for signals...")
-
-        # Get currently open symbols+sides across all wallets
+        # Get currently open symbols+sides (in-memory + on-chain)
         open_pairs = set()
         for p in self.positions.values():
             if p.is_open:
                 open_pairs.add((p.symbol, p.side))
-
-        # Also check on-chain positions
         for wid, acct in self._all_wallets():
             try:
                 chain_pos = await asyncio.to_thread(
@@ -1128,59 +1124,71 @@ class CoreTelegramMixin:
             except Exception:
                 pass
 
-        # Scan last 50 messages from each monitored channel
-        actionable = []  # list of (parsed_signal, raw_text, channel_name, timestamp)
+        # ── Source 1: Signal store (already parsed & recorded) ──
+        actionable = []  # list of (raw_text, parsed_signal, source_label, timestamp)
         seen_fingerprints = set()
 
-        for ch_id, ch_name in self.resolved_channels.items():
+        for sig in self.signal_store.get_recent(20):
+            if (sig.symbol, sig.side) in open_pairs:
+                continue
+            tp_prices = tuple(sorted(tp["price"] for tp in sig.take_profits))
+            fp = (sig.symbol, sig.side, tp_prices)
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+
+            # Re-parse to get a proper Signal object for display
             try:
-                msgs = await self.client.get_messages(ch_id, limit=50)
-                for msg in msgs:
-                    if not msg or not msg.text:
-                        continue
-                    text = msg.text.strip()
-                    if len(text) < 10:
-                        continue
-                    if is_update_message(text):
-                        continue
+                parsed = parse_signal(sig.raw_text)
+            except Exception:
+                continue
 
-                    try:
-                        signal = parse_signal(text)
-                    except Exception:
-                        continue
-
-                    # Must be an allowed symbol
-                    if signal.symbol not in ALLOWED_SYMBOLS:
-                        continue
-
-                    # Skip if already open
-                    if (signal.symbol, signal.side) in open_pairs:
-                        continue
-
-                    # Dedup by symbol+side+TPs
-                    tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
-                    fp = (signal.symbol, signal.side, tp_prices)
-                    if fp in seen_fingerprints:
-                        continue
-                    seen_fingerprints.add(fp)
-
-                    ts = msg.date.timestamp() if msg.date else time.time()
-                    actionable.append((signal, text, ch_name, ts))
-
-                    if len(actionable) >= 5:
-                        break
-            except Exception as e:
-                self.logger.warning(f"Failed to scan {ch_name}: {e}")
-
+            source = sig.source_channel or "store"
+            actionable.append((sig.raw_text, parsed, source, sig.timestamp_received))
             if len(actionable) >= 5:
                 break
 
+        # ── Source 2: Channel history (catches signals that failed to parse before) ──
+        if len(actionable) < 5:
+            await self.send_message(chat_id, "Scanning channels for more signals...")
+            for ch_id, ch_name in self.resolved_channels.items():
+                try:
+                    msgs = await self.client.get_messages(ch_id, limit=50)
+                    for msg in msgs:
+                        if not msg or not msg.text:
+                            continue
+                        text = msg.text.strip()
+                        if len(text) < 10 or is_update_message(text):
+                            continue
+                        try:
+                            signal = parse_signal(text)
+                        except Exception:
+                            continue
+                        if signal.symbol not in ALLOWED_SYMBOLS:
+                            continue
+                        if (signal.symbol, signal.side) in open_pairs:
+                            continue
+                        tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
+                        fp = (signal.symbol, signal.side, tp_prices)
+                        if fp in seen_fingerprints:
+                            continue
+                        seen_fingerprints.add(fp)
+
+                        ts = msg.date.timestamp() if msg.date else time.time()
+                        actionable.append((text, signal, ch_name, ts))
+                        if len(actionable) >= 5:
+                            break
+                except Exception as e:
+                    self.logger.warning(f"Failed to scan {ch_name}: {e}")
+                if len(actionable) >= 5:
+                    break
+
         if not actionable:
-            await self.send_message(chat_id, "No actionable signals found in recent channel history.")
+            await self.send_message(chat_id, "No actionable signals found.")
             return
 
         lines = ["**Recent Signals** _(not already open)_\n"]
-        for i, (sig, raw, ch, ts) in enumerate(actionable, 1):
+        for i, (raw, sig, source, ts) in enumerate(actionable, 1):
             ts_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
             entry = sig.entry_mid
             entry_str = f"${entry:,.0f}" if entry > 0 else "market"
@@ -1188,7 +1196,7 @@ class CoreTelegramMixin:
             line = (
                 f"**{i}.** {sig.symbol} {sig.side} {sig.leverage:.0f}x [{sig.trade_type}]\n"
                 f"   Entry: {entry_str} | SL: ${sig.stop_loss:,.0f} | {n_tps} TPs\n"
-                f"   _{ts_str} — {ch}_"
+                f"   _{ts_str} — {source}_"
             )
             lines.append(line)
 
@@ -1196,7 +1204,7 @@ class CoreTelegramMixin:
         await self.send_message(chat_id, "\n".join(lines))
 
         self.pending_signals[chat_id] = {
-            "signals": [(raw, sig) for sig, raw, ch, ts in actionable],
+            "signals": [(raw, sig) for raw, sig, source, ts in actionable],
             "created_at": time.time(),
         }
 
