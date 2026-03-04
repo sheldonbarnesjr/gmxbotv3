@@ -1137,7 +1137,16 @@ class CoreTelegramMixin:
         actionable = []  # list of (raw_text, parsed_signal, source_label, timestamp)
         seen_fingerprints = set()
 
+        # Collect position IDs that are still open so we can skip those signals
+        open_position_ids = {
+            p.signal_id for p in self.positions.values()
+            if p.is_open and p.signal_id
+        }
+
         for sig in self.signal_store.get_recent(20):
+            # Skip signals that already have an open position
+            if sig.status == "executed" and sig.signal_id in open_position_ids:
+                continue
             if _is_fully_occupied(sig.symbol, sig.side):
                 continue
             tp_prices = tuple(sorted(tp["price"] for tp in sig.take_profits))
