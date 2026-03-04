@@ -73,7 +73,8 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /lastmsg — Last message from monitored channel(s)
 /lastsignal — Re-run the last parsed signal
 /pdf — Download trade history as PDF
-/pnl — PnL summary (today / 30d / all time)
+/history — PnL summary (today / 30d / all time)
+/pnl — Push hourly PnL update now
 /positions — Show on-chain positions & orders
 /prices — Live GMX & Chainlink prices
 /resume — Resume trading
@@ -319,8 +320,10 @@ class CoreTelegramMixin:
                 await self.cmd_health(chat_id)
             elif cmd == "/balance":
                 await self.cmd_balance(chat_id)
-            elif cmd == "/pnl":
+            elif cmd == "/history":
                 await self.cmd_pnl(chat_id)
+            elif cmd == "/pnl":
+                await self.send_hourly_pnl()
             elif cmd == "/summary":
                 await self.send_daily_summary()
             elif cmd in ("/balance-wallets", "/rebalance"):

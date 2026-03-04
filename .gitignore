@@ -20,14 +20,26 @@ __pycache__/
 # Claude
 .claude/
 
-# Generated docs / notes
+# pytest
+.pytest_cache/
+
+# Generated text output / notes
 *.txt
 *.pdf
+
+# Generated data exports & backtest results
+backtest_results.json
+signals_full.json
+onchain_trades.json
+tmp*.json
 
 # State backups & temp files (from state_io atomic writes)
 *.json.bak
 .state_*.tmp
-tmp*.json
+
+# Config docs (generated analysis, not source code)
+leverage_tiered_tp_config.md
+max_ev_tp1_entry_config.md
 
 # Test files
 test_*.py

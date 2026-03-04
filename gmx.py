@@ -1037,6 +1037,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             )
             target_sl, target_label = determine_new_sl_target(
                 pos.tp_hits_count, pos.entry_price, sorted_tps,
+                leverage=pos.leverage,
             )
 
             # None means no SL move for this TP hit count (trailing strategy: TP2 stays at Entry)

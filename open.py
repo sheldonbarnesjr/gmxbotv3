@@ -461,46 +461,22 @@ def _load_env_tp_dist(n_tps: int, prefix: str = "TP") -> List[float]:
 
 def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
                       swing_keyword_match: bool = False) -> List[TakeProfit]:
-    """Apply .env TP percentage overrides based on trade type.
+    """Apply back_load TP allocations: 1% at each early TP, rest on last.
 
-    Each TP count (2-8) has its own separate distribution in .env:
-      TP_3_1=30, TP_3_2=40, TP_3_3=30        → scalp 3 TPs: 30% / 40% / 30%
-      SWING_TP_3_1=30, SWING_TP_3_2=40, ...   → swing 3 TPs: 30% / 40% / 30%
-
-    - For scalp trades: TP_* env percentages override signal percentages
-    - For swing trades with explicit keyword match: SWING_TP_* env percentages
-    - For swing trades via heuristic only: scalp TP_* splits are used
-      (heuristic swings aren't confident enough to use swing splits)
+    Same strategy for all leverage tiers.
     """
+    from risk import get_tp_allocations
+
     n_tps = len(take_profits)
     if n_tps < 2:
-        # 0 or 1 TPs — nothing to distribute
         return take_profits
 
-    # Pick the right env prefix based on trade type + keyword confidence
-    if trade_type == "swing" and swing_keyword_match:
-        env_pcts = _load_env_tp_dist(n_tps, prefix="SWING_TP")
-    else:
-        # Scalp trades AND heuristic-only swings both use the scalp splits
-        env_pcts = _load_env_tp_dist(n_tps, prefix="TP")
-
-    # If not configured (all zeros or empty), keep signal defaults
-    if not env_pcts or all(p == 0 for p in env_pcts):
-        return take_profits
-
-    # Normalize: make sure they sum to 1.0
-    total = sum(env_pcts)
-    if total <= 0:
-        return take_profits
-
-    if len(env_pcts) < len(take_profits):
-        log.warning(f"TP distribution mismatch: {len(env_pcts)} pcts for {len(take_profits)} TPs — using signal defaults")
-        return take_profits
-
+    allocs = get_tp_allocations(n_tps)
+    total = sum(allocs)
     for i, tp in enumerate(take_profits):
-        tp.close_pct = env_pcts[i] / total  # normalize to sum to 1.0
+        tp.close_pct = allocs[i] / total
 
-    # Final fix: ensure exact 1.0 total (absorb rounding into last TP)
+    # Ensure exact 1.0 total (absorb rounding into last TP)
     actual_total = sum(tp.close_pct for tp in take_profits)
     if take_profits and abs(actual_total - 1.0) > 0.001:
         take_profits[-1].close_pct += 1.0 - actual_total
@@ -742,10 +718,9 @@ def parse_signal(text: str) -> Signal:
     # Classify as swing or scalp
     signal.trade_type = classify_signal(signal)
 
-    # Apply .env TP percentage overrides
-    # Swing keyword matches → SWING_TP_* splits; everything else → TP_* splits
+    # Apply TP allocations: 1% at each early TP, rest on last
     signal.take_profits = apply_env_tp_pcts(
-        signal.take_profits, signal.trade_type, signal.swing_keyword_match
+        signal.take_profits, signal.trade_type, signal.swing_keyword_match,
     )
 
     return signal

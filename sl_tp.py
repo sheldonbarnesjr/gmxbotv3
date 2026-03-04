@@ -454,7 +454,10 @@ class SLTPMixin:
                     key=lambda tp: tp.price,
                     reverse=(pos.side == "SHORT")
                 )
-                new_sl_price, sl_label = determine_new_sl_target(pos.tp_hits_count, pos.entry_price, sorted_tps)
+                new_sl_price, sl_label = determine_new_sl_target(
+                    pos.tp_hits_count, pos.entry_price, sorted_tps,
+                    leverage=pos.leverage,
+                )
 
             # None means no SL move needed for this TP hit (e.g. TP2 → stay at Entry)
             if new_sl_price is None:
