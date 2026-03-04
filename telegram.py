@@ -1137,15 +1137,23 @@ class CoreTelegramMixin:
         actionable = []  # list of (raw_text, parsed_signal, source_label, timestamp)
         seen_fingerprints = set()
 
-        # Collect position IDs that are still open so we can skip those signals
-        open_position_ids = {
-            p.signal_id for p in self.positions.values()
-            if p.is_open and p.signal_id
-        }
+        # Build set of open position fingerprints + signal IDs for filtering
+        open_position_ids = set()
+        open_position_fps = set()
+        for p in self.positions.values():
+            if p.is_open:
+                if p.signal_id:
+                    open_position_ids.add(p.signal_id)
+                # Also fingerprint by entry price to catch positions without signal_id
+                tp_prices = tuple(sorted(tp.price for tp in p.take_profits)) if p.take_profits else ()
+                open_position_fps.add((p.symbol, p.side, tp_prices))
 
         for sig in self.signal_store.get_recent(20):
-            # Skip signals that already have an open position
-            if sig.status == "executed" and sig.signal_id in open_position_ids:
+            # Skip signals that already have an open position (by signal_id or fingerprint)
+            if sig.signal_id in open_position_ids:
+                continue
+            sig_tp_prices = tuple(sorted(tp["price"] for tp in sig.take_profits))
+            if (sig.symbol, sig.side, sig_tp_prices) in open_position_fps:
                 continue
             if _is_fully_occupied(sig.symbol, sig.side):
                 continue
@@ -1194,6 +1202,10 @@ class CoreTelegramMixin:
                             continue
                         tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
                         fp = (signal.symbol, signal.side, tp_prices)
+                        # Skip if this matches an already-open position
+                        if fp in open_position_fps:
+                            self.logger.debug(f"/signals skip (already open): {signal.symbol} {signal.side}")
+                            continue
                         if fp in seen_fingerprints:
                             self.logger.debug(f"/signals skip (dedup): {signal.symbol} {signal.side}")
                             continue
