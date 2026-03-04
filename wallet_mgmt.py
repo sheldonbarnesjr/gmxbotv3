@@ -115,7 +115,7 @@ class WalletMixin:
                 # Check in-memory positions first (catches pending/unconfirmed trades)
                 inmem_matches = [
                     p for p in self.positions.values()
-                    if p.symbol == symbol and p.is_long == is_long and p.is_open and p.wallet_id == wid
+                    if p.symbol == symbol and (p.side == "LONG") == is_long and p.is_open and p.wallet_id == wid
                 ]
                 if inmem_matches:
                     reason = f"W{wid}: in-memory {symbol} {side_label} (pos {inmem_matches[0].id[:8]})"
