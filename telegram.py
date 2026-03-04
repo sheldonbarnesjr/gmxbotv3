@@ -1162,24 +1162,31 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, "Scanning channels for more signals...")
             for ch_id, ch_name in self.resolved_channels.items():
                 try:
-                    msgs = await self.client.get_messages(ch_id, limit=50)
+                    msgs = await self.client.get_messages(ch_id, limit=100)
                     for msg in msgs:
                         if not msg or not msg.text:
                             continue
                         text = msg.text.strip()
-                        if len(text) < 10 or is_update_message(text):
+                        if len(text) < 10:
+                            continue
+                        if is_update_message(text):
+                            self.logger.debug(f"/signals skip (update): {text[:60]}")
                             continue
                         try:
                             signal = parse_signal(text)
-                        except Exception:
+                        except Exception as e:
+                            self.logger.debug(f"/signals skip (parse fail): {e} | {text[:60]}")
                             continue
                         if signal.symbol not in ALLOWED_SYMBOLS:
+                            self.logger.debug(f"/signals skip (symbol {signal.symbol}): {text[:60]}")
                             continue
                         if _is_fully_occupied(signal.symbol, signal.side):
+                            self.logger.debug(f"/signals skip (full): {signal.symbol} {signal.side}")
                             continue
                         tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
                         fp = (signal.symbol, signal.side, tp_prices)
                         if fp in seen_fingerprints:
+                            self.logger.debug(f"/signals skip (dedup): {signal.symbol} {signal.side}")
                             continue
                         seen_fingerprints.add(fp)
 
@@ -1193,7 +1200,16 @@ class CoreTelegramMixin:
                     break
 
         if not actionable:
-            await self.send_message(chat_id, "No actionable signals found.")
+            # Show debug info about what was checked
+            store_count = len(self.signal_store.get_recent(20))
+            await self.send_message(
+                chat_id,
+                f"No actionable signals found.\n"
+                f"Store: {store_count} signals checked\n"
+                f"Open pairs: {', '.join(f'{s} {d}' for s, d in pair_wallet_count.keys()) or 'none'}\n"
+                f"Scalp wallets: {scalp_wallet_count}\n"
+                f"Check bot logs for /signals skip reasons."
+            )
             return
 
         lines = ["**Recent Signals** _(not already open)_\n"]
