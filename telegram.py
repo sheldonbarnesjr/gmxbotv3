@@ -71,14 +71,13 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /help — This message
 /increase — Add collateral to an open position
 /lastmsg — Last message from monitored channel(s)
-/lastsignal — Re-run the last parsed signal
 /pdf — Download trade history as PDF
 /history — PnL summary (today / 30d / all time)
 /pnl — Push hourly PnL update now
 /positions — Show on-chain positions & orders
 /prices — Live GMX & Chainlink prices
 /resume — Resume trading
-/signals — Recent signal history & status
+/signals — Recent signals (pick one to open)
 /sl — Move stop loss
 /status — Bot status & mode
 /summary — Send daily summary now
@@ -199,6 +198,8 @@ class CoreTelegramMixin:
                     await self.handle_withdraw_reply(event.chat_id, text)
                 elif event.chat_id in self.pending_increase:
                     await self.handle_increase_reply(event.chat_id, text)
+                elif event.chat_id in self.pending_signals:
+                    await self.handle_signals_reply(event.chat_id, text)
                 else:
                     await self.handle_close_confirmation(event.chat_id, text)
 
@@ -265,6 +266,8 @@ class CoreTelegramMixin:
                         await self.handle_withdraw_reply(chat_id, text)
                     elif chat_id in self.pending_increase:
                         await self.handle_increase_reply(chat_id, text)
+                    elif chat_id in self.pending_signals:
+                        await self.handle_signals_reply(chat_id, text)
                     else:
                         await self.handle_close_confirmation(chat_id, text)
 
@@ -330,11 +333,8 @@ class CoreTelegramMixin:
                 await self.cmd_balance_wallets(chat_id)
             elif cmd == "/lastmsg":
                 await self.cmd_lastmsg(chat_id)
-            elif cmd == "/lastsignal":
-                await self.cmd_lastsignal(chat_id)
-            elif cmd == "/signals":
-                arg = parts[1] if len(parts) > 1 else ""
-                await self.cmd_signals(chat_id, arg)
+            elif cmd in ("/lastsignal", "/signals"):
+                await self.cmd_signals(chat_id)
             elif cmd == "/increase":
                 arg = parts[1] if len(parts) > 1 else None
                 await self.cmd_increase(chat_id, arg)
@@ -379,6 +379,9 @@ class CoreTelegramMixin:
                 elif chat_id in self.pending_increase:
                     del self.pending_increase[chat_id]
                     await self.send_message(chat_id, "Increase cancelled.")
+                elif chat_id in self.pending_signals:
+                    del self.pending_signals[chat_id]
+                    await self.send_message(chat_id, "Signal selection cancelled.")
                 else:
                     await self.send_message(chat_id, "Nothing to cancel.")
             else:
@@ -601,6 +604,9 @@ class CoreTelegramMixin:
                         reverse=not pos.is_long,
                     )
                     tp_num_offset = hit_tp_num  # offset so TP numbering continues
+                    # Total TP size across all orders — use this as denominator so
+                    # percentages stay correct even after adding/removing collateral.
+                    total_tp_size = sum(o.get("size_usd", 0) or 0 for o in sorted_tps)
                     for j, o in enumerate(sorted_tps, 1):
                         tp_num = tp_num_offset + j
                         tp_price = o.get("trigger_price", 0) or 0
@@ -608,8 +614,8 @@ class CoreTelegramMixin:
                         # % of position closing at this TP
                         tp_size = o.get("size_usd", 0) or 0
                         close_pct_str = ""
-                        if tp_size > 0 and pos.size_usd > 0:
-                            close_pct = (tp_size / pos.size_usd) * 100
+                        if tp_size > 0 and total_tp_size > 0:
+                            close_pct = (tp_size / total_tp_size) * 100
                             close_pct_str = f" (closes {close_pct:.0f}%)"
                         elif internal:
                             hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
@@ -1091,51 +1097,96 @@ class CoreTelegramMixin:
                 await self.send_message(chat_id, f"📡 **{ch_name}** — error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
-    # /lastsignal
+    # /signals — show last 5 actionable signals, prompt to open
     # ──────────────────────────────────────────────────────────────────────
 
-    async def cmd_lastsignal(self, chat_id: int):
-        """Re-run the last parsed signal through process_signal()."""
-        if not self.last_signal_text:
-            await self.send_message(chat_id, "No signal stored yet. Wait for a signal from the channel first.")
-            return
+    async def cmd_signals(self, chat_id: int):
+        """Show last 5 signals that aren't already open, prompt user to pick one."""
+        from datetime import datetime
 
-        preview = self.last_signal_text[:200]
-        await self.send_message(chat_id, f"Re-running last signal:\n\n{preview}\n\nExecuting...")
-        await self.process_signal(self.last_signal_text)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # /signals
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def cmd_signals(self, chat_id: int, args: str = ""):
-        """Show recent signals and their status from the signal store."""
-        n = 10
-        if args.strip().isdigit():
-            n = min(int(args.strip()), 50)
-
-        recent = self.signal_store.get_recent(n)
+        recent = self.signal_store.get_recent(20)  # fetch more to filter down
         if not recent:
             await self.send_message(chat_id, "No signals recorded yet.")
             return
 
-        from datetime import datetime
-        lines = [f"**Last {len(recent)} Signals**\n"]
+        # Get currently open symbols+sides across all wallets
+        open_pairs = set()
+        for p in self.positions.values():
+            if p.is_open:
+                open_pairs.add((p.symbol, p.side))
+
+        # Filter to signals not already open (same symbol+side)
+        actionable = []
         for sig in recent:
-            status_icon = {
-                "pending": "...",
-                "executed": "OK",
-                "rejected": "NO",
-            }.get(sig.status, "??")
+            if (sig.symbol, sig.side) not in open_pairs:
+                actionable.append(sig)
+            if len(actionable) >= 5:
+                break
+
+        if not actionable:
+            await self.send_message(chat_id, "No actionable signals — all recent signals are already open.")
+            return
+
+        lines = ["**Recent Signals** _(not already open)_\n"]
+        for i, sig in enumerate(actionable, 1):
             ts = datetime.fromtimestamp(sig.timestamp_received).strftime("%m/%d %H:%M")
-            line = f"`[{status_icon}]` {ts} {sig.symbol} {sig.side} {sig.leverage:.0f}x [{sig.trade_type}]"
-            if sig.rejection_reason:
-                line += f"\n       Reason: {sig.rejection_reason[:40]}"
-            if sig.position_id:
-                line += f"\n       Pos: ...{sig.position_id[-6:]}"
+            entry = (sig.entry_low + sig.entry_high) / 2
+            n_tps = len(sig.take_profits)
+            line = (
+                f"**{i}.** {sig.symbol} {sig.side} {sig.leverage:.0f}x [{sig.trade_type}]\n"
+                f"   Entry: ${entry:,.0f} | SL: ${sig.stop_loss:,.0f} | {n_tps} TPs\n"
+                f"   _{ts}_"
+            )
+            if sig.status == "rejected" and sig.rejection_reason:
+                line += f"\n   Previously rejected: {sig.rejection_reason[:40]}"
             lines.append(line)
 
+        lines.append("\nReply with number to open (e.g. `1`) or /cancel")
         await self.send_message(chat_id, "\n".join(lines))
+
+        self.pending_signals[chat_id] = {
+            "signals": actionable,
+            "created_at": time.time(),
+        }
+
+    async def handle_signals_reply(self, chat_id: int, text: str):
+        """Handle user's reply to /signals prompt."""
+        pending = self.pending_signals.get(chat_id)
+        if not pending:
+            return
+
+        if time.time() - pending["created_at"] > 120:
+            del self.pending_signals[chat_id]
+            await self.send_message(chat_id, "Signal selection expired (2min). Use /signals again.")
+            return
+
+        text = text.strip().upper()
+        if text in ("CANCEL", "NO", "N"):
+            del self.pending_signals[chat_id]
+            await self.send_message(chat_id, "Signal selection cancelled.")
+            return
+
+        # Parse number
+        try:
+            idx = int(text.strip()) - 1
+        except ValueError:
+            await self.send_message(chat_id, "Reply with a number (e.g. `1`) or /cancel")
+            return
+
+        signals = pending["signals"]
+        if idx < 0 or idx >= len(signals):
+            await self.send_message(chat_id, f"Invalid choice. Pick 1-{len(signals)} or /cancel")
+            return
+
+        sig = signals[idx]
+        del self.pending_signals[chat_id]
+
+        await self.send_message(
+            chat_id,
+            f"Opening {sig.symbol} {sig.side} {sig.leverage:.0f}x...\n"
+            f"Re-running signal through execution pipeline."
+        )
+        await self.process_signal(sig.raw_text)
 
     # ──────────────────────────────────────────────────────────────────────
     # /tradesize

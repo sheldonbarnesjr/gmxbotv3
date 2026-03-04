@@ -80,17 +80,22 @@ class WalletMixin:
             wallets.append((4, self.account4))
         return wallets
 
-    async def _pick_wallet(self, symbol: str, trade_type: str = "scalp") -> tuple:
+    async def _pick_wallet(self, symbol: str, trade_type: str = "scalp", *, is_long: bool = True) -> tuple:
         """Pick which wallet to use for a new position based on trade type.
 
         Routing logic:
           - swing/long-term → W1 only
-          - scalp → W2, W3, W4 (first available without that symbol)
+          - scalp → W2, W3, W4 (first available without that symbol+side)
+
+        A wallet is only "busy" if it has the same symbol AND same side open.
+        E.g. a BTC SHORT on W2 does NOT block a new BTC SHORT with different
+        leverage/TPs from going on W3.
 
         Queries ON-CHAIN positions (not just internal tracking) so the bot
         is aware of positions opened manually or before a reboot.
         Returns (wallet_id, account) or (None, None) if all wallets busy."""
         market_addr = self.cfg.markets.get(symbol, "").lower()
+        side_label = "LONG" if is_long else "SHORT"
         if not market_addr:
             return 1, self.account  # unknown symbol, default to W1
 
@@ -107,13 +112,13 @@ class WalletMixin:
         for wid, acct in wallets:
             try:
                 # Check in-memory positions first (catches pending/unconfirmed trades)
-                has_symbol_inmem = any(
-                    p.symbol == symbol and p.is_open and p.wallet_id == wid
+                has_same_inmem = any(
+                    p.symbol == symbol and p.is_long == is_long and p.is_open and p.wallet_id == wid
                     for p in self.positions.values()
                 )
-                if has_symbol_inmem:
+                if has_same_inmem:
                     self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} in-memory — skipping"
+                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} {side_label} in-memory — skipping"
                     )
                     continue
 
@@ -121,17 +126,18 @@ class WalletMixin:
                 chain_positions = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
                 )
-                has_symbol = any(
-                    cp.market.lower() == market_addr for cp in chain_positions
+                has_same_onchain = any(
+                    cp.market.lower() == market_addr and cp.is_long == is_long
+                    for cp in chain_positions
                 )
-                if not has_symbol:
+                if not has_same_onchain:
                     self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) has no {symbol} position — selected [{trade_type}]"
+                        f"Wallet {wid} ({acct.address[:10]}...) has no {symbol} {side_label} position — selected [{trade_type}]"
                     )
                     return wid, acct
                 else:
                     self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} open on-chain"
+                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} {side_label} on-chain"
                     )
             except Exception as e:
                 self.logger.warning(f"Failed to check wallet {wid} on-chain: {e}")

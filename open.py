@@ -511,7 +511,9 @@ def parse_signal(text: str) -> Signal:
     # Skip common non-symbol words
     skip = {"LONG", "SHORT", "BUY", "SELL", "ENTRY", "SL", "TP", "STOP", "TAKE",
             "PROFIT", "LEVERAGE", "LEV", "RISK", "NORMAL", "HIGH", "LOW", "USD",
-            "USDT", "CLOSE", "TRAILING", "ENABLED"}
+            "USDT", "CLOSE", "TRAILING", "ENABLED", "VIP", "GROUP", "SCALP",
+            "SWING", "TARGET", "GAIN", "LOSS", "RR", "SSL", "VRVP", "EMA",
+            "BEARISH", "BULLISH", "DIV", "DIVS", "SET"}
     for m in re.finditer(r'\b([A-Z]{2,10})\b', txt):
         candidate = m.group(1)
         if candidate not in skip and candidate in COINGECKO_IDS:
@@ -544,7 +546,8 @@ def parse_signal(text: str) -> Signal:
         if entry_single:
             entry_low = entry_high = float(entry_single.group(1).replace(",", ""))
         else:
-            raise ValueError("Could not find entry price")
+            # No explicit entry — will use current market price at execution
+            entry_low = entry_high = 0.0
 
     # ── Take Profits ──
     # Try both TP patterns and use whichever finds more matches.
@@ -680,7 +683,7 @@ def parse_signal(text: str) -> Signal:
 
     # ── Stop Loss ──
     sl_match = re.search(
-        r'(?:SL|STOP\s*LOSS|STOP(?=\s*[:=@\-$]))\s*[:=@\-]?\s*\$?([\d,]+(?:\.\d+)?)',
+        r'(?:\bSL\b|STOP\s*LOSS|STOP(?=\s*[:=@\-$]))\s*[:=@\-]?\s*\$?(\d[\d,]*(?:\.\d+)?)',
         txt, re.IGNORECASE
     )
     if not sl_match:

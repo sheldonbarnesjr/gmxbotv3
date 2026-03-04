@@ -246,7 +246,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Withdraw state: chat_id -> pending withdraw info
         self.pending_withdraw: Dict[int, Dict[str, Any]] = {}
 
-        # Last signal text for /lastsignal replay
+        # Signal selection state: chat_id -> pending signal pick
+        self.pending_signals: Dict[int, Dict[str, Any]] = {}
+
+        # Last signal text for replay
         self.last_signal_text: Optional[str] = None
 
         # Retry queue for failed TP/SL order placements
@@ -1417,8 +1420,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self.signal_store.mark_rejected(signal_id, f"{signal.symbol} not in allowed pairs")
                 return
 
-            # Dedup: skip if same signal text was processed within the dedup window
-            sig_hash = hashlib.md5(text.encode()).hexdigest()
+            # Dedup: skip only if an identical signal (same symbol, side, leverage, TP levels)
+            # was processed within the dedup window.  Different leverage or TP levels = new trade.
+            tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
+            sig_fingerprint = f"{signal.symbol}|{signal.side}|{signal.leverage}|{tp_prices}"
+            sig_hash = hashlib.md5(sig_fingerprint.encode()).hexdigest()
             now = time.time()
 
             # Purge expired entries
@@ -1429,8 +1435,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
             if sig_hash in self._recent_signal_hashes:
                 elapsed = now - self._recent_signal_hashes[sig_hash]
-                self.logger.info(f"Duplicate signal ignored (same text {elapsed:.0f}s ago, window={self._signal_dedup_window:.0f}s)")
-                self.signal_store.mark_rejected(signal_id, "duplicate signal")
+                self.logger.info(f"Exact duplicate signal ignored (same leverage+TPs {elapsed:.0f}s ago, window={self._signal_dedup_window:.0f}s)")
+                self.signal_store.mark_rejected(signal_id, "exact duplicate signal")
                 return
             self._recent_signal_hashes[sig_hash] = now
 
@@ -1438,6 +1444,17 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.last_signal_text = text
 
             self.logger.info(f"Signal parsed: {signal.symbol} {signal.side} [{signal.trade_type}] (sig={signal_id[:8]})")
+
+            # If signal has no explicit entry, use current market price
+            if signal.entry_mid == 0:
+                try:
+                    mkt_price = await asyncio.to_thread(fetch_current_price, signal.symbol, self.w3)
+                    signal.entry_low = signal.entry_high = mkt_price
+                    self.logger.info(f"No entry in signal — using market price ${mkt_price:,.2f}")
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch market price for missing entry: {e}")
+                    self.signal_store.mark_rejected(signal_id, "no entry price and market price unavailable")
+                    return
 
             # Validation
             if not await self.validate_signal(signal):
@@ -1447,7 +1464,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Pick wallet based on trade type:
             #   swing → W1 only
             #   scalp → W2, W3, W4 (first available)
-            wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type)
+            wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type, is_long=signal.is_long)
             if not acct:
                 self.signal_store.mark_rejected(signal_id, "no available wallets")
                 await self.notify(
@@ -1520,30 +1537,30 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     return
 
-            # Final safety check: scan ALL wallets for an existing on-chain
-            # position in this market+side to prevent duplicates even when
-            # slightly different signal text bypasses the hash-based dedup.
+            # Final safety check: verify the SELECTED wallet doesn't already
+            # have an on-chain position for this market+side (guards against
+            # race conditions where _pick_wallet passed but the position
+            # appeared on-chain before we execute).
             market_addr = self.cfg.markets.get(signal.symbol, "").lower()
             if market_addr:
-                for wid_chk, acct_chk in self._all_wallets():
-                    try:
-                        chain_positions = await asyncio.to_thread(
-                            chain_fetch_positions, self.w3, acct_chk.address
-                        )
-                        for cp in chain_positions:
-                            if cp.market.lower() == market_addr and cp.is_long == signal.is_long:
-                                self.logger.warning(
-                                    f"Duplicate blocked: {signal.symbol} {signal.side} already open "
-                                    f"on W{wid_chk} ({acct_chk.address[:10]}...)"
-                                )
-                                self.signal_store.mark_rejected(signal_id, f"duplicate on W{wid_chk}")
-                                await self.notify(
-                                    f"Blocked duplicate {signal.symbol} {signal.side}: "
-                                    f"already open on W{wid_chk}"
-                                )
-                                return
-                    except Exception as e:
-                        self.logger.warning(f"Could not check W{wid_chk} for duplicates: {e}")
+                try:
+                    chain_positions = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    for cp in chain_positions:
+                        if cp.market.lower() == market_addr and cp.is_long == signal.is_long:
+                            self.logger.warning(
+                                f"Duplicate blocked: {signal.symbol} {signal.side} already open "
+                                f"on W{wallet_id} ({acct.address[:10]}...)"
+                            )
+                            self.signal_store.mark_rejected(signal_id, f"duplicate on W{wallet_id}")
+                            await self.notify(
+                                f"Blocked duplicate {signal.symbol} {signal.side}: "
+                                f"already open on W{wallet_id}"
+                            )
+                            return
+                except Exception as e:
+                    self.logger.warning(f"Could not check W{wallet_id} for duplicates: {e}")
 
             # Execute on-chain with the selected wallet
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
@@ -1683,19 +1700,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             await self.notify(f"Rejected {signal.symbol} {signal.side}: {tp_err}")
             return False
 
-        # Reject if we already have an open position for this symbol (same side)
-        existing = [
-            p for p in self.positions.values()
-            if p.symbol == signal.symbol and p.side == signal.side and p.is_open
-        ]
-        if existing:
-            self.logger.warning(
-                f"Rejected {signal.symbol} {signal.side}: already have {len(existing)} open position(s)"
-            )
-            await self.notify(
-                f"Rejected {signal.symbol} {signal.side}: already have an open {signal.side} position"
-            )
-            return False
+        # NOTE: We no longer reject based on existing positions for the same
+        # symbol+side here.  _pick_wallet() handles routing to a free wallet
+        # and rejects only when ALL eligible wallets are occupied.
 
         # Price deviation check — reject if too far from signal entry
         try:
