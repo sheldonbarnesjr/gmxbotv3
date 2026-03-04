@@ -1101,13 +1101,12 @@ class CoreTelegramMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_signals(self, chat_id: int):
-        """Show last 5 signals that aren't already open, prompt user to pick one."""
+        """Scan channel history for recent signals not already open, prompt to pick one."""
         from datetime import datetime
+        from open import parse_signal
+        from config import ALLOWED_SYMBOLS
 
-        recent = self.signal_store.get_recent(20)  # fetch more to filter down
-        if not recent:
-            await self.send_message(chat_id, "No signals recorded yet.")
-            return
+        await self.send_message(chat_id, "Scanning channel history for signals...")
 
         # Get currently open symbols+sides across all wallets
         open_pairs = set()
@@ -1115,37 +1114,89 @@ class CoreTelegramMixin:
             if p.is_open:
                 open_pairs.add((p.symbol, p.side))
 
-        # Filter to signals not already open (same symbol+side)
-        actionable = []
-        for sig in recent:
-            if (sig.symbol, sig.side) not in open_pairs:
-                actionable.append(sig)
+        # Also check on-chain positions
+        for wid, acct in self._all_wallets():
+            try:
+                chain_pos = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, acct.address
+                )
+                for cp in chain_pos:
+                    side = "LONG" if cp.is_long else "SHORT"
+                    sym = cp.symbol if hasattr(cp, "symbol") else ""
+                    if sym:
+                        open_pairs.add((sym, side))
+            except Exception:
+                pass
+
+        # Scan last 50 messages from each monitored channel
+        actionable = []  # list of (parsed_signal, raw_text, channel_name, timestamp)
+        seen_fingerprints = set()
+
+        for ch_id, ch_name in self.resolved_channels.items():
+            try:
+                msgs = await self.client.get_messages(ch_id, limit=50)
+                for msg in msgs:
+                    if not msg or not msg.text:
+                        continue
+                    text = msg.text.strip()
+                    if len(text) < 10:
+                        continue
+                    if is_update_message(text):
+                        continue
+
+                    try:
+                        signal = parse_signal(text)
+                    except Exception:
+                        continue
+
+                    # Must be an allowed symbol
+                    if signal.symbol not in ALLOWED_SYMBOLS:
+                        continue
+
+                    # Skip if already open
+                    if (signal.symbol, signal.side) in open_pairs:
+                        continue
+
+                    # Dedup by symbol+side+TPs
+                    tp_prices = tuple(sorted(tp.price for tp in signal.take_profits))
+                    fp = (signal.symbol, signal.side, tp_prices)
+                    if fp in seen_fingerprints:
+                        continue
+                    seen_fingerprints.add(fp)
+
+                    ts = msg.date.timestamp() if msg.date else time.time()
+                    actionable.append((signal, text, ch_name, ts))
+
+                    if len(actionable) >= 5:
+                        break
+            except Exception as e:
+                self.logger.warning(f"Failed to scan {ch_name}: {e}")
+
             if len(actionable) >= 5:
                 break
 
         if not actionable:
-            await self.send_message(chat_id, "No actionable signals — all recent signals are already open.")
+            await self.send_message(chat_id, "No actionable signals found in recent channel history.")
             return
 
         lines = ["**Recent Signals** _(not already open)_\n"]
-        for i, sig in enumerate(actionable, 1):
-            ts = datetime.fromtimestamp(sig.timestamp_received).strftime("%m/%d %H:%M")
-            entry = (sig.entry_low + sig.entry_high) / 2
+        for i, (sig, raw, ch, ts) in enumerate(actionable, 1):
+            ts_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
+            entry = sig.entry_mid
+            entry_str = f"${entry:,.0f}" if entry > 0 else "market"
             n_tps = len(sig.take_profits)
             line = (
                 f"**{i}.** {sig.symbol} {sig.side} {sig.leverage:.0f}x [{sig.trade_type}]\n"
-                f"   Entry: ${entry:,.0f} | SL: ${sig.stop_loss:,.0f} | {n_tps} TPs\n"
-                f"   _{ts}_"
+                f"   Entry: {entry_str} | SL: ${sig.stop_loss:,.0f} | {n_tps} TPs\n"
+                f"   _{ts_str} — {ch}_"
             )
-            if sig.status == "rejected" and sig.rejection_reason:
-                line += f"\n   Previously rejected: {sig.rejection_reason[:40]}"
             lines.append(line)
 
         lines.append("\nReply with number to open (e.g. `1`) or /cancel")
         await self.send_message(chat_id, "\n".join(lines))
 
         self.pending_signals[chat_id] = {
-            "signals": actionable,
+            "signals": [(raw, sig) for sig, raw, ch, ts in actionable],
             "created_at": time.time(),
         }
 
@@ -1178,15 +1229,15 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, f"Invalid choice. Pick 1-{len(signals)} or /cancel")
             return
 
-        sig = signals[idx]
+        raw_text, sig = signals[idx]
         del self.pending_signals[chat_id]
 
         await self.send_message(
             chat_id,
             f"Opening {sig.symbol} {sig.side} {sig.leverage:.0f}x...\n"
-            f"Re-running signal through execution pipeline."
+            f"Running through execution pipeline."
         )
-        await self.process_signal(sig.raw_text)
+        await self.process_signal(raw_text)
 
     # ──────────────────────────────────────────────────────────────────────
     # /tradesize
