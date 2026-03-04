@@ -952,6 +952,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     pos.verified_decreases = pos.verified_decreases[:len(pos.take_profits)]
 
+                # Always use on-chain entry price (signal entry may differ from fill)
+                if cp.entry_price and cp.entry_price > 0:
+                    pos.entry_price = cp.entry_price
+
                 self.positions[pos.id] = pos
                 synced += 1
                 tp_str = f", {tp_count} TPs" if take_profits else ", no TPs"

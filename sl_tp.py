@@ -675,17 +675,17 @@ class SLTPMixin:
     async def cmd_sl(self, chat_id: int, arg: Optional[str]):
         """Telegram /sl command handler.
 
-        Manually move SL to entry (breakeven) or a specific TP level.
+        Manually move SL to entry (breakeven), a TP level, or a custom price.
 
         Usage:
             /sl                   — show open positions & available SL targets
             /sl 1 entry           — move position #1 SL to entry price
             /sl 1 tp2             — move position #1 SL to TP2 price
-            /sl 1 tp3             — move position #1 SL to TP3 price (etc.)
+            /sl 1 72500           — move position #1 SL to $72,500
 
         Args:
             chat_id: Telegram chat ID
-            arg: "<position_number> <target>" where target is "entry" or "tp1"-"tp8"
+            arg: "<position_number> <target>" where target is "entry", "tp1"-"tp8", or a price
         """
         try:
             positions, orders = await self._fetch_all_positions_and_orders()
@@ -725,13 +725,13 @@ class SLTPMixin:
                         f"  Entry: ${pos.entry_price:,.2f} | SL: {current_sl}\n"
                         f"  Targets: {', '.join(targets)}\n\n"
                     )
-                msg += "Example: `/sl 1 entry` or `/sl 1 tp2`"
+                msg += "Example: `/sl 1 entry` or `/sl 1 tp2` or `/sl 1 72500`"
                 await self.send_message(chat_id, msg)
                 return
 
             parts = arg.strip().split()
             if len(parts) < 2:
-                await self.send_message(chat_id, "Usage: `/sl <#> <target>`\nExample: `/sl 1 entry` or `/sl 1 tp2`")
+                await self.send_message(chat_id, "Usage: `/sl <#> <target>`\nExample: `/sl 1 entry` or `/sl 1 tp2` or `/sl 1 72500`")
                 return
 
             try:
@@ -773,7 +773,7 @@ class SLTPMixin:
                 try:
                     tp_num = int(target[2:])
                 except ValueError:
-                    await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry' or 'tp1'-'tp8'.")
+                    await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry', 'tp1'-'tp8', or a price.")
                     return
                 sorted_tps = sorted(internal_pos.take_profits,
                                     key=lambda t: t.price,
@@ -784,7 +784,16 @@ class SLTPMixin:
                 new_sl_price = sorted_tps[tp_num - 1].price
                 sl_label = f"TP{tp_num}"
             else:
-                await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry' or 'tp1'-'tp8'.")
+                # Try parsing as a raw price
+                try:
+                    new_sl_price = float(target.replace(",", "").replace("$", ""))
+                except ValueError:
+                    await self.send_message(chat_id, f"Invalid target: {target}. Use 'entry', 'tp1'-'tp8', or a price.")
+                    return
+                if new_sl_price <= 0:
+                    await self.send_message(chat_id, "Price must be positive.")
+                    return
+                sl_label = f"${new_sl_price:,.2f}"
                 return
 
             current_price = chain_pos.current_price or await self.get_current_price(chain_pos.symbol)
