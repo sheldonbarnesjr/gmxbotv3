@@ -1477,9 +1477,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             wallet_label = f" [W{wallet_id}]" if len(self._all_wallets()) > 1 else ""
             type_label = signal.trade_type.upper()
 
-            # Determine collateral = portfolio_pct of TOTAL portfolio (free USDC + deployed collateral + PnL)
+            # Determine collateral based on number of open trades:
+            #   0-1 open: portfolio_pct of TOTAL portfolio (free USDC + deployed + PnL)
+            #   2+  open: portfolio_pct of FREE USDC only (avoid over-deploying)
             total_portfolio = await self._get_total_portfolio_value()
             free_usdc = await self._get_combined_usdc()
+            open_count = sum(1 for p in self.positions.values() if p.is_open)
 
             if total_portfolio <= 0:
                 self.signal_store.mark_rejected(signal_id, "portfolio value is $0")
@@ -1489,7 +1492,15 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Cap leverage at max_leverage first so collateral calculation is correct
             signal.leverage = cap_leverage(signal.leverage, self.cfg.max_leverage)
 
-            collateral_usd = total_portfolio * self.cfg.portfolio_pct
+            if open_count >= self.cfg.free_balance_after:
+                # Size from free USDC only — don't count deployed collateral
+                sizing_base = free_usdc
+                sizing_label = f"free USDC (${free_usdc:,.0f}, {open_count} open trades)"
+            else:
+                sizing_base = total_portfolio
+                sizing_label = f"total portfolio (${total_portfolio:,.0f})"
+
+            collateral_usd = sizing_base * self.cfg.portfolio_pct
             size_usd = collateral_usd * signal.leverage
 
             min_collateral_err = check_min_collateral(
@@ -1508,7 +1519,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 f"TP: {tp_list}\n"
                 f"SL: ${signal.stop_loss:,.0f}\n"
                 f"Portfolio: ${total_portfolio:.0f} (free: ${free_usdc:.0f} + deployed)\n"
-                f"Collateral: ${collateral_usd:.0f} ({self.cfg.portfolio_pct:.0%} of ${total_portfolio:.0f})\n"
+                f"Sizing: {self.cfg.portfolio_pct:.0%} of {sizing_label}\n"
+                f"Collateral: ${collateral_usd:.0f}\n"
                 f"Size: ${size_usd:.0f} @ {signal.leverage:.0f}x\n"
                 f"Mode: {'DRY RUN' if self.cfg.dry_run else 'LIVE'}"
             )
