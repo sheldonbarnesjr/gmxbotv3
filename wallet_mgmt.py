@@ -109,40 +109,47 @@ class WalletMixin:
                 # No scalp wallets configured, fall back to all wallets
                 wallets = self._all_wallets()
 
+        skip_reasons = []
         for wid, acct in wallets:
             try:
                 # Check in-memory positions first (catches pending/unconfirmed trades)
-                has_same_inmem = any(
-                    p.symbol == symbol and p.is_long == is_long and p.is_open and p.wallet_id == wid
-                    for p in self.positions.values()
-                )
-                if has_same_inmem:
-                    self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} {side_label} in-memory — skipping"
-                    )
+                inmem_matches = [
+                    p for p in self.positions.values()
+                    if p.symbol == symbol and p.is_long == is_long and p.is_open and p.wallet_id == wid
+                ]
+                if inmem_matches:
+                    reason = f"W{wid}: in-memory {symbol} {side_label} (pos {inmem_matches[0].id[:8]})"
+                    self.logger.info(reason)
+                    skip_reasons.append(reason)
                     continue
 
                 # Then check on-chain (catches positions from before reboot or manual opens)
                 chain_positions = await asyncio.to_thread(
                     chain_fetch_positions, self.w3, acct.address
                 )
-                has_same_onchain = any(
-                    cp.market.lower() == market_addr and cp.is_long == is_long
-                    for cp in chain_positions
-                )
-                if not has_same_onchain:
+                matching = [
+                    cp for cp in chain_positions
+                    if cp.market.lower() == market_addr and cp.is_long == is_long
+                ]
+                if not matching:
                     self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) has no {symbol} {side_label} position — selected [{trade_type}]"
+                        f"W{wid} ({acct.address[:10]}...) free for {symbol} {side_label} — selected [{trade_type}]"
                     )
                     return wid, acct
                 else:
-                    self.logger.info(
-                        f"Wallet {wid} ({acct.address[:10]}...) already has {symbol} {side_label} on-chain"
-                    )
+                    reason = f"W{wid}: on-chain {symbol} {side_label} (size ${matching[0].size_usd:,.0f})"
+                    self.logger.info(reason)
+                    skip_reasons.append(reason)
             except Exception as e:
-                self.logger.warning(f"Failed to check wallet {wid} on-chain: {e}")
+                reason = f"W{wid}: check failed — {e}"
+                self.logger.warning(reason)
+                skip_reasons.append(reason)
                 continue
 
+        # Store rejection details so caller can show them
+        detail = "; ".join(skip_reasons) if skip_reasons else "unknown"
+        self.logger.warning(f"No wallet for {symbol} {side_label} [{trade_type}]: {detail}")
+        self._last_wallet_reject_reason = detail
         return None, None
 
     def get_portfolio_value(self) -> float:

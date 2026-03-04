@@ -1466,10 +1466,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             #   scalp → W2, W3, W4 (first available)
             wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type, is_long=signal.is_long)
             if not acct:
-                self.signal_store.mark_rejected(signal_id, "no available wallets")
+                reason = getattr(self, '_last_wallet_reject_reason', 'unknown')
+                self.signal_store.mark_rejected(signal_id, f"no available wallets: {reason}")
                 await self.notify(
                     f"Rejected {signal.symbol} {signal.side} [{signal.trade_type}]: "
-                    "no available wallets"
+                    f"no available wallets\n{reason}"
                 )
                 return
 
