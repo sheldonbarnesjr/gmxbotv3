@@ -508,14 +508,16 @@ class CoreTelegramMixin:
                     pnl_pct = pos.pnl_percentage if pos.pnl_percentage else 0.0
                 pnl_icon = "+" if pnl >= 0 else ""
 
-                pos_orders = [o for o in orders if o["market"].lower() == pos.market.lower()]
+                wid = getattr(pos, '_wallet_id', 1)
+                pos_orders = [o for o in orders
+                              if o["market"].lower() == pos.market.lower()
+                              and o.get("_wallet_id", 1) == wid]
                 tp_orders = sorted([o for o in pos_orders if o["order_type"] == 5],
                                    key=lambda o: o["trigger_price"])
                 sl_orders = [o for o in pos_orders if o["order_type"] == 6]
                 limit_orders = [o for o in pos_orders if o["order_type"] in (2, 3)]
 
                 wid_label = ""
-                wid = getattr(pos, '_wallet_id', 1)
                 if hasattr(pos, '_wallet_id'):
                     wid_label = f" [W{wid}]"
 
@@ -616,7 +618,8 @@ class CoreTelegramMixin:
                         close_pct_str = ""
                         if tp_size > 0 and total_tp_size > 0:
                             close_pct = (tp_size / total_tp_size) * 100
-                            close_pct_str = f" (closes {close_pct:.0f}%)"
+                            fmt = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
+                            close_pct_str = f" (closes {fmt}%)"
                         elif internal:
                             hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
                             remaining_tps = [t for t in internal.take_profits if t.price not in hit_tp_prices]
@@ -739,7 +742,10 @@ class CoreTelegramMixin:
                 msg += f"**Positions ({len(positions)})**\n"
                 for i, pos in enumerate(positions, 1):
                     side = "LONG" if pos.is_long else "SHORT"
-                    pos_orders = [o for o in orders if o["market"].lower() == pos.market.lower()]
+                    wid_c = getattr(pos, '_wallet_id', 1)
+                    pos_orders = [o for o in orders
+                                  if o["market"].lower() == pos.market.lower()
+                                  and o.get("_wallet_id", 1) == wid_c]
                     tp_orders = sorted([o for o in pos_orders if o["order_type"] == 5],
                                        key=lambda o: o["trigger_price"])
                     sl_orders = [o for o in pos_orders if o["order_type"] == 6]
