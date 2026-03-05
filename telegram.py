@@ -69,7 +69,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /signals — Recent signals (pick one to open)
 /sl — Move stop loss
 /status — Bot status, health & halt/resume
-/trade-history — Trade history & PnL report (PDF)
+/trades — Trade history & PnL report (PDF)
 /tradesize — Show/change trade size
 /wallet — Deposit (d) or withdraw (w) USDC
 
@@ -309,7 +309,7 @@ class CoreTelegramMixin:
             elif cmd == "/tradesize":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_tradesize(chat_id, arg)
-            elif cmd == "/trade-history":
+            elif cmd == "/trades":
                 await self.cmd_pdf(chat_id)
             elif cmd == "/wallet":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
