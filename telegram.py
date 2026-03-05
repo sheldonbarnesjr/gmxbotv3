@@ -64,19 +64,17 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /cancelorder — List & cancel individual SL/TP orders
 /close — Close positions
 /collateral — Add or remove collateral (+/- amount)
-/deposit — Show W1 deposit address
+/deposit — Show deposit address & watch for USDC
 /gas — Swap USDC to ETH for gas (shows gas balances with no args)
 /help — This message
-/pdf — Trade history & PnL report (PDF)
 /pnl — Push hourly PnL update now
 /positions — Show on-chain positions & orders
-/prices — Live GMX & Chainlink prices
 /signals — Recent signals (pick one to open)
 /sl — Move stop loss
 /status — Bot status, health & halt/resume
+/trade-history — Trade history & PnL report (PDF)
 /tradesize — Show/change trade size
 /withdraw — Withdraw USDC to any Arbitrum address
-/winrate — Win rate stats
 
 **Wallets:** W1=swing, W2-W4=scalps"""
 
@@ -296,16 +294,6 @@ class CoreTelegramMixin:
                     await self.handle_collateral_reply(chat_id, "CONFIRM")
                 else:
                     await self.handle_close_confirmation(chat_id, "YES")
-            elif cmd == "/winrate":
-                sym = parts[1].upper() if len(parts) > 1 else None
-                n = None
-                if len(parts) > 2:
-                    try:
-                        n = int(parts[2])
-                    except ValueError:
-                        await self.send_message(chat_id, "Invalid count. Usage: /winrate [SYMBOL] [N]")
-                        return
-                await self.cmd_winrate(chat_id, sym, n)
             elif cmd == "/balance":
                 await self.cmd_balance(chat_id)
             elif cmd == "/pnl":
@@ -321,15 +309,13 @@ class CoreTelegramMixin:
             elif cmd == "/gas":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_topup(chat_id, arg)
-            elif cmd == "/prices":
-                await self.cmd_prices(chat_id)
             elif cmd == "/sl":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_sl(chat_id, arg)
             elif cmd == "/tradesize":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_tradesize(chat_id, arg)
-            elif cmd == "/pdf":
+            elif cmd == "/trade-history":
                 await self.cmd_pdf(chat_id)
             elif cmd == "/withdraw":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None

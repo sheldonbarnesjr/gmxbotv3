@@ -313,7 +313,13 @@ class WithdrawMixin:
         """Show W1 Arbitrum address and start watching for incoming USDC."""
         w1_addr = self.account.address
 
-        # Get current W1 USDC balance as baseline
+        # Get total balance across all wallets
+        try:
+            total_bal = await self._get_total_portfolio_value()
+        except Exception:
+            total_bal = 0.0
+
+        # Get W1 baseline for the deposit watcher
         try:
             baseline = await asyncio.to_thread(
                 self._get_portfolio_value_for, self.account
@@ -323,13 +329,12 @@ class WithdrawMixin:
 
         await self.send_message(
             chat_id,
-            f"**Deposit USDC to Bot**\n\n"
             f"Send USDC (Arbitrum) to:\n"
-            f"`{w1_addr}`\n\n"
-            f"Current W1 balance: ${baseline:,.2f}\n\n"
             f"Watching for incoming USDC for 30 min.\n"
-            f"Will auto-rebalance across all wallets when received."
+            f"Current balance: ${total_bal:,.2f}"
         )
+        # Send address as separate message for easy copy-paste
+        await self.send_message(chat_id, w1_addr)
 
         # Cancel any existing watcher
         if self._deposit_watch_task and not self._deposit_watch_task.done():
