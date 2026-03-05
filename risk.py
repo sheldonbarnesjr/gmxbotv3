@@ -195,21 +195,19 @@ def classify_exit_reason(
     """
 
     if tp_hits_count > 0 and tp_orders_remaining == 0:
-        return "All TPs filled"
+        return "All TPs Filled"
 
     # ── Liquidation detection ──
     if sl_orders_remaining >= 0 and tp_orders_remaining >= 0:
         if sl_orders_remaining > 0 and tp_orders_remaining > 0 and tp_hits_count == 0:
             return "Liquidation"
         if sl_orders_remaining > 0 and tp_orders_remaining == 0 and tp_hits_count > 0:
-            return "All TPs filled"
+            return "All TPs Filled"
         if sl_orders_remaining == 0 and tp_orders_remaining > 0:
             if sl_moved_to_entry and stop_loss:
                 sl_label = sl_move_label or "Entry"
-                if sl_label == "Entry":
-                    return "SL (breakeven)"
-                return f"SL at {sl_label} (${stop_loss:,.2f})"
-            return "SL triggered"
+                return f"Closed at {sl_label} (${stop_loss:,.2f})"
+            return "SL Hit"
 
     if sl_moved_to_entry and stop_loss:
         sl_label = sl_move_label or "Entry"
@@ -224,19 +222,15 @@ def classify_exit_reason(
                 sl_triggered = True
 
         if sl_triggered:
-            if sl_label == "Entry":
-                return "SL (breakeven)"
-            return f"SL at {sl_label} (${sl_price:,.2f})"
+            return f"Closed at {sl_label} (${sl_price:,.2f})"
 
         if tp_hits_count > 0:
-            return f"TP/SL hit ({tp_hits_count} TPs filled)"
-        return "SL/TP hit"
+            return f"Closed ({tp_hits_count} TPs hit)"
+        return "SL Hit"
 
     if tp_hits_count > 0:
         return f"Closed ({tp_hits_count} TPs hit)"
-    if tp_orders_remaining > 0:
-        return "SL/TP/liquidation"
-    return "SL/liquidation"
+    return "SL Hit"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -327,14 +321,13 @@ def determine_new_sl_target(
 ) -> Tuple[Optional[float], Optional[str]]:
     """Determine where SL should move after TP hit(s).
 
-    Trail 1-back for ALL leverage tiers and ALL TP counts.
-    Tested against 6 alternative strategies on 969 signals — this wins.
-
+    Strategy:
       TP1 hit → SL to Entry (breakeven)
-      TP2 hit → SL to TP1
-      TP3 hit → SL to TP2
-      TP4 hit → SL to TP3
-      ... always trail 1 level back
+      TP2 hit → SL stays at Entry
+      TP3 hit → SL to TP1
+      TP4 hit → SL to TP2
+      TP5 hit → SL to TP3
+      ... always trail 2 levels back from TP3 onward
 
     Returns (new_sl_price, sl_label), or (None, None) if no move needed.
     """
@@ -345,11 +338,17 @@ def determine_new_sl_target(
     if tp_hits_count <= 0:
         return None, None
 
-    if tp_hits_count == 1:
+    # All TPs hit → position fully closed, no SL move needed
+    if tp_hits_count >= len(sorted_tps):
+        return None, None
+
+    # TP1 or TP2 hit → SL to entry
+    if tp_hits_count <= 2:
         return entry_price, "Entry"
 
-    # Always trail 1 level back
-    idx = tp_hits_count - 2  # 0-indexed
-    if idx < len(sorted_tps):
-        return _tp_price(idx), f"TP{idx + 1}"
+    # TP3+ hit → trail 2 levels back (TP3→TP1, TP4→TP2, TP5→TP3, etc.)
+    trail_idx = tp_hits_count - 3  # 0-indexed: TP3→0(TP1), TP4→1(TP2), ...
+    if trail_idx < len(sorted_tps):
+        return _tp_price(trail_idx), f"TP{trail_idx + 1}"
+
     return entry_price, "Entry"

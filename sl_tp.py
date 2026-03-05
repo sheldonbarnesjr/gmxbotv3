@@ -111,7 +111,9 @@ class SLTPMixin:
                 if not new_events:
                     continue
 
-                # Step 3: Match events to un-verified TPs by execution price
+                # Step 3: Match events to un-verified TPs using on-chain order_type
+                # order_type: 5=TP (LimitDecrease), 6=SL (StopLossDecrease),
+                #             4=MarketDecrease (manual), None=unknown (fallback)
                 if is_long:
                     sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price)
                 else:
@@ -126,11 +128,34 @@ class SLTPMixin:
                         pos.processed_tx_hashes.add(event_key)
                         continue
 
+                    evt_order_type = event.get("order_type")
+
+                    # SL execution (order_type=6) — never match as TP
+                    if evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE:
+                        self.logger.info(
+                            f"{pos.symbol}: SL hit @ ${exec_price:,.0f} "
+                            f"(order_type=6, sl_level={pos.sl_move_label or 'original'}, "
+                            f"tx={event['tx_hash'][:16]}...)"
+                        )
+                        pos.processed_tx_hashes.add(event_key)
+                        continue
+
+                    # Manual close (order_type=4) — not a TP
+                    if evt_order_type == 4:  # MarketDecrease
+                        self.logger.info(
+                            f"{pos.symbol}: Manual close @ ${exec_price:,.0f} "
+                            f"(order_type=4, tx={event['tx_hash'][:16]}...)"
+                        )
+                        pos.processed_tx_hashes.add(event_key)
+                        continue
+
+                    # TP execution (order_type=5) or unknown (None → fallback to price matching)
                     matched = False
                     for i, tp in enumerate(sorted_tps):
                         if self._tp_already_verified(pos, tp.price):
                             continue
-                        # Match execution price to TP (1% tolerance for price impact)
+                        # For confirmed TPs (order_type=5), use price to determine WHICH TP
+                        # For unknown order_type, use price matching as fallback
                         if verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01):
                             pos.verified_decreases.append({
                                 "execution_price": exec_price,
@@ -140,23 +165,31 @@ class SLTPMixin:
                                 "log_index": event.get("log_index", 0),
                                 "size_delta_usd": event.get("size_delta_usd", 0),
                                 "matched_tp_price": tp.price,
+                                "order_type": evt_order_type,
                             })
                             new_hits += 1
                             matched = True
+                            source = "on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match"
                             self.logger.info(
                                 f"{pos.symbol} TP{i+1} HIT @ ${exec_price:,.0f} "
-                                f"(PositionDecrease event, "
+                                f"({source}, order_type={evt_order_type}, "
                                 f"pnl=${event.get('net_pnl_usd', 0):,.2f}, "
                                 f"tx={event['tx_hash'][:16]}...)"
                             )
                             break
 
                     if not matched:
-                        self.logger.debug(
-                            f"{pos.symbol}: PositionDecrease @ ${exec_price:,.0f} "
-                            f"did not match any unverified TP "
-                            f"(may be SL hit or manual close)"
-                        )
+                        if evt_order_type == ORDER_TYPE_LIMIT_DECREASE:
+                            # Confirmed TP from chain but no price match — log warning
+                            self.logger.warning(
+                                f"{pos.symbol}: TP execution (order_type=5) @ ${exec_price:,.0f} "
+                                f"did not match any unverified TP price"
+                            )
+                        else:
+                            self.logger.debug(
+                                f"{pos.symbol}: PositionDecrease @ ${exec_price:,.0f} "
+                                f"order_type={evt_order_type} — no TP match"
+                            )
                     # Mark as processed regardless of match
                     pos.processed_tx_hashes.add(event_key)
 
@@ -316,6 +349,14 @@ class SLTPMixin:
                         event_key = f"{evt.get('tx_hash', '')}:{evt.get('log_index', 0)}"
                         if event_key in pos.processed_tx_hashes:
                             continue
+                        # Skip SL/manual close events — only match confirmed TPs or unknowns
+                        evt_order_type = evt.get("order_type")
+                        if evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE:
+                            pos.processed_tx_hashes.add(event_key)
+                            continue
+                        if evt_order_type == 4:  # MarketDecrease
+                            pos.processed_tx_hashes.add(event_key)
+                            continue
                         exec_price = evt.get("execution_price", 0)
                         if exec_price and tp.price > 0:
                             if verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01):
@@ -327,14 +368,16 @@ class SLTPMixin:
                                     "log_index": evt.get("log_index", 0),
                                     "size_delta_usd": evt.get("size_delta_usd", 0),
                                     "matched_tp_price": tp.price,
+                                    "order_type": evt_order_type,
                                 })
                                 pos.processed_tx_hashes.add(event_key)
                                 newly_marked += 1
                                 verified = True
                                 self._get_stale_tp_misses().pop(miss_key, None)
+                                source = "on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match"
                                 self.logger.info(
                                     f"Stale check: {pos.symbol} TP @ ${tp.price:,.2f} "
-                                    f"verified via PositionDecrease event @ ${exec_price:,.0f}"
+                                    f"verified via PositionDecrease event @ ${exec_price:,.0f} ({source})"
                                 )
                                 break
 

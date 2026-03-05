@@ -461,20 +461,24 @@ def _load_env_tp_dist(n_tps: int, prefix: str = "TP") -> List[float]:
 
 def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
                       swing_keyword_match: bool = False) -> List[TakeProfit]:
-    """Apply back_load TP allocations: 1% at each early TP, rest on last.
+    """Apply env-configured TP percentage splits (TP_3_1, TP_4_1, etc.).
 
-    Same strategy for all leverage tiers.
+    Reads TP_{n}_{i} from .env for the given TP count.
+    Falls back to equal distribution if not configured.
     """
-    from risk import get_tp_allocations
-
     n_tps = len(take_profits)
     if n_tps < 2:
         return take_profits
 
-    allocs = get_tp_allocations(n_tps)
-    total = sum(allocs)
-    for i, tp in enumerate(take_profits):
-        tp.close_pct = allocs[i] / total
+    env_pcts = _load_env_tp_dist(n_tps)
+    if env_pcts and len(env_pcts) == n_tps and sum(env_pcts) > 0:
+        for i, tp in enumerate(take_profits):
+            tp.close_pct = env_pcts[i]
+    else:
+        # Fallback: equal distribution
+        each = 1.0 / n_tps
+        for tp in take_profits:
+            tp.close_pct = each
 
     # Ensure exact 1.0 total (absorb rounding into last TP)
     actual_total = sum(tp.close_pct for tp in take_profits)
@@ -617,16 +621,18 @@ def parse_signal(text: str) -> Signal:
                 f"keeping originals to avoid empty TP list"
             )
 
+    # Cap at 8 TPs max — drop extras (keep the closest targets)
+    MAX_TPS = 8
+    if len(take_profits) > MAX_TPS:
+        log.warning(
+            f"Signal has {len(take_profits)} TPs — trimming to {MAX_TPS}"
+        )
+        take_profits = take_profits[:MAX_TPS]
+
     # Assign close percentages if not specified in the signal.
     # Each TP's close_pct is a fraction of the ORIGINAL position size.
     # All close_pct values must sum to 1.0 (100%) so the full position
     # is closed across all TPs.
-    #
-    # Default distributions (when signal doesn't specify %):
-    #   2 TPs: 33%, 67%           — small early lock-in, let the rest ride
-    #   3 TPs: 20%, 50%, 30%      — light trim, bulk at TP2, remainder at TP3
-    #   4 TPs: 15%, 30%, 30%, 25% — scale out gradually
-    #   5 TPs: 10%, 20%, 30%, 25%, 15% — pyramid out, heaviest at TP3
     #
     # The last TP always absorbs any rounding remainder so the total
     # is exactly 1.0 — no dust position left behind.
@@ -638,8 +644,6 @@ def parse_signal(text: str) -> Signal:
         6:  [0.08, 0.15, 0.22, 0.22, 0.18, 0.15],
         7:  [0.06, 0.12, 0.18, 0.20, 0.18, 0.14, 0.12],
         8:  [0.05, 0.10, 0.15, 0.18, 0.17, 0.14, 0.11, 0.10],
-        9:  [0.04, 0.08, 0.12, 0.16, 0.16, 0.14, 0.12, 0.10, 0.08],
-        10: [0.04, 0.07, 0.10, 0.13, 0.15, 0.14, 0.12, 0.10, 0.08, 0.07],
     }
 
     if take_profits:
