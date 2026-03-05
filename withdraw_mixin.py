@@ -309,6 +309,37 @@ class WithdrawMixin:
     # /deposit — show W1 address + auto-rebalance watcher
     # ──────────────────────────────────────────────────────────────────────
 
+    async def cmd_wallet(self, chat_id: int, arg: Optional[str] = None):
+        """Unified /wallet command: + for deposit, -<amount> for withdraw."""
+        if not arg:
+            await self.send_message(
+                chat_id,
+                "Usage:\n"
+                "  /wallet +  — show deposit address\n"
+                "  /wallet -100  — withdraw $100 USDC"
+            )
+            return
+
+        arg = arg.strip()
+        if arg == "+":
+            await self.cmd_deposit(chat_id)
+        elif arg.startswith("-"):
+            amount_str = arg[1:].strip()
+            if not amount_str:
+                await self.send_message(chat_id, "Usage: /wallet -<amount>\nExample: /wallet -100")
+                return
+            await self.cmd_withdraw(chat_id, amount_str)
+        elif arg.startswith("+") and len(arg) > 1:
+            # +<anything> treat as deposit
+            await self.cmd_deposit(chat_id)
+        else:
+            await self.send_message(
+                chat_id,
+                "Usage:\n"
+                "  /wallet +  — show deposit address\n"
+                "  /wallet -100  — withdraw $100 USDC"
+            )
+
     async def cmd_deposit(self, chat_id: int):
         """Show W1 Arbitrum address and start watching for incoming USDC."""
         w1_addr = self.account.address

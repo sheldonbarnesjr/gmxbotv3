@@ -61,12 +61,9 @@ logger = logging.getLogger("GMXBot.telegram")
 HELP_TEXT = """**GMX V2 Bot Commands**
 
 /balance — Wallet balances (auto-rebalances)
-/cancelorder — List & cancel individual SL/TP orders
 /close — Close positions
 /collateral — Add or remove collateral (+/- amount)
-/deposit — Show deposit address & watch for USDC
 /gas — Swap USDC to ETH for gas (shows gas balances with no args)
-/help — This message
 /pnl — Push hourly PnL update now
 /positions — Show on-chain positions & orders
 /signals — Recent signals (pick one to open)
@@ -74,7 +71,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /status — Bot status, health & halt/resume
 /trade-history — Trade history & PnL report (PDF)
 /tradesize — Show/change trade size
-/withdraw — Withdraw USDC to any Arbitrum address
+/wallet — Deposit (+) or withdraw (-) USDC
 
 **Wallets:** W1=swing, W2-W4=scalps"""
 
@@ -277,7 +274,7 @@ class CoreTelegramMixin:
             parts = text.strip().split()
             cmd = parts[0].lower()
 
-            if cmd == "/help":
+            if cmd in ("/help", "/start"):
                 await self.send_message(chat_id, HELP_TEXT)
             elif cmd == "/status":
                 arg = parts[1].lower() if len(parts) > 1 else None
@@ -303,9 +300,6 @@ class CoreTelegramMixin:
             elif cmd == "/collateral":
                 arg = parts[1] if len(parts) > 1 else None
                 await self.cmd_collateral(chat_id, arg)
-            elif cmd == "/cancelorder":
-                arg = " ".join(parts[1:]) if len(parts) > 1 else None
-                await self.cmd_cancelorder(chat_id, arg)
             elif cmd == "/gas":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_topup(chat_id, arg)
@@ -317,11 +311,9 @@ class CoreTelegramMixin:
                 await self.cmd_tradesize(chat_id, arg)
             elif cmd == "/trade-history":
                 await self.cmd_pdf(chat_id)
-            elif cmd == "/withdraw":
+            elif cmd == "/wallet":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
-                await self.cmd_withdraw(chat_id, arg)
-            elif cmd == "/deposit":
-                await self.cmd_deposit(chat_id)
+                await self.cmd_wallet(chat_id, arg)
             elif cmd == "/cancel":
                 if chat_id in self.pending_withdraw:
                     state = self.pending_withdraw[chat_id].get("state", "")
