@@ -279,7 +279,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.price_update_task: Optional[asyncio.Task] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.tp_monitor_task: Optional[asyncio.Task] = None
-        self.daily_summary_task: Optional[asyncio.Task] = None
+        self.weekly_summary_task: Optional[asyncio.Task] = None
         self.rebalance_task: Optional[asyncio.Task] = None
         self.order_retry_task: Optional[asyncio.Task] = None
         self.resolved_channels: Dict[int, str] = {}  # channel_id -> channel_name
@@ -510,11 +510,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.price_update_task = asyncio.create_task(self.price_update_loop())
         self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         self.tp_monitor_task = asyncio.create_task(self.tp_monitor_loop())
-        self.daily_summary_task = asyncio.create_task(self.daily_summary_loop())
+        self.weekly_summary_task = asyncio.create_task(self.weekly_summary_loop())
         self.rebalance_task = asyncio.create_task(self.rebalance_loop())
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
-        self.hourly_pnl_task = asyncio.create_task(self.hourly_pnl_loop())
+        self.pnl_alert_task = asyncio.create_task(self.pnl_alert_loop())
 
         # Bot API polling for DM commands
         if self.cfg.telegram_bot_token:
@@ -554,16 +554,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.heartbeat_task.cancel()
         if self.tp_monitor_task:
             self.tp_monitor_task.cancel()
-        if self.daily_summary_task:
-            self.daily_summary_task.cancel()
+        if self.weekly_summary_task:
+            self.weekly_summary_task.cancel()
         if self.rebalance_task:
             self.rebalance_task.cancel()
         if self.order_retry_task:
             self.order_retry_task.cancel()
         if getattr(self, 'gas_check_task', None):
             self.gas_check_task.cancel()
-        if getattr(self, 'hourly_pnl_task', None):
-            self.hourly_pnl_task.cancel()
+        if getattr(self, 'pnl_alert_task', None):
+            self.pnl_alert_task.cancel()
         if self.bot_polling_task:
             self.bot_polling_task.cancel()
 

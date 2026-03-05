@@ -1387,73 +1387,116 @@ class CoreTelegramMixin:
     # Daily summary loop & sender
     # ──────────────────────────────────────────────────────────────────────
 
-    async def daily_summary_loop(self):
+    async def weekly_summary_loop(self):
         ET = ZoneInfo("America/New_York")
         while True:
             try:
                 now = datetime.now(ET)
-                target = now.replace(hour=22, minute=0, second=0, microsecond=0)
-                if now >= target:
-                    target += timedelta(days=1)
+                # Next Sunday at 10 PM ET
+                days_until_sunday = (6 - now.weekday()) % 7
+                if days_until_sunday == 0 and now.hour >= 22:
+                    days_until_sunday = 7
+                target = (now + timedelta(days=days_until_sunday)).replace(
+                    hour=22, minute=0, second=0, microsecond=0
+                )
                 wait_seconds = (target - now).total_seconds()
                 self.logger.info(
-                    f"Daily summary scheduled for {target.strftime('%Y-%m-%d %I:%M %p %Z')} "
+                    f"Weekly summary scheduled for {target.strftime('%Y-%m-%d %I:%M %p %Z')} "
                     f"({wait_seconds / 3600:.1f}h from now)"
                 )
                 await asyncio.sleep(wait_seconds)
-                await self.send_daily_summary()
+                await self.send_weekly_summary()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"Daily summary error: {e}")
+                self.logger.error(f"Weekly summary error: {e}")
                 await asyncio.sleep(3600)
 
     # Last known PnL snapshot for change detection (set by send_hourly_pnl)
     _last_pnl_snapshot: Optional[dict] = None
 
-    async def hourly_pnl_loop(self):
-        """Send a PnL Update between 9 AM and 11 PM ET, weekdays only.
+    # PnL alert threshold tracking (10% buckets)
+    _last_pnl_threshold: int = 0
 
-        Only sends if PnL has changed since the last update.
-        Also records a balance snapshot every hour for 24h tracking.
+    async def pnl_alert_loop(self):
+        """Check total PnL % every 60s and alert when it crosses a 10% threshold.
+
+        Also records a balance snapshot and syncs positions every hour.
         """
+        _hour_counter = 0  # track iterations for hourly tasks
         while True:
             try:
-                await asyncio.sleep(3600)  # 1 hour
+                await asyncio.sleep(60)
+                _hour_counter += 1
 
-                # Record balance snapshot every hour (for /balance 24h change)
+                # Hourly tasks: balance snapshot + position sync (every 60 iterations)
+                if _hour_counter >= 60:
+                    _hour_counter = 0
+                    try:
+                        total_portfolio = await self._get_total_portfolio_value()
+                        self._save_balance_snapshot(total_portfolio)
+                    except Exception as e:
+                        self.logger.debug(f"Balance snapshot failed: {e}")
+                    try:
+                        async with self._signal_lock:
+                            await self._sync_on_chain_positions()
+                        self.logger.debug("Hourly position sync complete")
+                    except Exception as e:
+                        self.logger.debug(f"Hourly position sync failed: {e}")
+
+                # Fetch all open positions across wallets
+                PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
+                total_pnl = 0.0
+                total_collateral = 0.0
+                pos_lines = []
                 try:
-                    total_portfolio = await self._get_total_portfolio_value()
-                    self._save_balance_snapshot(total_portfolio)
+                    for wid, acct in self._all_wallets():
+                        cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
+                        for cp in cps:
+                            sym = cp.symbol.upper().split("/")[0]
+                            if sym not in PNL_SYMBOLS:
+                                continue
+                            total_pnl += cp.unrealized_pnl
+                            total_collateral += cp.collateral_amount
+                            side = "LONG" if cp.is_long else "SHORT"
+                            p_sign = "+" if cp.unrealized_pnl >= 0 else ""
+                            pct_sign = "+" if cp.pnl_percentage >= 0 else ""
+                            pos_lines.append(
+                                f"{sym} {side} [W{wid}]  {p_sign}${cp.unrealized_pnl:,.2f} ({pct_sign}{cp.pnl_percentage:.1f}%)"
+                            )
                 except Exception as e:
-                    self.logger.debug(f"Balance snapshot failed: {e}")
-
-                # Silent hourly re-sync from on-chain (under signal lock to avoid races)
-                try:
-                    async with self._signal_lock:
-                        await self._sync_on_chain_positions()
-                    self.logger.debug("Hourly position sync complete")
-                except Exception as e:
-                    self.logger.debug(f"Hourly position sync failed: {e}")
-
-                ET = ZoneInfo("America/New_York")
-                now_et = datetime.now(ET)
-                hour = now_et.hour
-                weekday = now_et.weekday()  # 0=Mon … 6=Sun
-
-                # Skip weekends (Sat=5, Sun=6)
-                if weekday >= 5:
-                    self.logger.debug(f"PnL Update skipped — weekend ({now_et.strftime('%A')})")
+                    self.logger.debug(f"PnL alert: could not fetch positions: {e}")
                     continue
 
-                if 9 <= hour <= 22:  # 9 AM to 11 PM ET
-                    await self.send_hourly_pnl()
+                if not pos_lines or total_collateral <= 0:
+                    continue
+
+                total_pct = total_pnl / total_collateral * 100
+                # Bucket: -10.3% → -1, +22% → +2, +5% → 0
+                if total_pct >= 0:
+                    bucket = int(total_pct // 10)
                 else:
-                    self.logger.debug(f"PnL Update skipped — outside 9AM-11PM ET (currently {hour}:00)")
+                    bucket = -int((-total_pct) // 10)
+                    if (-total_pct) % 10 != 0:
+                        bucket -= 1
+
+                if bucket != self._last_pnl_threshold:
+                    self._last_pnl_threshold = bucket
+                    await self._send_pnl_alert(total_pnl, total_pct, pos_lines)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"PnL Update loop error: {e}")
+                self.logger.error(f"PnL alert loop error: {e}")
+
+    async def _send_pnl_alert(self, total_pnl: float, total_pct: float, pos_lines: list):
+        """Format and send a PnL threshold alert."""
+        t_sign = "+" if total_pnl >= 0 else ""
+        pct_sign = "+" if total_pct >= 0 else ""
+        msg = f"PnL Alert: {t_sign}${total_pnl:,.2f} ({pct_sign}{total_pct:.1f}%)\n\n"
+        msg += "\n".join(pos_lines)
+        await self.notify(msg)
+        self.logger.info(f"PnL alert sent: {t_sign}${total_pnl:,.2f} ({pct_sign}{total_pct:.1f}%)")
 
     async def send_hourly_pnl(self):
         """Build and send the PnL Update alert.
@@ -1554,32 +1597,23 @@ class CoreTelegramMixin:
         await self.notify(msg)
         self.logger.info(f"PnL Update sent: today={t_sign}${today_total:,.2f}")
 
-    async def send_daily_summary(self):
-        """Build and send the daily summary using on-chain trade data.
-
-        Uses the same on-chain data source as /pnl and PnL Update
-        (fetched via _fetch_and_store_trades) for accurate numbers.
-        """
+    async def send_weekly_summary(self):
+        """Send weekly summary with lifetime stats and per-symbol breakdown."""
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_cutoff = int(today_start.timestamp())
 
         PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
 
-        # Build reverse map: market_address (lower) → symbol
         market_to_sym = {}
         for sym, addr in self.cfg.markets.items():
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        # ── Fetch on-chain trades (merged with local store) ──
         all_trades = await self._fetch_and_store_trades()
 
         def _net(t):
             return t.get("net_pnl_usd", t.get("pnl_usd", 0))
 
-        # Tag trades with symbol, exclude dust (< $1)
         tagged = []
         for t in all_trades:
             if abs(_net(t)) < 1:
@@ -1590,15 +1624,6 @@ class CoreTelegramMixin:
                 entry["_sym"] = sym
                 tagged.append(entry)
 
-        todays_trades = [t for t in tagged if t.get("timestamp", 0) >= today_cutoff]
-
-        # ── Daily stats ──
-        daily_pnl = sum(_net(t) for t in todays_trades)
-        daily_wins = sum(1 for t in todays_trades if _net(t) > 0)
-        daily_losses = sum(1 for t in todays_trades if _net(t) <= 0)
-        daily_count = len(todays_trades)
-        daily_winrate = (daily_wins / daily_count * 100) if daily_count else 0.0
-
         # ── Lifetime stats ──
         lifetime_pnl = sum(_net(t) for t in tagged)
         lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
@@ -1606,75 +1631,26 @@ class CoreTelegramMixin:
         lifetime_count = len(tagged)
         lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
 
-        # ── Per-symbol breakdown (today) ──
+        # ── Per-symbol breakdown (lifetime) ──
         symbol_lines = []
         for sym in ("BTC", "ETH", "SOL"):
-            sym_trades = [t for t in todays_trades if t["_sym"] == sym]
+            sym_trades = [t for t in tagged if t["_sym"] == sym]
             if sym_trades:
                 sym_pnl = sum(_net(t) for t in sym_trades)
                 sym_sign = "+" if sym_pnl >= 0 else ""
                 sym_w = sum(1 for t in sym_trades if _net(t) > 0)
                 symbol_lines.append(f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}/{len(sym_trades)} wins)")
 
-        # ── Wallet balances ──
-        balance_lines = []
-        total_usdc = 0.0
-        total_deployed = 0.0
-        try:
-            for wid, acct in self._all_wallets():
-                usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
-                total_usdc += usdc
-                try:
-                    positions = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
-                    deployed = sum(p.collateral_amount for p in positions) if positions else 0.0
-                except Exception:
-                    deployed = 0.0
-                total_deployed += deployed
-                addr = f"{acct.address[:8]}...{acct.address[-6:]}"
-                balance_lines.append(f"  W{wid} ({addr}): ${usdc:,.2f} USDC")
-        except Exception as e:
-            self.logger.warning(f"Daily summary: balance fetch failed: {e}")
-            balance_lines.append("  (could not fetch balances)")
-
-        # ── Open positions (unrealized PnL) ──
-        open_pnl = 0.0
-        open_count = 0
-        try:
-            for _, acct in self._all_wallets():
-                cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
-                for cp in cps:
-                    sym = cp.symbol.upper().split("/")[0]
-                    if sym in PNL_SYMBOLS:
-                        open_pnl += cp.unrealized_pnl
-                        open_count += 1
-        except Exception:
-            pass
-
-        d_sign = "+" if daily_pnl >= 0 else ""
         l_sign = "+" if lifetime_pnl >= 0 else ""
-        o_sign = "+" if open_pnl >= 0 else ""
 
         msg = (
-            f"Daily Summary — {now.strftime('%b %d, %Y')}\n\n"
-            f"**Today ({daily_count} trades)**\n"
-            f"  PnL: {d_sign}${daily_pnl:,.2f}\n"
-            f"  Win Rate: {daily_winrate:.0f}% ({daily_wins}W / {daily_losses}L)\n"
-        )
-        if symbol_lines:
-            msg += "\n".join(symbol_lines) + "\n"
-
-        msg += (
-            f"\n**Lifetime ({lifetime_count} trades)**\n"
+            f"Weekly Summary — {now.strftime('%b %d, %Y')}\n\n"
+            f"Lifetime ({lifetime_count} trades)\n"
             f"  PnL: {l_sign}${lifetime_pnl:,.2f}\n"
             f"  Win Rate: {lifetime_winrate:.0f}% ({lifetime_wins}W / {lifetime_losses}L)\n"
         )
-
-        if open_count:
-            open_pct_str = f" ({open_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
-            msg += f"\n**Open Positions ({open_count})**\n  Unrealized: {o_sign}${open_pnl:,.2f}{open_pct_str}\n"
-
-        msg += "\n**Account Balance**\n" + "\n".join(balance_lines) + "\n"
-        msg += f"  Total USDC: ${total_usdc:,.2f}\n  Deployed: ${total_deployed:,.2f}"
+        if symbol_lines:
+            msg += "\n".join(symbol_lines)
 
         await self.notify(msg)
-        self.logger.info(f"Daily summary sent: daily PnL={d_sign}${daily_pnl:,.2f}")
+        self.logger.info(f"Weekly summary sent: lifetime PnL={l_sign}${lifetime_pnl:,.2f}")
