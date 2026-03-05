@@ -241,7 +241,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.pending_closes: Dict[int, Dict[str, Any]] = {}
 
         # Increase position state: chat_id -> pending increase info
-        self.pending_increase: Dict[int, Dict[str, Any]] = {}
+        self.pending_collateral: Dict[int, Dict[str, Any]] = {}
 
         # Withdraw state: chat_id -> pending withdraw info
         self.pending_withdraw: Dict[int, Dict[str, Any]] = {}

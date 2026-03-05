@@ -661,9 +661,13 @@ class WalletMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_balance(self, chat_id: int):
-        """Display wallet balance summary: free USDC, deployed collateral, PnL."""
+        """Display wallet balance summary: free USDC, deployed collateral, PnL.
+        Auto-rebalances wallets before showing totals."""
         cfg = self.cfg
         try:
+            # Auto-rebalance before showing totals
+            await self._rebalance_wallets()
+
             total_usdc = 0.0
             total_deployed = 0.0
             wallet_lines = []
@@ -703,13 +707,14 @@ class WalletMixin:
             else:
                 change_str = ""
 
+            pnl_pct_str = f" ({total_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
             msg = (
                 "**Wallet Balance**\n\n"
                 + "\n".join(wallet_lines)
                 + "\n\n**Combined**\n"
                 f"Free USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f}\n"
-                f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}\n"
+                f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}{pnl_pct_str}\n"
                 f"**Total Portfolio: ${total_portfolio:,.2f}**{change_str}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of ${total_portfolio:,.2f})"
             )

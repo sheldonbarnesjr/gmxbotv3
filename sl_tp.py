@@ -202,6 +202,8 @@ class SLTPMixin:
                     u_sign = "+" if unrealized_pnl >= 0 else ""
                     t_sign = "+" if total_pnl >= 0 else ""
 
+                    col = pos.collateral_usd
+                    pnl_pct_str = f" ({total_pnl / col * 100:+.1f}%)" if col > 0 else ""
                     try:
                         await self.notify(
                             f"✅ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
@@ -209,7 +211,7 @@ class SLTPMixin:
                             f"TPs: {pos.tp_hits_count}/{len(pos.take_profits)}\n"
                             f"Realized:   {r_sign}${realized_pnl:,.2f}\n"
                             f"Unrealized: {u_sign}${unrealized_pnl:,.2f}\n"
-                            f"Total PnL:  {t_sign}${total_pnl:,.2f}"
+                            f"Total PnL:  {t_sign}${total_pnl:,.2f}{pnl_pct_str}"
                         )
                     except Exception:
                         pass

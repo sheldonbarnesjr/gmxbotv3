@@ -579,7 +579,7 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_pdf(self, chat_id: int):
-        """Generate and send a PDF of all trade history (on-chain + local)."""
+        """Generate and send a PDF with PnL summary + full trade history."""
         await self.send_message(chat_id, "Fetching on-chain trades & generating PDF...")
 
         # Build market_address → symbol map
@@ -596,9 +596,21 @@ class AnalyticsMixin:
             await self.send_message(chat_id, "No trades to export.")
             return
 
+        # Fetch open position unrealized PnL for the summary
+        open_unrealized = {sym: 0.0 for sym in PNL_SYMBOLS}
+        try:
+            for wid, acct in self._all_wallets():
+                cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
+                for cp in cps:
+                    sym = cp.symbol.upper().split("/")[0]
+                    if sym in PNL_SYMBOLS:
+                        open_unrealized[sym] += cp.unrealized_pnl
+        except Exception:
+            pass
+
         try:
             pdf_path = await asyncio.to_thread(
-                self._generate_trade_pdf, on_chain, market_to_sym
+                self._generate_trade_pdf, on_chain, market_to_sym, open_unrealized
             )
             bot_api_chats = getattr(self, '_bot_api_chats', set())
             if chat_id in bot_api_chats:
@@ -614,9 +626,12 @@ class AnalyticsMixin:
             self.logger.error(f"PDF generation failed: {e}")
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
-    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict) -> str:
-        """Build the PDF file with all trades (on-chain + local) and return its path."""
+    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict,
+                             open_unrealized: dict = None) -> str:
+        """Build the PDF file with PnL summary + trade list and return its path."""
         ET = ZoneInfo("America/New_York")
+        if open_unrealized is None:
+            open_unrealized = {}
 
         # ── Normalize on-chain trades into unified dicts ──
         unified = []
@@ -705,6 +720,60 @@ class AnalyticsMixin:
             pdf.cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
 
         pdf.ln(4)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(4)
+
+        # ── PnL Breakdown by Symbol (Today / 30d / All Time) ──
+        now = datetime.now(ET)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_cutoff = int(today_start.timestamp())
+        now_ts = int(time.time())
+        month_cutoff = now_ts - 30 * 86400
+
+        def _net(t):
+            return t.get("pnl_usd", 0)
+
+        def _bucket(trades_list):
+            if not trades_list:
+                return 0.0, 0, 0
+            pnl = sum(_net(t) for t in trades_list)
+            w = sum(1 for t in trades_list if _net(t) > 0)
+            return pnl, len(trades_list), w
+
+        def _s(v):
+            return "+" if v >= 0 else ""
+
+        for label, cutoff in [("Today", today_cutoff), ("30 Days", month_cutoff), ("All Time", 0)]:
+            bucket = [t for t in unified if t["timestamp"] >= cutoff]
+            if not bucket and label != "Today":
+                continue
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 7, label, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 9)
+            t_pnl, t_trades, t_wins = 0.0, 0, 0
+            for sym in ("BTC", "ETH", "SOL"):
+                sym_trades = [t for t in bucket if t["symbol"] == sym]
+                pnl_s, cnt, w = _bucket(sym_trades)
+                t_pnl += pnl_s
+                t_trades += cnt
+                t_wins += w
+                wr = f"{w}/{cnt}" if cnt else "-"
+                pdf.cell(0, 5, f"  {sym}: {_s(pnl_s)}${pnl_s:,.2f}  ({wr})", new_x="LMARGIN", new_y="NEXT")
+            # Add open unrealized for Today
+            if label == "Today" and open_unrealized:
+                total_unr = sum(open_unrealized.values())
+                pdf.cell(0, 5, f"  Realized:   {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades})", new_x="LMARGIN", new_y="NEXT")
+                pdf.cell(0, 5, f"  Unrealized: {_s(total_unr)}${total_unr:,.2f}", new_x="LMARGIN", new_y="NEXT")
+                combined = t_pnl + total_unr
+                pdf.set_font("Helvetica", "B", 9)
+                pdf.cell(0, 5, f"  Total:      {_s(combined)}${combined:,.2f}", new_x="LMARGIN", new_y="NEXT")
+                pdf.set_font("Helvetica", "", 9)
+            else:
+                wr_pct = f"{t_wins / t_trades * 100:.0f}%" if t_trades else "-"
+                pdf.cell(0, 5, f"  Total: {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades} | {wr_pct} WR)", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
         pdf.set_draw_color(200, 200, 200)
         pdf.line(10, pdf.get_y(), 200, pdf.get_y())
         pdf.ln(4)

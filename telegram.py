@@ -60,28 +60,20 @@ logger = logging.getLogger("GMXBot.telegram")
 
 HELP_TEXT = """**GMX V2 Bot Commands**
 
-/addorder — Add a SL or TP to an open position
-/balance — Wallet ETH & token balance
-/balance-wallets — Rebalance USDC between wallets
+/balance — Wallet balances (auto-rebalances)
 /cancelorder — List & cancel individual SL/TP orders
 /close — Close positions
+/collateral — Add or remove collateral (+/- amount)
 /deposit — Show W1 deposit address
-/halt — Halt trading
-/health — System health
+/gas — Swap USDC to ETH for gas (shows gas balances with no args)
 /help — This message
-/increase — Add collateral to an open position
-/lastmsg — Last message from monitored channel(s)
-/pdf — Download trade history as PDF
-/history — PnL summary (today / 30d / all time)
+/pdf — Trade history & PnL report (PDF)
 /pnl — Push hourly PnL update now
 /positions — Show on-chain positions & orders
 /prices — Live GMX & Chainlink prices
-/resume — Resume trading
 /signals — Recent signals (pick one to open)
 /sl — Move stop loss
-/status — Bot status & mode
-/summary — Send daily summary now
-/topup — Swap USDC to ETH for gas (shows gas balances with no args)
+/status — Bot status, health & halt/resume
 /tradesize — Show/change trade size
 /withdraw — Withdraw USDC to any Arbitrum address
 /winrate — Win rate stats
@@ -98,7 +90,7 @@ class CoreTelegramMixin:
 
     Expected attributes on the host class (GMXBot):
         cfg, client, w3, account, account2, account3, account4,
-        positions, trade_history, pending_closes, pending_increase,
+        positions, trade_history, pending_closes, pending_collateral,
         is_halted, halt_reason, halt_time, health_stats,
         resolved_channels, price_cache, logger,
         and methods: _all_wallets, _scalp_wallets, _get_account,
@@ -196,8 +188,8 @@ class CoreTelegramMixin:
                     return
                 if event.chat_id in self.pending_withdraw:
                     await self.handle_withdraw_reply(event.chat_id, text)
-                elif event.chat_id in self.pending_increase:
-                    await self.handle_increase_reply(event.chat_id, text)
+                elif event.chat_id in self.pending_collateral:
+                    await self.handle_collateral_reply(event.chat_id, text)
                 elif event.chat_id in self.pending_signals:
                     await self.handle_signals_reply(event.chat_id, text)
                 else:
@@ -264,8 +256,8 @@ class CoreTelegramMixin:
                         await self.process_admin_command(text, chat_id)
                     elif chat_id in self.pending_withdraw:
                         await self.handle_withdraw_reply(chat_id, text)
-                    elif chat_id in self.pending_increase:
-                        await self.handle_increase_reply(chat_id, text)
+                    elif chat_id in self.pending_collateral:
+                        await self.handle_collateral_reply(chat_id, text)
                     elif chat_id in self.pending_signals:
                         await self.handle_signals_reply(chat_id, text)
                     else:
@@ -290,7 +282,8 @@ class CoreTelegramMixin:
             if cmd == "/help":
                 await self.send_message(chat_id, HELP_TEXT)
             elif cmd == "/status":
-                await self.cmd_status(chat_id)
+                arg = parts[1].lower() if len(parts) > 1 else None
+                await self.cmd_status(chat_id, arg)
             elif cmd == "/positions":
                 await self.cmd_positions(chat_id)
             elif cmd == "/close":
@@ -299,16 +292,10 @@ class CoreTelegramMixin:
             elif cmd == "/confirm":
                 if chat_id in self.pending_withdraw:
                     await self.handle_withdraw_reply(chat_id, "CONFIRM")
-                elif chat_id in self.pending_increase:
-                    await self.handle_increase_reply(chat_id, "CONFIRM")
+                elif chat_id in self.pending_collateral:
+                    await self.handle_collateral_reply(chat_id, "CONFIRM")
                 else:
                     await self.handle_close_confirmation(chat_id, "YES")
-            elif cmd == "/halt":
-                reason = " ".join(parts[1:]) if len(parts) > 1 else "Manual halt"
-                await self.halt_trading(reason)
-            elif cmd == "/resume":
-                reason = " ".join(parts[1:]) if len(parts) > 1 else "Manual resume"
-                await self.resume_trading(reason)
             elif cmd == "/winrate":
                 sym = parts[1].upper() if len(parts) > 1 else None
                 n = None
@@ -319,32 +306,19 @@ class CoreTelegramMixin:
                         await self.send_message(chat_id, "Invalid count. Usage: /winrate [SYMBOL] [N]")
                         return
                 await self.cmd_winrate(chat_id, sym, n)
-            elif cmd == "/health":
-                await self.cmd_health(chat_id)
             elif cmd == "/balance":
                 await self.cmd_balance(chat_id)
-            elif cmd == "/history":
-                await self.cmd_pnl(chat_id)
             elif cmd == "/pnl":
                 await self.send_hourly_pnl()
-            elif cmd == "/summary":
-                await self.send_daily_summary()
-            elif cmd in ("/balance-wallets", "/rebalance"):
-                await self.cmd_balance_wallets(chat_id)
-            elif cmd == "/lastmsg":
-                await self.cmd_lastmsg(chat_id)
             elif cmd in ("/lastsignal", "/signals"):
                 await self.cmd_signals(chat_id)
-            elif cmd == "/increase":
+            elif cmd == "/collateral":
                 arg = parts[1] if len(parts) > 1 else None
-                await self.cmd_increase(chat_id, arg)
+                await self.cmd_collateral(chat_id, arg)
             elif cmd == "/cancelorder":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_cancelorder(chat_id, arg)
-            elif cmd == "/addorder":
-                arg = " ".join(parts[1:]) if len(parts) > 1 else None
-                await self.cmd_addorder(chat_id, arg)
-            elif cmd == "/topup":
+            elif cmd == "/gas":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_topup(chat_id, arg)
             elif cmd == "/prices":
@@ -376,9 +350,9 @@ class CoreTelegramMixin:
                 elif chat_id in self.pending_closes:
                     del self.pending_closes[chat_id]
                     await self.send_message(chat_id, "Close cancelled.")
-                elif chat_id in self.pending_increase:
-                    del self.pending_increase[chat_id]
-                    await self.send_message(chat_id, "Increase cancelled.")
+                elif chat_id in self.pending_collateral:
+                    del self.pending_collateral[chat_id]
+                    await self.send_message(chat_id, "Collateral change cancelled.")
                 elif chat_id in self.pending_signals:
                     del self.pending_signals[chat_id]
                     await self.send_message(chat_id, "Signal selection cancelled.")
@@ -413,11 +387,21 @@ class CoreTelegramMixin:
     # /status
     # ──────────────────────────────────────────────────────────────────────
 
-    async def cmd_status(self, chat_id: int):
+    async def cmd_status(self, chat_id: int, arg: str = None):
+        # Handle halt/resume sub-commands
+        if arg == "halt":
+            await self.halt_trading("Manual halt")
+            return
+        if arg == "resume":
+            await self.resume_trading("Manual resume")
+            return
+
         cfg = self.cfg
         health = self.get_health_report()
-        status = "HALTED" if health["is_halted"] else "ACTIVE"
+        is_halted = health["is_halted"]
+        status = "HALTED" if is_halted else "ACTIVE"
         uptime_hours = health["uptime_seconds"] / 3600
+        heartbeat_age = time.time() - self.last_heartbeat
         total_exposure = sum(p.size_usd for p in self.positions.values() if p.is_open)
         wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
         wallet_lines = []
@@ -431,15 +415,20 @@ class CoreTelegramMixin:
             f"Mode: {'DRY RUN' if cfg.dry_run else 'LIVE'}\n"
             f"{wallet_str}\n"
             f"Network: {cfg.network.upper()}\n"
-            f"Uptime: {uptime_hours:.1f}h\n\n"
-            f"Positions: {health['open_positions']}\n"
+            f"Uptime: {uptime_hours:.1f}h\n"
+            f"Heartbeat: {heartbeat_age:.0f}s ago\n\n"
+            f"Positions: {health['open_positions']}/{health['total_positions']}\n"
             f"Exposure: ${total_exposure:.0f}\n"
+            f"Price updates: {health['price_updates']}\n"
             f"Signals: {health['signals_processed']}\n"
             f"Trades: {health['trades_executed']}\n"
             f"Errors: {health['errors']}"
         )
-        if health["is_halted"]:
+        if is_halted:
             msg += f"\n\nHalt reason: {self.halt_reason}"
+            msg += "\n\nUse `/status resume` to resume trading."
+        else:
+            msg += "\n\nUse `/status halt` to halt trading."
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -751,10 +740,11 @@ class CoreTelegramMixin:
                     tp_orders = sorted([o for o in pos_orders if o["order_type"] == 5],
                                        key=lambda o: o["trigger_price"])
                     sl_orders = [o for o in pos_orders if o["order_type"] == 6]
+                    pnl_pct_c = pos.pnl_percentage if hasattr(pos, 'pnl_percentage') else 0.0
                     msg += (
                         f"\n**#{i} {pos.symbol} {side}**\n"
                         f"  Size: ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
-                        f"  PnL:  ${pos.unrealized_pnl:+.2f}\n"
+                        f"  PnL:  ${pos.unrealized_pnl:+.2f} ({pnl_pct_c:+.1f}%)\n"
                     )
                     if sl_orders or tp_orders:
                         for o in sl_orders:
@@ -804,7 +794,8 @@ class CoreTelegramMixin:
         if to_close:
             for pos in to_close:
                 side = "LONG" if pos.is_long else "SHORT"
-                msg += f"  {pos.symbol} {side} — ${pos.size_usd:,.2f} — PnL: ${pos.unrealized_pnl:+.2f}\n"
+                pnl_pct_c = pos.pnl_percentage if hasattr(pos, 'pnl_percentage') else 0.0
+                msg += f"  {pos.symbol} {side} — ${pos.size_usd:,.2f} — PnL: ${pos.unrealized_pnl:+.2f} ({pnl_pct_c:+.1f}%)\n"
         if also_cancel_orders and orders:
             msg += f"\n  + Cancel {len(orders)} open order(s) (SL/TP/Limit)\n"
         elif also_cancel_orders and not to_close:
@@ -941,10 +932,10 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, "Close cancelled.")
 
     # ──────────────────────────────────────────────────────────────────────
-    # /increase + handler
+    # /collateral + handler
     # ──────────────────────────────────────────────────────────────────────
 
-    async def cmd_increase(self, chat_id: int, amount_str: str = None):
+    async def cmd_collateral(self, chat_id: int, amount_str: str = None):
         all_positions = []
         for wid, acct in self._all_wallets():
             try:
@@ -958,7 +949,7 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, "No open positions found across wallets.")
             return
 
-        msg = "**Select position to increase:**\n\n"
+        msg = "**Adjust collateral:**\n\n"
         for i, (wid, acct, cp) in enumerate(all_positions, 1):
             side = "LONG" if cp.is_long else "SHORT"
             pnl_sign = "+" if cp.unrealized_pnl >= 0 else ""
@@ -971,32 +962,36 @@ class CoreTelegramMixin:
             )
 
         if amount_str:
-            msg += f"Amount: ${amount_str} USDC\nReply with position number (1-{len(all_positions)})"
+            msg += f"Amount: {amount_str} USDC\nReply with position number (1-{len(all_positions)})"
         else:
-            msg += "Reply with: <number> <amount>\nExample: 1 25  (adds $25 USDC to position 1)"
+            msg += (
+                "Reply with: <number> <+/-amount>\n"
+                "Example: 1 +25  (add $25 collateral)\n"
+                "Example: 1 -25  (remove $25 collateral)"
+            )
 
-        self.pending_increase[chat_id] = {
+        self.pending_collateral[chat_id] = {
             "positions": all_positions,
-            "amount": float(amount_str) if amount_str else None,
+            "amount": amount_str if amount_str else None,
             "created_at": time.time(),
         }
         await self.send_message(chat_id, msg)
 
-    async def handle_increase_reply(self, chat_id: int, text: str):
+    async def handle_collateral_reply(self, chat_id: int, text: str):
         cfg = self.cfg
-        pending = self.pending_increase.get(chat_id)
+        pending = self.pending_collateral.get(chat_id)
         if not pending:
             return
 
         if time.time() - pending["created_at"] > 120:
-            del self.pending_increase[chat_id]
-            await self.send_message(chat_id, "Increase request expired (2min). Use /increase again.")
+            del self.pending_collateral[chat_id]
+            await self.send_message(chat_id, "Collateral request expired (2min). Use /collateral again.")
             return
 
         text = text.strip().upper()
         if text in ("CANCEL", "NO", "N"):
-            del self.pending_increase[chat_id]
-            await self.send_message(chat_id, "Increase cancelled.")
+            del self.pending_collateral[chat_id]
+            await self.send_message(chat_id, "Collateral change cancelled.")
             return
 
         parts = text.split()
@@ -1011,23 +1006,40 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, f"Invalid. Pick 1-{len(positions)}")
             return
 
-        amount = pending.get("amount")
-        if amount is None:
+        # Parse amount with +/- sign
+        raw_amount = pending.get("amount")
+        if raw_amount is None:
             try:
-                amount = float(parts[1])
-            except (ValueError, IndexError):
-                await self.send_message(chat_id, "Include amount: e.g. '1 25' to add $25 to position 1")
+                raw_amount = parts[1]
+            except IndexError:
+                await self.send_message(chat_id, "Include amount: e.g. '1 +25' or '1 -25'")
                 return
 
-        if amount <= 0:
-            await self.send_message(chat_id, "Amount must be positive.")
-            del self.pending_increase[chat_id]
+        try:
+            amount_val = float(raw_amount)
+        except ValueError:
+            await self.send_message(chat_id, f"Invalid amount: {raw_amount}")
+            del self.pending_collateral[chat_id]
             return
+
+        if amount_val == 0:
+            await self.send_message(chat_id, "Amount cannot be zero.")
+            del self.pending_collateral[chat_id]
+            return
+
+        is_increase = amount_val > 0
+        amount = abs(amount_val)
 
         wid, acct, cp = positions[idx]
         side = "LONG" if cp.is_long else "SHORT"
-        del self.pending_increase[chat_id]
+        del self.pending_collateral[chat_id]
 
+        if is_increase:
+            await self._collateral_increase(chat_id, cfg, wid, acct, cp, side, amount)
+        else:
+            await self._collateral_decrease(chat_id, cfg, wid, acct, cp, side, amount)
+
+    async def _collateral_increase(self, chat_id, cfg, wid, acct, cp, side, amount):
         additional_size = amount * cp.leverage
 
         await self.send_message(
@@ -1058,7 +1070,7 @@ class CoreTelegramMixin:
 
             await self.send_message(
                 chat_id,
-                f"✅ {cp.symbol} {side} increased\n"
+                f"✅ {cp.symbol} {side} collateral increased\n"
                 f"Added ${amount:.2f} collateral (${additional_size:.2f} size)\n"
                 f"TX: {txh}"
             )
@@ -1069,15 +1081,59 @@ class CoreTelegramMixin:
                         and pos.wallet_id == wid and pos.side == side):
                     old_collateral = pos.size_usd / pos.leverage if pos.leverage > 0 else pos.size_usd
                     pos.size_usd += additional_size
-                    # Recalculate leverage from new on-chain size/collateral
                     new_collateral = old_collateral + amount
                     if new_collateral > 0:
                         pos.leverage = pos.size_usd / new_collateral
                     break
 
         except Exception as e:
-            self.logger.error(f"Increase failed: {e}\n{traceback.format_exc()}")
-            await self.send_message(chat_id, f"Failed to increase position: {e}")
+            self.logger.error(f"Collateral increase failed: {e}\n{traceback.format_exc()}")
+            await self.send_message(chat_id, f"Failed to increase collateral: {e}")
+
+    async def _collateral_decrease(self, chat_id, cfg, wid, acct, cp, side, amount):
+        if amount >= cp.collateral_amount * 0.95:
+            await self.send_message(
+                chat_id,
+                f"Cannot remove ${amount:.2f} — collateral is only ${cp.collateral_amount:.2f}.\n"
+                f"Max removable: ${cp.collateral_amount * 0.90:.2f}. Use /close for full exit."
+            )
+            return
+
+        decrease_pct = amount / cp.collateral_amount
+        size_reduction = cp.size_usd * decrease_pct
+
+        await self.send_message(
+            chat_id,
+            f"Decreasing {cp.symbol} {side} [W{wid}]\n"
+            f"Removing: ${amount:.2f} collateral → -${size_reduction:.2f} size @ {cp.leverage:.1f}x\n"
+            "Executing..."
+        )
+
+        try:
+            txh = await asyncio.to_thread(
+                create_close_order,
+                self.w3, acct, cp,
+                percentage=decrease_pct,
+                dry_run=cfg.dry_run,
+            )
+
+            await self.send_message(
+                chat_id,
+                f"✅ {cp.symbol} {side} collateral decreased\n"
+                f"Removed ${amount:.2f} collateral (-${size_reduction:.2f} size)\n"
+                f"TX: {txh}"
+            )
+
+            for pos in self.positions.values():
+                if (pos.is_open and pos.market_addr
+                        and pos.market_addr.lower() == cp.market.lower()
+                        and pos.wallet_id == wid and pos.side == side):
+                    pos.size_usd -= size_reduction
+                    break
+
+        except Exception as e:
+            self.logger.error(f"Collateral decrease failed: {e}\n{traceback.format_exc()}")
+            await self.send_message(chat_id, f"Failed to decrease collateral: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # /lastmsg
@@ -1479,8 +1535,10 @@ class CoreTelegramMixin:
                     # from TP fills shows up in the "Closed" section.
                     total_pos = cp.unrealized_pnl
                     t_sign = "+" if total_pos >= 0 else ""
+                    pnl_pct_h = cp.pnl_percentage
+                    pnl_pct_sign = "+" if pnl_pct_h >= 0 else ""
                     open_lines.append(
-                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f}"
+                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f} ({pnl_pct_sign}{pnl_pct_h:.1f}%)"
                     )
         except Exception as e:
             self.logger.warning(f"PnL Update: could not fetch positions: {e}")
@@ -1633,7 +1691,8 @@ class CoreTelegramMixin:
         )
 
         if open_count:
-            msg += f"\n**Open Positions ({open_count})**\n  Unrealized: {o_sign}${open_pnl:,.2f}\n"
+            open_pct_str = f" ({open_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
+            msg += f"\n**Open Positions ({open_count})**\n  Unrealized: {o_sign}${open_pnl:,.2f}{open_pct_str}\n"
 
         msg += "\n**Account Balance**\n" + "\n".join(balance_lines) + "\n"
         msg += f"  Total USDC: ${total_usdc:,.2f}\n  Deployed: ${total_deployed:,.2f}"
