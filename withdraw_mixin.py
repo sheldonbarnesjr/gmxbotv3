@@ -310,34 +310,33 @@ class WithdrawMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_wallet(self, chat_id: int, arg: Optional[str] = None):
-        """Unified /wallet command: + for deposit, -<amount> for withdraw."""
+        """Unified /wallet command: d for deposit, w <amount> for withdraw."""
         if not arg:
             await self.send_message(
                 chat_id,
                 "Usage:\n"
-                "  /wallet +  — show deposit address\n"
-                "  /wallet -100  — withdraw $100 USDC"
+                "  /wallet d  — show deposit address\n"
+                "  /wallet w 100  — withdraw $100 USDC"
             )
             return
 
-        arg = arg.strip()
-        if arg == "+":
+        parts = arg.strip().split(None, 1)
+        sub = parts[0].lower()
+
+        if sub == "d":
             await self.cmd_deposit(chat_id)
-        elif arg.startswith("-"):
-            amount_str = arg[1:].strip()
+        elif sub == "w":
+            amount_str = parts[1].strip() if len(parts) > 1 else None
             if not amount_str:
-                await self.send_message(chat_id, "Usage: /wallet -<amount>\nExample: /wallet -100")
+                await self.send_message(chat_id, "Usage: /wallet w <amount>\nExample: /wallet w 100")
                 return
             await self.cmd_withdraw(chat_id, amount_str)
-        elif arg.startswith("+") and len(arg) > 1:
-            # +<anything> treat as deposit
-            await self.cmd_deposit(chat_id)
         else:
             await self.send_message(
                 chat_id,
                 "Usage:\n"
-                "  /wallet +  — show deposit address\n"
-                "  /wallet -100  — withdraw $100 USDC"
+                "  /wallet d  — show deposit address\n"
+                "  /wallet w 100  — withdraw $100 USDC"
             )
 
     async def cmd_deposit(self, chat_id: int):

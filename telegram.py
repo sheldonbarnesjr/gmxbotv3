@@ -71,7 +71,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /status — Bot status, health & halt/resume
 /trade-history — Trade history & PnL report (PDF)
 /tradesize — Show/change trade size
-/wallet — Deposit (+) or withdraw (-) USDC
+/wallet — Deposit (d) or withdraw (w) USDC
 
 **Wallets:** W1=swing, W2-W4=scalps"""
 
