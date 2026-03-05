@@ -294,6 +294,7 @@ class CoreTelegramMixin:
             elif cmd == "/balance":
                 await self.cmd_balance(chat_id)
             elif cmd == "/pnl":
+                await self.send_message(chat_id, "Fetching PnL data...")
                 await self.send_hourly_pnl()
             elif cmd in ("/lastsignal", "/signals"):
                 await self.cmd_signals(chat_id)

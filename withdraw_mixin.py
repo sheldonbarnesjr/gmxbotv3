@@ -359,9 +359,8 @@ class WithdrawMixin:
 
         await self.send_message(
             chat_id,
-            f"Send USDC (Arbitrum) to:\n"
-            f"Watching for incoming USDC for 30 min.\n"
-            f"Current balance: ${total_bal:,.2f}"
+            f"Current balance: ${total_bal:,.2f}\n"
+            f"Send USDC (Arbitrum) to:"
         )
         # Send address as separate message for easy copy-paste
         await self.send_message(chat_id, w1_addr)
