@@ -699,16 +699,19 @@ class SLTPMixin:
                     side = "LONG" if pos.is_long else "SHORT"
                     wid_label = f" [W{pos._wallet_id}]" if hasattr(pos, '_wallet_id') else ""
                     market_lower = pos.market.lower()
+                    pos_wid = getattr(pos, '_wallet_id', 1)
                     sl_orders = [o for o in orders
                                  if o["market"].lower() == market_lower
-                                 and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE]
+                                 and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                                 and o.get("_wallet_id", 1) == pos_wid]
                     current_sl = f"${sl_orders[0]['trigger_price']:,.2f}" if sl_orders else "None"
 
                     internal_pos = None
                     for p in self.positions.values():
                         if (p.is_open and p.market_addr
                                 and p.market_addr.lower() == market_lower
-                                and p.side == side):
+                                and p.side == side
+                                and p.wallet_id == pos_wid):
                             internal_pos = p
                             break
 
@@ -751,10 +754,12 @@ class SLTPMixin:
             market_lower = chain_pos.market.lower()
 
             internal_pos = None
+            wid = getattr(chain_pos, '_wallet_id', 0)
             for p in self.positions.values():
                 if (p.is_open and p.market_addr
                         and p.market_addr.lower() == market_lower
-                        and p.side == side):
+                        and p.side == side
+                        and p.wallet_id == wid):
                     internal_pos = p
                     break
 
@@ -794,7 +799,6 @@ class SLTPMixin:
                     await self.send_message(chat_id, "Price must be positive.")
                     return
                 sl_label = f"${new_sl_price:,.2f}"
-                return
 
             current_price = chain_pos.current_price or await self.get_current_price(chain_pos.symbol)
             if current_price:
@@ -835,6 +839,7 @@ class SLTPMixin:
                     f"✅ SL moved for #{pos_num} {internal_pos.symbol} {side} [W{internal_pos.wallet_id}] "
                     f"→ {sl_label} (${new_sl_price:,.2f})"
                 )
+                self._save_position_state()
 
         except Exception as e:
             self.logger.error(f"cmd_sl error: {e}\n{traceback.format_exc()}")

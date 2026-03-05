@@ -697,9 +697,11 @@ class CoreTelegramMixin:
 
             total_pnl = sum(p.unrealized_pnl for p in positions)
             total_size = sum(p.size_usd for p in positions)
+            total_collateral = sum(p.collateral_amount for p in positions)
+            pnl_pct_str = f" ({total_pnl / total_collateral * 100:+.1f}%)" if total_collateral > 0 else ""
             any_onchain = any(getattr(p, 'pnl_source', 'local') == "onchain" for p in positions)
             pnl_tag = " (on-chain)" if any_onchain else ""
-            msg += f"\nTotal Size: ${total_size:,.2f}  |  Total PnL: ${total_pnl:+.2f}{pnl_tag}\n"
+            msg += f"\nTotal Size: ${total_size:,.2f}  |  Collateral: ${total_collateral:,.2f}  |  PnL: ${total_pnl:+.2f}{pnl_pct_str}{pnl_tag}\n"
 
         # Pending limit entry orders
         pending_entries = [

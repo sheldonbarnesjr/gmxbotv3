@@ -822,11 +822,23 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                                 f"but no PositionDecrease event found — not marking as hit"
                             )
 
-                    pos.verified_decreases = verified_decrease_list
-                    pos.realized_pnl = total_realized
+                    # Preserve saved verified_decreases if event query failed
+                    # or returned fewer hits than what was already on disk
+                    saved_vd = saved.get("verified_decreases", []) if saved else []
+                    if len(verified_decrease_list) >= len(saved_vd) or decreases:
+                        pos.verified_decreases = verified_decrease_list
+                        pos.realized_pnl = total_realized
+                    else:
+                        pos.verified_decreases = saved_vd
+                        pos.realized_pnl = saved.get("realized_pnl", 0.0)
+                        self.logger.warning(
+                            f"Sync: {symbol} {side} [W{wid}] event query returned "
+                            f"{len(verified_decrease_list)} hits but saved state has "
+                            f"{len(saved_vd)} — keeping saved state"
+                        )
                     pos.original_size_usd = (
                         cp.size_usd + sum(
-                            d["size_delta_usd"] for d in verified_decrease_list
+                            d["size_delta_usd"] for d in pos.verified_decreases
                         )
                     )
 
@@ -917,8 +929,19 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     else:
                         pos.take_profits.sort(key=lambda t: t.price, reverse=True)
 
-                    pos.verified_decreases = verified_decrease_list_b
-                    pos.realized_pnl = total_realized_b
+                    # Preserve saved verified_decreases if event query failed
+                    saved_vd_b = saved.get("verified_decreases", []) if saved else []
+                    if len(verified_decrease_list_b) >= len(saved_vd_b) or decreases_b:
+                        pos.verified_decreases = verified_decrease_list_b
+                        pos.realized_pnl = total_realized_b
+                    else:
+                        pos.verified_decreases = saved_vd_b
+                        pos.realized_pnl = saved.get("realized_pnl", 0.0)
+                        self.logger.warning(
+                            f"Sync Path B: {symbol} {side} [W{wid}] event query returned "
+                            f"{len(verified_decrease_list_b)} hits but saved state has "
+                            f"{len(saved_vd_b)} — keeping saved state"
+                        )
 
                     # Derive SL state from on-chain SL price + verified hits
                     verified_tp_prices_b = {d["matched_tp_price"] for d in verified_decrease_list_b}
