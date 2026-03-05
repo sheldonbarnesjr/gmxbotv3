@@ -210,8 +210,13 @@ def build_test_signal(current_price: float) -> Signal:
     return signal
 
 
-def make_fake_decrease(market_addr, tp_price, size_delta, pnl, tx_suffix, log_index=0):
-    """Build a fake PositionDecrease event dict."""
+def make_fake_decrease(market_addr, tp_price, size_delta, pnl, tx_suffix, log_index=0, order_type=5):
+    """Build a fake PositionDecrease event dict.
+
+    Args:
+        order_type: GMX order type (5=TP/LimitDecrease, 6=SL, 4=MarketDecrease, None=unknown).
+                    Defaults to 5 (TP) for backward compat with existing tests.
+    """
     return {
         "market_address": market_addr.lower(),
         "is_long": True,
@@ -221,6 +226,7 @@ def make_fake_decrease(market_addr, tp_price, size_delta, pnl, tx_suffix, log_in
         "timestamp": int(time.time()),
         "tx_hash": f"fake_{tx_suffix}_tx_" + "x" * 50,
         "log_index": log_index,
+        "order_type": order_type,
     }
 
 
@@ -504,7 +510,7 @@ def run_unit_tests():
             tp_hits_count=3, sl_moved_to_entry=True, sl_move_label="TP1",
             sl_orders_remaining=1, tp_orders_remaining=0,
         )
-        assert r == "All TPs filled", f"Expected 'All TPs filled', got '{r}'"
+        assert r == "All TPs Filled", f"Expected 'All TPs Filled', got '{r}'"
 
         # Liquidation (both SL+TP still on chain, no hits)
         r = classify_exit_reason(
@@ -520,17 +526,17 @@ def run_unit_tests():
             tp_hits_count=0, sl_moved_to_entry=False, sl_move_label=None,
             sl_orders_remaining=0, tp_orders_remaining=3,
         )
-        assert r == "SL triggered", f"Expected 'SL triggered', got '{r}'"
+        assert r == "SL Hit", f"Expected 'SL Hit', got '{r}'"
 
-        # SL breakeven (SL moved to entry, SL orders gone, TPs remain)
+        # SL at entry (SL moved to entry, SL orders gone, TPs remain)
         r = classify_exit_reason(
             is_long=True, current_price=90000.0, stop_loss=90000.0,
             tp_hits_count=1, sl_moved_to_entry=True, sl_move_label="Entry",
             sl_orders_remaining=0, tp_orders_remaining=2,
         )
-        assert r == "SL (breakeven)", f"Expected 'SL (breakeven)', got '{r}'"
+        assert "Closed at Entry" in r, f"Expected 'Closed at Entry ...', got '{r}'"
 
-        # Fallback: tp_orders_remaining > 0 → SL/TP/liquidation
+        # Fallback: no order counts available, tp_hits > 0
         r = classify_exit_reason(
             is_long=True, current_price=90000.0, stop_loss=85000.0,
             tp_hits_count=1, sl_moved_to_entry=False, sl_move_label=None,

@@ -2295,8 +2295,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 # Determine exit price: SL exits use the SL trigger price
                 # (more accurate than market price at detection time)
+                # "Closed at ..." = SL triggered at a TP level or entry
                 exit_price = pos.current_price or pos.entry_price
-                if "SL" in exit_reason and pos.stop_loss:
+                if ("SL" in exit_reason or "Closed at" in exit_reason) and pos.stop_loss:
                     exit_price = pos.stop_loss
 
                 # Calculate total PnL: realized (from verified decreases) + remaining
@@ -2371,13 +2372,33 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         msg += f"SL was: ${pos.stop_loss:,.2f}\n"
                     msg += f"Orphaned orders cancelled: {sl_orders_remaining} SL + {tp_orders_remaining} TP"
                 else:
+                    # Build close reason line
+                    total_tps = len(pos.take_profits)
+                    tp_hits = pos.tp_hits_count
+
+                    # Calculate remaining % that was closed by SL/final close
+                    total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
+                    bs = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
+                    remaining_pct = max(100.0 - (total_decreased / bs * 100 if bs > 0 else 0), 0)
+
+                    if exit_reason == "All TPs Filled":
+                        close_line = "All TPs Filled"
+                    elif "Closed at" in exit_reason:
+                        close_line = f"Closed {remaining_pct:.0f}% at {pos.sl_move_label or 'Entry'} (${exit_price:,.2f})"
+                    elif exit_reason == "SL Hit":
+                        close_line = f"SL Hit (${exit_price:,.2f})"
+                    else:
+                        close_line = exit_reason
+
                     msg = (
                         f"**Position Closed**\n\n"
                         f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
+                        f"{close_line}\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
                         f"Exit: ${exit_price:,.2f}\n"
                     )
-                    if realized_pnl != 0:
+                    # Show realized/remaining breakdown only if TPs were partially hit
+                    if realized_pnl != 0 and tp_hits > 0 and exit_reason != "All TPs Filled":
                         r_sign = "+" if realized_pnl >= 0 else ""
                         rm_sign = "+" if remaining_pnl >= 0 else ""
                         msg += (
@@ -2388,6 +2409,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
                         f"Duration: {duration:.1f}h"
                     )
+
+                    # Build targets line: TP1 ✅ TP2 ✅ TP3 TP4 TP5
+                    if total_tps > 0:
+                        targets = []
+                        for i in range(total_tps):
+                            label = f"TP{i+1}"
+                            if i < tp_hits:
+                                label += " ✅"
+                            targets.append(label)
+                        msg += f"\n\nTargets: {' '.join(targets)}"
                 await self.notify(msg)
 
                 # Track liquidation in health stats

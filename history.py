@@ -71,6 +71,75 @@ def _get_event_log1_abi():
     }]
 
 
+def _get_event_log2_abi():
+    """Return EventLog2 ABI for decoding OrderExecuted events."""
+    from open import _EVENT_LOG2_ABI
+    return _EVENT_LOG2_ABI
+
+
+def _build_order_type_map(receipt, emitter_addr_lower, el2_contract, order_executed_topic_hex):
+    """Build orderKey → orderType map from OrderExecuted EventLog2 events in a receipt.
+
+    Scans all logs in a transaction receipt for OrderExecuted events and
+    extracts the orderType from each one's eventData uintItems.
+
+    Args:
+        receipt: Transaction receipt with logs.
+        emitter_addr_lower: Lowercase EventEmitter address.
+        el2_contract: Web3 contract with EventLog2 ABI for decoding.
+        order_executed_topic_hex: Hex string of keccak256("OrderExecuted") without 0x.
+
+    Returns:
+        Dict mapping orderKey (hex str without 0x) → orderType (int).
+    """
+    order_type_map = {}
+    el2_topic_hex = _EVENT_LOG2_TOPIC[2:]  # strip 0x
+
+    for rlog in receipt["logs"]:
+        try:
+            topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
+            # Must be EventLog2 from the EventEmitter
+            if rlog["address"].lower() != emitter_addr_lower:
+                continue
+            if len(topics) < 4 or topics[0] != el2_topic_hex:
+                continue
+            # topic[1] must be OrderExecuted hash
+            if topics[1] != order_executed_topic_hex:
+                continue
+
+            # topic[2] = orderKey (indexed bytes32)
+            order_key_hex = topics[2]
+
+            # Decode eventData to get orderType from uintItems
+            decoded = el2_contract.events.EventLog2().process_log(rlog)
+            ed = decoded["args"]["eventData"]
+            for item in ed["uintItems"]["items"]:
+                if item["key"] == "orderType":
+                    order_type_map[order_key_hex] = int(item["value"])
+                    break
+        except Exception:
+            continue
+
+    return order_type_map
+
+
+def _extract_order_key_from_decrease(event_data):
+    """Extract orderKey from a PositionDecrease event's bytes32Items.
+
+    Returns orderKey as hex string (without 0x prefix), or None if not found.
+    """
+    try:
+        for item in event_data["bytes32Items"]["items"]:
+            if item["key"] == "orderKey":
+                val = item["value"]
+                if isinstance(val, bytes):
+                    return val.hex()
+                return str(val).replace("0x", "")
+    except Exception:
+        pass
+    return None
+
+
 def fetch_trade_history(
     w3: Web3,
     account: str,
@@ -307,9 +376,15 @@ def fetch_recent_position_decreases(
     el1_abi = _get_event_log1_abi()
     emitter1 = w3.eth.contract(address=emitter_addr, abi=el1_abi)
 
+    # EventLog2 decoder for OrderExecuted events (to extract orderType)
+    el2_abi = _get_event_log2_abi()
+    emitter2 = w3.eth.contract(address=emitter_addr, abi=el2_abi)
+    order_executed_topic_hex = Web3.keccak(text="OrderExecuted").hex()
+
     results = []
     processed_receipts = {}
     account_lower = account.lower()
+    emitter_lower = emitter_addr.lower()
 
     for exec_log in exec_logs:
         tx_hash = exec_log["transactionHash"].hex()
@@ -325,9 +400,14 @@ def fetch_recent_position_decreases(
             continue
         processed_receipts[tx_hash] = True
 
+        # Build orderKey → orderType map from OrderExecuted events in this tx
+        order_type_map = _build_order_type_map(
+            receipt, emitter_lower, emitter2, order_executed_topic_hex
+        )
+
         for rlog in receipt["logs"]:
             topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
-            if not (rlog["address"].lower() == emitter_addr.lower()
+            if not (rlog["address"].lower() == emitter_lower
                     and topics[0] == _EVENT_LOG1_TOPIC[2:]):
                 continue
 
@@ -401,6 +481,10 @@ def fetch_recent_position_decreases(
                 net_pnl = base_pnl + price_impact - fees_usd
                 execution_price = execution_price_raw / _P30 if execution_price_raw else 0
 
+                # Look up order_type via orderKey from bytes32Items
+                order_key = _extract_order_key_from_decrease(ed)
+                order_type = order_type_map.get(order_key) if order_key else None
+
                 blk = w3.eth.get_block(block_num)
 
                 results.append({
@@ -412,6 +496,7 @@ def fetch_recent_position_decreases(
                     "timestamp": blk["timestamp"],
                     "tx_hash": tx_hash,
                     "log_index": rlog.get("logIndex", 0),
+                    "order_type": order_type,  # 5=TP, 6=SL, 4=MarketDecrease, None=unknown
                 })
 
             except Exception as e:
