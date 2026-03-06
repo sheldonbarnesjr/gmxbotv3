@@ -163,6 +163,10 @@ class Config:
     telegram_bot_token: str = ""
     bot_admin_chat_id: str = ""
 
+    # ── VIP Promo ──
+    vip_group_chat_id: str = ""
+    salesbot_username: str = ""
+
     # ── Network & Web3 ──
     network: str = "arbitrum"
     rpc_url: str = "https://arb1.arbitrum.io/rpc"
@@ -242,6 +246,10 @@ def load_config() -> Config:
         # Bot API
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN", ""),
         bot_admin_chat_id=_env("ADMIN_CHAT_ID", ""),
+
+        # VIP Promo
+        vip_group_chat_id=_env("VIP_GROUP_CHAT_ID", ""),
+        salesbot_username=_env("SALESBOT_USERNAME", ""),
 
         # Network
         network=_env("NETWORK", "arbitrum").lower(),

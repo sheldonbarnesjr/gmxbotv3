@@ -17,6 +17,7 @@ Other Telegram features have been moved to specialized mixins:
 GMXBot inherits from all mixins to get full command coverage.
 """
 
+import os
 import time
 import asyncio
 import logging
@@ -312,6 +313,8 @@ class CoreTelegramMixin:
                 await self.cmd_tradesize(chat_id, arg)
             elif cmd == "/trades":
                 await self.cmd_pdf(chat_id)
+            elif cmd == "/reset":
+                await self.cmd_reset(chat_id)
             elif cmd == "/wallet":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_wallet(chat_id, arg)
@@ -1654,3 +1657,115 @@ class CoreTelegramMixin:
 
         await self.notify(msg)
         self.logger.info(f"Weekly summary sent: lifetime PnL={l_sign}${lifetime_pnl:,.2f}")
+
+    # ── VIP Group Promo (weekly, 30 min after summary) ──
+
+    async def vip_promo_loop(self):
+        if not self.cfg.vip_group_chat_id:
+            return
+        ET = ZoneInfo("America/New_York")
+        while True:
+            try:
+                now = datetime.now(ET)
+                days_until_sunday = (6 - now.weekday()) % 7
+                if days_until_sunday == 0 and (now.hour > 22 or (now.hour == 22 and now.minute >= 30)):
+                    days_until_sunday = 7
+                target = (now + timedelta(days=days_until_sunday)).replace(
+                    hour=22, minute=30, second=0, microsecond=0
+                )
+                wait_seconds = (target - now).total_seconds()
+                self.logger.info(
+                    f"VIP promo scheduled for {target.strftime('%Y-%m-%d %I:%M %p %Z')} "
+                    f"({wait_seconds / 3600:.1f}h from now)"
+                )
+                await asyncio.sleep(wait_seconds)
+                await self.send_vip_promo()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"VIP promo loop error: {e}")
+                await asyncio.sleep(3600)
+
+    async def send_vip_promo(self):
+        """Send strategy PDF, trade history PDF, and promo message to VIP group."""
+        import bot_api
+
+        vip_chat = self.cfg.vip_group_chat_id
+        if not vip_chat:
+            return
+
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+
+        # ── Build lifetime stats (same logic as send_weekly_summary) ──
+        PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            if sym in PNL_SYMBOLS:
+                market_to_sym[addr.lower()] = sym
+
+        all_trades = await self._fetch_and_store_trades()
+
+        def _net(t):
+            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
+
+        tagged = []
+        for t in all_trades:
+            if abs(_net(t)) < 1:
+                continue
+            sym = market_to_sym.get((t.get("market_address") or "").lower())
+            if sym:
+                entry = dict(t)
+                entry["_sym"] = sym
+                tagged.append(entry)
+
+        lifetime_pnl = sum(_net(t) for t in tagged)
+        lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
+        lifetime_losses = sum(1 for t in tagged if _net(t) <= 0)
+        lifetime_count = len(tagged)
+        lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
+
+        symbol_lines = []
+        for sym in ("BTC", "ETH", "SOL"):
+            sym_trades = [t for t in tagged if t["_sym"] == sym]
+            if sym_trades:
+                sym_pnl = sum(_net(t) for t in sym_trades)
+                sym_sign = "+" if sym_pnl >= 0 else ""
+                sym_w = sum(1 for t in sym_trades if _net(t) > 0)
+                symbol_lines.append(f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}W/{len(sym_trades) - sym_w}L)")
+
+        l_sign = "+" if lifetime_pnl >= 0 else ""
+
+        purchase_line = ""
+        if self.cfg.salesbot_username:
+            purchase_line = f"\nPurchase ({lifetime_winrate:.0f}% win rate): https://t.me/{self.cfg.salesbot_username}"
+
+        msg = (
+            f"GMXBot — Automated GMX V2 Trading\n\n"
+            f"This week's performance and full strategy attached below.\n"
+            f"Review the trades, study the strategy, and let the bot do the work.\n\n"
+            f"Lifetime: {l_sign}${lifetime_pnl:,.2f} | Win Rate: {lifetime_winrate:.0f}% | {lifetime_count} Trades\n"
+        )
+        if symbol_lines:
+            msg += "\n".join(symbol_lines) + "\n"
+        msg += purchase_line
+
+        token = self.cfg.telegram_bot_token
+        await bot_api.send_admin_message(token, vip_chat, msg)
+
+        # Send strategy PDF
+        strategy_path = os.getenv("STRATEGY_PDF_PATH", "./docs/strategy_guide.pdf")
+        if os.path.exists(strategy_path):
+            await bot_api.send_admin_pdf(token, vip_chat, strategy_path, caption="Strategy Guide")
+
+        # Generate and send trade history PDF
+        try:
+            pdf_path = await asyncio.to_thread(
+                self._generate_trade_pdf, all_trades, market_to_sym
+            )
+            await bot_api.send_admin_pdf(token, vip_chat, pdf_path, caption="Trade History Report")
+            os.remove(pdf_path)
+        except Exception as e:
+            self.logger.error(f"VIP promo trade PDF failed: {e}")
+
+        self.logger.info("VIP promo sent to group")

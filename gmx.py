@@ -515,6 +515,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
         self.pnl_alert_task = asyncio.create_task(self.pnl_alert_loop())
+        # self.vip_promo_task = asyncio.create_task(self.vip_promo_loop())  # uncomment when ready to launch
 
         # Bot API polling for DM commands
         if self.cfg.telegram_bot_token:
