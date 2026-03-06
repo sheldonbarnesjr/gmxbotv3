@@ -43,6 +43,10 @@ logger = logging.getLogger("GMXBot.analytics")
 TRADE_HISTORY_FILE = "trade_history.json"
 ONCHAIN_TRADES_FILE = "onchain_trades.json"
 
+# Only show trades from this date forward (UTC midnight).
+# Change this date to reset your trade history starting point.
+TRADE_START_DATE = "2026-03-06"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data structures
@@ -255,12 +259,12 @@ class AnalyticsMixin:
             logger.warning(f"Failed to save trade history: {e}")
 
     async def cmd_reset(self, chat_id: int):
-        """Wipe all trade history (local + on-chain cache). Hidden command."""
+        """Wipe local trade history cache. Hidden command."""
         self.trade_history = []
         self._save_trade_history()
         self._save_onchain_trades([])
-        logger.info("Trade history reset by admin")
-        await self.send_message(chat_id, "Trade history wiped (local + on-chain cache). Fresh start.")
+        logger.info("Trade history cache cleared by admin")
+        await self.send_message(chat_id, f"Local cache cleared. Trades only count from {TRADE_START_DATE} onward.")
 
     def _load_trade_history(self):
         """Load trade history from disk on startup (with .bak fallback)."""
@@ -438,6 +442,15 @@ class AnalyticsMixin:
                 by_key[f"{tx}:{li}"] = t
 
         merged = sorted(by_key.values(), key=lambda x: x.get("timestamp", 0))
+
+        # Filter out trades before TRADE_START_DATE
+        from datetime import datetime as _dt
+        try:
+            start_ts = int(_dt.strptime(TRADE_START_DATE, "%Y-%m-%d").timestamp())
+            merged = [t for t in merged if t.get("timestamp", 0) >= start_ts]
+        except Exception:
+            pass
+
         self._save_onchain_trades(merged)
         self.logger.info(f"On-chain trades: {len(fresh)} fetched, {len(merged)} total stored")
         return merged
