@@ -22,51 +22,53 @@ Signals come with multiple TP levels (usually 2-4, up to 8). The bot doesn't clo
 
 ### How the position closes at each TP
 
-With 3 TPs the default split is:
+With 3 TPs:
 
 | TP Level | % of Position Closed | What Happens |
 |----------|---------------------|--------------|
-| TP1 | 10% | Small profit taken early |
-| TP2 | 35% | Bigger chunk taken at the second target |
-| TP3 | 55% | Rest of the position closes |
+| TP1 | 20% | Early profit secured |
+| TP2 | 50% | Big chunk taken at the second target |
+| TP3 | 30% | Rest of the position closes |
 
 With 4 TPs:
 
 | TP Level | % of Position Closed | What Happens |
 |----------|---------------------|--------------|
-| TP1 | 10% | Small early profit |
-| TP2 | 20% | Second take |
-| TP3 | 30% | Bigger chunk as momentum confirms |
-| TP4 | 40% | Rest of the position closes at the highest target |
+| TP1 | 19% | Early profit |
+| TP2 | 40% | Big take at second target |
+| TP3 | 1% | Keeps position alive for final target |
+| TP4 | 40% | Rest closes at the highest target |
 
 With 5 TPs:
 
 | TP Level | % of Position Closed | What Happens |
 |----------|---------------------|--------------|
-| TP1 | 10% | Small early profit |
-| TP2 | 15% | Second take |
-| TP3 | 20% | Third take |
-| TP4 | 25% | Fourth take |
-| TP5 | 30% | Rest closes at the highest target |
+| TP1 | 19% | Early profit |
+| TP2 | 40% | Big take at second target |
+| TP3 | 1% | Keeps position alive |
+| TP4 | 1% | Keeps position alive |
+| TP5 | 39% | Rest closes at the highest target |
 
-The idea: take a small piece early to secure some profit, then let the majority of the position ride to higher targets. The more TPs a signal has, the more gradually the position is scaled out.
+The strategy: take a solid chunk at TP1 and a large piece at TP2, then hold through the middle targets with minimal closes (1%) to keep the position alive, and close the rest at the final target. This maximizes profit if the trade runs to its highest target while still locking in gains early.
+
+This pattern continues for 6, 7, and 8 TP signals — always heavy on TP1 + TP2, 1% dust on middle TPs, and the rest on the final TP.
 
 These splits are configurable in your `.env` file. For example, to change the 3-TP split:
 
 ```env
-TP_3_1=10
-TP_3_2=35
-TP_3_3=55
+TP_3_1=20
+TP_3_2=50
+TP_3_3=30
 ```
 
 Or a 5-TP split:
 
 ```env
-TP_5_1=10
-TP_5_2=15
-TP_5_3=20
-TP_5_4=25
-TP_5_5=30
+TP_5_1=19
+TP_5_2=40
+TP_5_3=1
+TP_5_4=1
+TP_5_5=39
 ```
 
 Values are percentages and must add up to 100.
