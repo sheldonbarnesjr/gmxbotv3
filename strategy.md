@@ -30,14 +30,26 @@ With 3 TPs the default split is:
 | TP2 | 35% | Bigger chunk taken at the second target |
 | TP3 | 55% | Rest of the position closes |
 
-The idea: take a small piece early to secure some profit, then let the majority of the position ride to higher targets.
+With 4 TPs:
 
-With 2 TPs:
+| TP Level | % of Position Closed | What Happens |
+|----------|---------------------|--------------|
+| TP1 | 10% | Small early profit |
+| TP2 | 20% | Second take |
+| TP3 | 30% | Bigger chunk as momentum confirms |
+| TP4 | 40% | Rest of the position closes at the highest target |
 
-| TP Level | % Closed |
-|----------|----------|
-| TP1 | 20% |
-| TP2 | 80% |
+With 5 TPs:
+
+| TP Level | % of Position Closed | What Happens |
+|----------|---------------------|--------------|
+| TP1 | 10% | Small early profit |
+| TP2 | 15% | Second take |
+| TP3 | 20% | Third take |
+| TP4 | 25% | Fourth take |
+| TP5 | 30% | Rest closes at the highest target |
+
+The idea: take a small piece early to secure some profit, then let the majority of the position ride to higher targets. The more TPs a signal has, the more gradually the position is scaled out.
 
 These splits are configurable in your `.env` file. For example, to change the 3-TP split:
 
@@ -45,6 +57,16 @@ These splits are configurable in your `.env` file. For example, to change the 3-
 TP_3_1=10
 TP_3_2=35
 TP_3_3=55
+```
+
+Or a 5-TP split:
+
+```env
+TP_5_1=10
+TP_5_2=15
+TP_5_3=20
+TP_5_4=25
+TP_5_5=30
 ```
 
 Values are percentages and must add up to 100.
