@@ -254,6 +254,14 @@ class AnalyticsMixin:
         except Exception as e:
             logger.warning(f"Failed to save trade history: {e}")
 
+    async def cmd_reset(self, chat_id: int):
+        """Wipe all trade history (local + on-chain cache). Hidden command."""
+        self.trade_history = []
+        self._save_trade_history()
+        self._save_onchain_trades([])
+        logger.info("Trade history reset by admin")
+        await self.send_message(chat_id, "Trade history wiped (local + on-chain cache). Fresh start.")
+
     def _load_trade_history(self):
         """Load trade history from disk on startup (with .bak fallback)."""
         data = safe_json_read(TRADE_HISTORY_FILE, default=[])
@@ -596,21 +604,9 @@ class AnalyticsMixin:
             await self.send_message(chat_id, "No trades to export.")
             return
 
-        # Fetch open position unrealized PnL for the summary
-        open_unrealized = {sym: 0.0 for sym in PNL_SYMBOLS}
-        try:
-            for wid, acct in self._all_wallets():
-                cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
-                for cp in cps:
-                    sym = cp.symbol.upper().split("/")[0]
-                    if sym in PNL_SYMBOLS:
-                        open_unrealized[sym] += cp.unrealized_pnl
-        except Exception:
-            pass
-
         try:
             pdf_path = await asyncio.to_thread(
-                self._generate_trade_pdf, on_chain, market_to_sym, open_unrealized
+                self._generate_trade_pdf, on_chain, market_to_sym
             )
             bot_api_chats = getattr(self, '_bot_api_chats', set())
             if chat_id in bot_api_chats:
@@ -626,12 +622,9 @@ class AnalyticsMixin:
             self.logger.error(f"PDF generation failed: {e}")
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
-    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict,
-                             open_unrealized: dict = None) -> str:
-        """Build the PDF file with PnL summary + trade list and return its path."""
+    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict) -> str:
+        """Build the PDF file with closed trade PnL summary + trade list."""
         ET = ZoneInfo("America/New_York")
-        if open_unrealized is None:
-            open_unrealized = {}
 
         # ── Normalize on-chain trades into unified dicts ──
         unified = []
@@ -687,7 +680,7 @@ class AnalyticsMixin:
 
         # ── Title ──
         pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 12, "GMX V2 Trade History", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.cell(0, 12, "GMX V2 Closed Trades", new_x="LMARGIN", new_y="NEXT", align="C")
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(
             0, 6,
@@ -760,18 +753,8 @@ class AnalyticsMixin:
                 t_wins += w
                 wr = f"{w}/{cnt}" if cnt else "-"
                 pdf.cell(0, 5, f"  {sym}: {_s(pnl_s)}${pnl_s:,.2f}  ({wr})", new_x="LMARGIN", new_y="NEXT")
-            # Add open unrealized for Today
-            if label == "Today" and open_unrealized:
-                total_unr = sum(open_unrealized.values())
-                pdf.cell(0, 5, f"  Realized:   {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades})", new_x="LMARGIN", new_y="NEXT")
-                pdf.cell(0, 5, f"  Unrealized: {_s(total_unr)}${total_unr:,.2f}", new_x="LMARGIN", new_y="NEXT")
-                combined = t_pnl + total_unr
-                pdf.set_font("Helvetica", "B", 9)
-                pdf.cell(0, 5, f"  Total:      {_s(combined)}${combined:,.2f}", new_x="LMARGIN", new_y="NEXT")
-                pdf.set_font("Helvetica", "", 9)
-            else:
-                wr_pct = f"{t_wins / t_trades * 100:.0f}%" if t_trades else "-"
-                pdf.cell(0, 5, f"  Total: {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades} | {wr_pct} WR)", new_x="LMARGIN", new_y="NEXT")
+            wr_pct = f"{t_wins / t_trades * 100:.0f}%" if t_trades else "-"
+            pdf.cell(0, 5, f"  Total: {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades} | {wr_pct} WR)", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(2)
 
         pdf.set_draw_color(200, 200, 200)
