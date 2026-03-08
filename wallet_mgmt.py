@@ -702,6 +702,7 @@ class WalletMixin:
 
             # Bitunix balance
             bx_section = ""
+            bx_total = 0.0
             bx_client = getattr(self, "bitunix_client", None)
             ex_mode = getattr(self, "exchange_mode", "gmx")
             if bx_client and ex_mode in ("bitunix", "mirror"):
@@ -729,6 +730,12 @@ class WalletMixin:
                 except Exception as e:
                     bx_section = f"\n\n**Bitunix (CEX)**\nError fetching balance: {e}"
 
+            # Combined total across both exchanges
+            combined_section = ""
+            if bx_total > 0:
+                grand_total = total_portfolio + bx_total
+                combined_section = f"\n\n**Combined Total (GMX + Bitunix): ${grand_total:,.2f}**"
+
             pnl_pct_str = f" ({total_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
             msg = (
                 "**GMX (On-Chain)**\n\n"
@@ -740,6 +747,7 @@ class WalletMixin:
                 f"**GMX Total: ${total_portfolio:,.2f}**{change_str}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of ${total_portfolio:,.2f})"
                 + bx_section
+                + combined_section
             )
             await self.send_message(chat_id, msg)
         except Exception as e:
