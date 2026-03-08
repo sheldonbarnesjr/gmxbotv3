@@ -43,3 +43,27 @@ max_ev_tp1_entry_config.md
 
 # Test files
 test_*.py
+
+# Sales bot data (tx hashes, sale logs)
+sales_data/
+
+# Keygen / licensing / sales (not ready for release)
+keygen.py
+license.py
+sales.py
+verify_payment.py
+
+# Backtest & analysis files
+backtest.py
+trade_backtest.py
+signal_analyzer.py
+scan_history.py
+backtest_results*.json
+official_backtest.json
+signals_major.json
+wick_backtest_results.json
+*.xlsx
+
+# Sub-projects (resale & intl bots — separate repos)
+gmxbot-resale/
+intl-trading-bot/

@@ -65,8 +65,10 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /close — Close positions
 /collateral — Add or remove collateral (+/- amount)
 /gas — Swap USDC to ETH for gas (shows gas balances with no args)
+/exchange — Switch exchange mode (gmx/bitunix/mirror)
 /pnl — Push hourly PnL update now
-/positions — Show on-chain positions & orders
+/performance — Platform performance comparison (GMX vs Bitunix)
+/positions — Show open positions & orders
 /signals — Recent signals (pick one to open)
 /sl — Move stop loss
 /status — Bot status, health & halt/resume
@@ -227,18 +229,30 @@ class CoreTelegramMixin:
                         continue
                     chat_id = msg["chat"]["id"]
 
-                    # ── Auth check: only allow admins ──
+                    # ── Auth check: admins + family members ──
                     sender = msg.get("from", {})
                     sender_username = (sender.get("username") or "").lower()
                     sender_id = str(sender.get("id", ""))
-                    allowed = False
-                    if self.cfg.admin_usernames and sender_username in self.cfg.admin_usernames:
-                        allowed = True
-                    elif self.cfg.bot_admin_chat_id and sender_id == self.cfg.bot_admin_chat_id:
-                        allowed = True
-                    elif str(chat_id) == str(self.cfg.admin_chat):
-                        allowed = True
-                    if not allowed:
+
+                    # Check if sender is a family member (but not the admin)
+                    is_admin = (
+                        (self.cfg.admin_usernames and sender_username in self.cfg.admin_usernames)
+                        or (self.cfg.bot_admin_chat_id and sender_id == self.cfg.bot_admin_chat_id)
+                        or str(chat_id) == str(self.cfg.admin_chat)
+                    )
+                    family_member = (
+                        self._get_family_member_by_chat_id(sender_id)
+                        if not is_admin else None
+                    )
+                    if family_member:
+                        self._bot_api_chats.add(chat_id)
+                        if text.startswith("/"):
+                            await self.process_family_command(text, chat_id, family_member)
+                        else:
+                            await self.send_message(chat_id, "Send a /command. Type /help for options.")
+                        continue
+
+                    if not is_admin:
                         self.logger.warning(
                             f"Unauthorized Bot API message from @{sender_username} "
                             f"(id={sender_id}, chat={chat_id}), ignoring."
@@ -315,6 +329,11 @@ class CoreTelegramMixin:
                 await self.cmd_pdf(chat_id)
             elif cmd == "/reset":
                 await self.cmd_reset(chat_id)
+            elif cmd == "/exchange":
+                arg = parts[1].lower() if len(parts) > 1 else None
+                await self.cmd_exchange(chat_id, arg)
+            elif cmd == "/performance":
+                await self.cmd_performance(chat_id)
             elif cmd == "/wallet":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_wallet(chat_id, arg)
@@ -340,6 +359,8 @@ class CoreTelegramMixin:
                     await self.send_message(chat_id, "Signal selection cancelled.")
                 else:
                     await self.send_message(chat_id, "Nothing to cancel.")
+            elif cmd == "/send":
+                await self.cmd_send(chat_id, parts)
             else:
                 await self.send_message(chat_id, "Unknown command. Type /help")
 
@@ -366,6 +387,46 @@ class CoreTelegramMixin:
         await self.notify(f"TRADING RESUMED\n{reason}")
 
     # ──────────────────────────────────────────────────────────────────────
+    # /exchange — Switch exchange mode
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def cmd_exchange(self, chat_id: int, arg: str = None):
+        """Show or change the exchange execution mode (gmx / bitunix / mirror)."""
+        valid_modes = ("gmx", "bitunix", "mirror")
+
+        if not arg:
+            mode = getattr(self, "exchange_mode", "gmx")
+            has_bitunix = self.bitunix_client is not None
+            bx_status = "connected" if has_bitunix else "not configured"
+            await self.send_message(
+                chat_id,
+                f"**Exchange Mode:** {mode.upper()}\n"
+                f"Bitunix API: {bx_status}\n\n"
+                f"Usage: /exchange <gmx|bitunix|mirror>\n"
+                f"  gmx — GMX only (on-chain)\n"
+                f"  bitunix — Bitunix only (CEX)\n"
+                f"  mirror — Both execute same trades"
+            )
+            return
+
+        if arg not in valid_modes:
+            await self.send_message(chat_id, f"Invalid mode '{arg}'. Use: gmx, bitunix, or mirror")
+            return
+
+        if arg in ("bitunix", "mirror") and not self.bitunix_client:
+            await self.send_message(
+                chat_id,
+                f"Cannot switch to {arg.upper()}: Bitunix API credentials not configured.\n"
+                f"Set BITUNIX_API_KEY and BITUNIX_SECRET_KEY in .env"
+            )
+            return
+
+        old_mode = getattr(self, "exchange_mode", "gmx")
+        self.exchange_mode = arg
+        self.logger.info(f"Exchange mode changed: {old_mode} -> {arg}")
+        await self.send_message(chat_id, f"Exchange mode changed: {old_mode.upper()} -> {arg.upper()}")
+
+    # ──────────────────────────────────────────────────────────────────────
     # /status
     # ──────────────────────────────────────────────────────────────────────
 
@@ -385,16 +446,15 @@ class CoreTelegramMixin:
         uptime_hours = health["uptime_seconds"] / 3600
         heartbeat_age = time.time() - self.last_heartbeat
         total_exposure = sum(p.size_usd for p in self.positions.values() if p.is_open)
-        wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
         wallet_lines = []
         for wid, acct in self._all_wallets():
-            role = wallet_roles.get(wid, "scalp")
-            wallet_lines.append(f"W{wid} ({role}): {acct.address[:8]}...{acct.address[-6:]}")
+            wallet_lines.append(f"W{wid}: {acct.address[:8]}...{acct.address[-6:]}")
         wallet_str = "\n".join(wallet_lines) if wallet_lines else "N/A"
         msg = (
             "**GMX V2 Bot Status**\n\n"
             f"Status: {status}\n"
             f"Mode: {'DRY RUN' if cfg.dry_run else 'LIVE'}\n"
+            f"Exchange: {getattr(self, 'exchange_mode', 'gmx').upper()}\n"
             f"{wallet_str}\n"
             f"Network: {cfg.network.upper()}\n"
             f"Uptime: {uptime_hours:.1f}h\n"
@@ -406,6 +466,26 @@ class CoreTelegramMixin:
             f"Trades: {health['trades_executed']}\n"
             f"Errors: {health['errors']}"
         )
+        # Bitunix info when in bitunix/mirror mode
+        mode = getattr(self, 'exchange_mode', 'gmx')
+        if mode in ("bitunix", "mirror") and self.bitunix_client:
+            bx_open = [p for p in self.positions.values() if p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix']
+            bx_exposure = sum(p.size_usd for p in bx_open)
+            bx_upnl = sum(p.unrealized_pnl or 0 for p in bx_open)
+            upnl_sign = "+" if bx_upnl >= 0 else ""
+            msg += (
+                f"\n\n**Bitunix**\n"
+                f"Positions: {len(bx_open)}\n"
+                f"Exposure: ${bx_exposure:,.0f}\n"
+                f"Unrealized: {upnl_sign}${bx_upnl:,.2f}"
+            )
+            try:
+                from bitunix_executor import get_bitunix_balance
+                bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
+                if bal:
+                    msg += f"\nAvailable: ${bal:,.2f}"
+            except Exception:
+                pass
         if is_halted:
             msg += f"\n\nHalt reason: {self.halt_reason}"
             msg += "\n\nUse `/status resume` to resume trading."
@@ -439,6 +519,40 @@ class CoreTelegramMixin:
         return all_positions, all_orders
 
     # ──────────────────────────────────────────────────────────────────────
+    # Bitunix close helper
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _handle_bitunix_close(self, chat_id: int, pos):
+        """Close a Bitunix position (internal Position object with _is_bitunix tag)."""
+        try:
+            success = await self.close_bitunix_position(pos)
+            if success:
+                pnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+                await self.send_message(
+                    chat_id,
+                    f"[BITUNIX] {pos.symbol} {pos.side} CLOSED\n"
+                    f"Entry: ${pos.entry_price:,.2f}\n"
+                    f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f} ({pos.pnl_percentage:+.1f}%)"
+                )
+                pos.is_open = False
+                pos.closed_at = time.time()
+                pos.exit_reason = "manual"
+                await self._record_trade(pos, exit_reason="manual")
+                # Clean up Bitunix monitoring state
+                self._bx_tp_tracking.pop(pos.id, None)
+                self._bx_missing_count.pop(pos.id, None)
+                self._save_bx_tp_tracking()
+                self._save_position_state()
+            else:
+                await self.send_message(
+                    chat_id,
+                    f"[BITUNIX] Failed to close {pos.symbol} {pos.side}. "
+                    f"Check Bitunix manually."
+                )
+        except Exception as e:
+            await self.send_message(chat_id, f"[BITUNIX] Close error: {e}")
+
+    # ──────────────────────────────────────────────────────────────────────
     # /positions
     # ──────────────────────────────────────────────────────────────────────
 
@@ -450,8 +564,14 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, f"Error fetching data: {e}")
             return
 
-        if not positions and not orders:
-            await self.send_message(chat_id, "No open positions or orders on-chain.")
+        # Collect Bitunix positions from internal tracking
+        bx_positions = [
+            p for p in self.positions.values()
+            if p.is_open and getattr(p, 'exchange', 'gmx') == "bitunix"
+        ]
+
+        if not positions and not orders and not bx_positions:
+            await self.send_message(chat_id, "No open positions or orders.")
             return
 
         msg = ""
@@ -688,6 +808,52 @@ class CoreTelegramMixin:
                 price_str = f"${tp:,.2f}" if tp else "market"
                 msg += f"  {o['symbol']} {side} @ {price_str}  (${o['size_usd']:,.2f})\n"
 
+        # ── Bitunix Positions (from internal tracking) ──
+        if bx_positions:
+            msg += f"\n**Bitunix Positions ({len(bx_positions)})**\n"
+            for i, pos in enumerate(bx_positions, 1):
+                pnl = pos.unrealized_pnl or 0.0
+                pnl_icon = "+" if pnl >= 0 else ""
+                collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                pnl_pct = (pnl / collateral * 100) if collateral > 0 else 0.0
+                current_str = f"${pos.current_price:,.2f}" if pos.current_price else "N/A"
+
+                msg += (
+                    f"\n**#{i} {pos.symbol} {pos.side}** [BITUNIX]\n"
+                    f"  Size:    ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
+                    f"  Entry:   ${pos.entry_price:,.2f}\n"
+                    f"  Current: {current_str}\n"
+                    f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                )
+
+                tracked = self._bx_tp_tracking.get(pos.id, [])
+                if tracked:
+                    tp_hits = sum(1 for t in tracked if t.get("hit"))
+                    msg += f"  TPs:     {tp_hits}/{len(tracked)} hit\n"
+                    for j, tp in enumerate(sorted(tracked, key=lambda t: t.get("price", 0)), 1):
+                        status = "HIT" if tp.get("hit") else "pending"
+                        icon = " ✅" if tp.get("hit") else ""
+                        tp_price = tp.get("price", 0) or 0
+                        tp_pct = tp.get("pct", 0) or 0
+                        msg += f"  TP{j}{icon} @ ${tp_price:,.2f} ({tp_pct:.0%}) — {status}\n"
+
+                if pos.stop_loss and pos.stop_loss > 0:
+                    sl_label = f" ({pos.sl_move_label})" if getattr(pos, 'sl_move_label', None) else ""
+                    msg += f"  SL  @ ${pos.stop_loss:,.2f}{sl_label}\n"
+
+                if pos.opened_at:
+                    dur_h = (time.time() - pos.opened_at) / 3600
+                    msg += f"  Duration: {dur_h:.1f}h\n"
+
+            bx_total_pnl = sum(p.unrealized_pnl or 0 for p in bx_positions)
+            bx_total_size = sum(p.size_usd for p in bx_positions)
+            bx_total_collateral = sum(
+                p.size_usd / p.leverage if p.leverage else p.size_usd
+                for p in bx_positions
+            )
+            bx_pnl_pct = f" ({bx_total_pnl / bx_total_collateral * 100:+.1f}%)" if bx_total_collateral > 0 else ""
+            msg += f"\nBitunix Total: ${bx_total_size:,.0f} size  |  PnL: ${bx_total_pnl:+.2f}{bx_pnl_pct}\n"
+
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -703,7 +869,13 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, f"Error fetching data: {e}")
             return
 
-        if not positions and not orders:
+        # Also collect Bitunix positions from internal tracking
+        bx_positions = [
+            p for p in self.positions.values()
+            if p.is_open and p.exchange == "bitunix"
+        ]
+
+        if not positions and not orders and not bx_positions:
             await self.send_message(chat_id, "No open positions or orders to close.")
             return
 
@@ -749,6 +921,19 @@ class CoreTelegramMixin:
                     sym = o.get('symbol', '???')
                     msg += f"  {sym} {label} @ ${price:,.2f}\n"
 
+            # Show Bitunix positions
+            if bx_positions:
+                idx = len(positions) + 1 if positions else 1
+                msg += f"\n**Bitunix Positions ({len(bx_positions)})**\n"
+                for i, bp in enumerate(bx_positions, idx):
+                    pnl = bp.unrealized_pnl or 0
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    msg += (
+                        f"  {i}. {bp.symbol} {bp.side} [BITUNIX] "
+                        f"${bp.size_usd:,.0f} @ {bp.leverage:.0f}x  "
+                        f"PnL: {pnl_sign}${pnl:,.2f}\n"
+                    )
+
             msg += "\nReply with:\n"
             if positions:
                 msg += "  /close BTC — close by symbol\n"
@@ -757,17 +942,26 @@ class CoreTelegramMixin:
             return
 
         arg_upper = arg.upper()
-        to_close: List[GMXPosition] = []
+        to_close: List = []  # Mix of GMXPosition and internal Position with _is_bitunix tag
         also_cancel_orders = False
 
         if arg_upper == "ALL":
-            to_close = positions if positions else []
+            to_close = list(positions) if positions else []
+            # Add Bitunix positions with tag
+            for bp in bx_positions:
+                bp._is_bitunix = True
+                to_close.append(bp)
             also_cancel_orders = True
         else:
             if positions:
                 for pos in positions:
                     if arg_upper == pos.symbol.upper() or arg_upper == pos.symbol.upper().split("/")[0]:
                         to_close.append(pos)
+            # Check Bitunix positions too
+            for bp in bx_positions:
+                if arg_upper == bp.symbol.upper():
+                    bp._is_bitunix = True
+                    to_close.append(bp)
             if not to_close:
                 await self.send_message(chat_id, f"No position found matching '{arg}'")
                 return
@@ -775,9 +969,12 @@ class CoreTelegramMixin:
         msg = "**Confirm close:**\n\n"
         if to_close:
             for pos in to_close:
-                side = "LONG" if pos.is_long else "SHORT"
+                is_bx = getattr(pos, '_is_bitunix', False)
+                platform = "[BITUNIX]" if is_bx else "[GMX]"
+                side = pos.side if is_bx else ("LONG" if pos.is_long else "SHORT")
+                pnl = pos.unrealized_pnl if hasattr(pos, 'unrealized_pnl') else 0
                 pnl_pct_c = pos.pnl_percentage if hasattr(pos, 'pnl_percentage') else 0.0
-                msg += f"  {pos.symbol} {side} — ${pos.size_usd:,.2f} — PnL: ${pos.unrealized_pnl:+.2f} ({pnl_pct_c:+.1f}%)\n"
+                msg += f"  {pos.symbol} {side} {platform} — ${pos.size_usd:,.2f} — PnL: ${pnl:+.2f} ({pnl_pct_c:+.1f}%)\n"
         if also_cancel_orders and orders:
             msg += f"\n  + Cancel {len(orders)} open order(s) (SL/TP/Limit)\n"
         elif also_cancel_orders and not to_close:
@@ -815,12 +1012,20 @@ class CoreTelegramMixin:
             elif also_cancel_orders and positions_to_close:
                 await self.send_message(chat_id, "Closing all open positions & orders...")
             elif positions_to_close:
-                labels = [f"{p.symbol} {'LONG' if p.is_long else 'SHORT'}" for p in positions_to_close]
+                labels = [
+                    f"{p.symbol} {p.side if getattr(p, '_is_bitunix', False) else ('LONG' if p.is_long else 'SHORT')}"
+                    for p in positions_to_close
+                ]
                 await self.send_message(chat_id, f"Closing {', '.join(labels)} & SL/TP...")
 
             close_failed = False
             if positions_to_close:
                 for pos in positions_to_close:
+                    # Route Bitunix positions to Bitunix close handler
+                    is_bitunix = getattr(pos, '_is_bitunix', False)
+                    if is_bitunix:
+                        await self._handle_bitunix_close(chat_id, pos)
+                        continue
                     side = "LONG" if pos.is_long else "SHORT"
                     pos_acct = getattr(pos, '_wallet_acct', self.account)
                     wid = getattr(pos, '_wallet_id', 1)
@@ -908,6 +1113,16 @@ class CoreTelegramMixin:
             if positions_to_close:
                 await self.topup_eth_if_needed()
                 await self._rebalance_wallets()
+                # Mirror close to family members
+                if self.family_members:
+                    for pos in positions_to_close:
+                        side = "LONG" if pos.is_long else "SHORT"
+                        # pos.symbol is "BTC/USD" format; family positions use "BTC"
+                        base_symbol = pos.symbol.split("/")[0]
+                        task = asyncio.create_task(
+                            self._mirror_close_to_family(base_symbol, side)
+                        )
+                        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         elif text_upper in ("NO", "N", "CANCEL"):
             del self.pending_closes[chat_id]

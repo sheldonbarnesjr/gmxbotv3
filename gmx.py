@@ -97,6 +97,7 @@ from open import (  # type: ignore[assignment]  # noqa: A004
     scale_price,
     fetch_execution_price,
     classify_signal,
+    _load_env_tp_dist,
     COINGECKO_IDS,
     INDEX_TOKEN_DECIMALS,
     ERC20_ABI,
@@ -112,6 +113,15 @@ from close import (
     GMXPosition,
     create_close_order,
 )
+
+# Bitunix exchange support
+from bitunix_api import BitunixClient
+from bitunix_executor import (
+    execute_bitunix_signal,
+    get_bitunix_balance,
+    get_bitunix_positions,
+)
+from bitunix_monitor import BitunixMonitorMixin
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATA STRUCTURES
@@ -187,6 +197,12 @@ class Position:
     # Each dict: {execution_price, net_pnl_usd, timestamp, tx_hash, log_index, size_delta_usd, matched_tp_price}
     verified_decreases: list = field(default_factory=list)
 
+    # Exchange platform: "gmx" or "bitunix"
+    exchange: str = "gmx"
+
+    # Bitunix-specific: exchange position ID (for TP/SL management)
+    bitunix_position_id: Optional[str] = None
+
     @property
     def tp_hits_count(self) -> int:
         """Derived from verified on-chain PositionDecrease events."""
@@ -218,7 +234,10 @@ class Position:
 # BOT ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, AnalyticsMixin, WithdrawMixin, CoreTelegramMixin):
+from family_mirror import FamilyMirrorMixin
+
+
+class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, AnalyticsMixin, WithdrawMixin, BitunixMonitorMixin, FamilyMirrorMixin, CoreTelegramMixin):
     """Production GMX V2 Trading Bot with real on-chain execution."""
 
     def __init__(self):
@@ -249,6 +268,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Signal selection state: chat_id -> pending signal pick
         self.pending_signals: Dict[int, Dict[str, Any]] = {}
 
+        # Family members (initialized in start() via _init_family_members)
+        self.family_members = []
+
         # Last signal text for replay
         self.last_signal_text: Optional[str] = None
 
@@ -260,7 +282,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Concurrency: prevent duplicate signal execution
         self._signal_lock = asyncio.Lock()
-        self._recent_signal_hashes: Dict[str, float] = {}  # hash -> timestamp
+        self._recent_signal_hashes: Dict[str, float] = self._load_signal_dedup()
         self._signal_dedup_window: float = 300.0  # 5 minutes
 
         # System
@@ -297,15 +319,28 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Key = pos_id, value = consecutive miss count. Only close after 2 misses.
         self._position_missing_count: dict = {}
 
+        # Bitunix client (initialized in start() if credentials are set)
+        self.bitunix_client: Optional[BitunixClient] = None
+
+        # Exchange mode: "gmx", "bitunix", or "mirror"
+        self.exchange_mode: str = self.cfg.exchange_mode
+
+        # Bitunix monitor state
+        self._init_bitunix_monitor()
+        self.bitunix_monitor_task: Optional[asyncio.Task] = None
+
         self.setup_logging()
 
     def setup_logging(self):
+        from logging.handlers import RotatingFileHandler
         logging.basicConfig(
             level=getattr(logging, self.cfg.log_level, logging.INFO),
             format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler("gmx_bot.log"),
+                RotatingFileHandler(
+                    "gmx_bot.log", maxBytes=10 * 1024 * 1024, backupCount=3
+                ),
             ],
         )
         self.logger = logging.getLogger("GMXBot")
@@ -388,6 +423,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 "tp_tx_hashes": list(pos.tp_tx_hashes),
                 "sl_tx_hash": pos.sl_tx_hash,
                 "order_history": pos.order_history,
+                "exchange": getattr(pos, 'exchange', 'gmx'),
+                "bitunix_position_id": getattr(pos, 'bitunix_position_id', None),
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "size_usd": pos.size_usd,
+                "collateral_usd": getattr(pos, 'collateral_usd', 0),
             }
         try:
             atomic_json_write(self.POSITION_STATE_FILE, state)
@@ -399,7 +440,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         return safe_json_read(self.POSITION_STATE_FILE, default={})
 
     def _clear_position_state(self, pos):
-        """Remove a closed position's entry from the state file."""
+        """Remove a closed position's entry from the state file and clean up tracking."""
         if not pos.market_addr:
             return
         key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
@@ -410,6 +451,39 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 atomic_json_write(self.POSITION_STATE_FILE, state)
         except Exception as e:
             self.logger.warning(f"Failed to clear position state: {e}")
+        # Clean up stale TP miss counters for this position
+        try:
+            misses = self._get_stale_tp_misses()
+            keys_to_remove = [k for k in misses if k.startswith(f"{pos.id}:")]
+            for k in keys_to_remove:
+                misses.pop(k, None)
+        except Exception:
+            pass
+        # Clean up position missing counters
+        self._position_missing_count.pop(pos.id, None)
+        # Clean up Bitunix tracking dicts if present
+        if hasattr(self, '_bx_missing_count'):
+            self._bx_missing_count.pop(pos.id, None)
+        if hasattr(self, '_bx_tp_tracking'):
+            self._bx_tp_tracking.pop(pos.id, None)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Signal dedup persistence (survives restart to prevent duplicate trades)
+    # ──────────────────────────────────────────────────────────────────────
+    SIGNAL_DEDUP_FILE = "signal_dedup.json"
+
+    def _save_signal_dedup(self):
+        """Persist signal dedup hashes so they survive restart."""
+        try:
+            atomic_json_write(self.SIGNAL_DEDUP_FILE, self._recent_signal_hashes)
+        except Exception as e:
+            self.logger.warning(f"Failed to save signal dedup: {e}")
+
+    def _load_signal_dedup(self) -> Dict[str, float]:
+        """Load signal dedup hashes from disk, filtering expired entries."""
+        data = safe_json_read(self.SIGNAL_DEDUP_FILE, default={})
+        now = time.time()
+        return {h: t for h, t in data.items() if now - t < 300.0}
 
     # ──────────────────────────────────────────────────────────────────────
     # Failed order queue persistence
@@ -462,6 +536,26 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.logger.info("Starting GMX V2 Trading Bot")
         await self.init_telegram()
         self.init_web3()
+
+        # Initialize Bitunix client if credentials are set
+        if self.cfg.bitunix_api_key and self.cfg.bitunix_secret_key:
+            self.bitunix_client = BitunixClient(
+                self.cfg.bitunix_api_key,
+                self.cfg.bitunix_secret_key,
+            )
+            try:
+                bal = self.bitunix_client.get_balance()
+                self.logger.info(f"Bitunix connected -- Balance: ${bal:,.2f} USDT")
+            except Exception as e:
+                self.logger.warning(f"Bitunix API connection failed: {e}")
+                if self.exchange_mode in ("bitunix", "mirror"):
+                    self.logger.error("Bitunix required but unreachable -- falling back to GMX only")
+                    self.exchange_mode = "gmx"
+        elif self.exchange_mode in ("bitunix", "mirror"):
+            self.logger.error("EXCHANGE_MODE requires Bitunix credentials but none set -- falling back to GMX only")
+            self.exchange_mode = "gmx"
+
+        self.logger.info(f"Exchange mode: {self.exchange_mode.upper()}")
 
         # Load persisted trade history (PnL / win rate data)
         self._load_trade_history()
@@ -517,6 +611,17 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.pnl_alert_task = asyncio.create_task(self.pnl_alert_loop())
         # self.vip_promo_task = asyncio.create_task(self.vip_promo_loop())  # uncomment when ready to launch
 
+        # Bitunix position monitor (TP tracking, SL trailing, reconciliation)
+        if self.bitunix_client and self.exchange_mode in ("bitunix", "mirror"):
+            self.bitunix_monitor_task = asyncio.create_task(self.bitunix_monitor_loop())
+            self.logger.info("Bitunix monitor started")
+
+        # Family member trade mirroring
+        self._init_family_members()
+        if self.family_members:
+            self.family_monitor_task = asyncio.create_task(self.family_monitor_loop())
+            self.logger.info(f"Family monitor started for {len(self.family_members)} members")
+
         # Bot API polling for DM commands
         if self.cfg.telegram_bot_token:
             self.bot_polling_task = asyncio.create_task(self.bot_api_polling_loop())
@@ -567,6 +672,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.pnl_alert_task.cancel()
         if self.bot_polling_task:
             self.bot_polling_task.cancel()
+        if self.bitunix_monitor_task:
+            self.bitunix_monitor_task.cancel()
 
         # Reconnect if needed so the offline message can be sent
         try:
@@ -590,20 +697,20 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.w3 = Web3(Web3.HTTPProvider(self.cfg.rpc_url))
         if self.cfg.private_key:
             self.account = Account.from_key(self.cfg.private_key)
-            self.logger.info(f"Web3 on {self.cfg.network}, wallet 1 (swing): {self.account.address[:10]}...")
+            self.logger.info(f"Web3 on {self.cfg.network}, wallet 1: {self.account.address[:10]}...")
         else:
             self.logger.warning("No private key — read-only mode")
         if self.cfg.private_key_2:
             self.account2 = Account.from_key(self.cfg.private_key_2)
-            self.logger.info(f"Wallet 2 (scalp): {self.account2.address[:10]}...")
+            self.logger.info(f"Wallet 2: {self.account2.address[:10]}...")
         else:
             self.logger.info("No PRIVATE_KEY_2 — single wallet mode")
         if self.cfg.private_key_3:
             self.account3 = Account.from_key(self.cfg.private_key_3)
-            self.logger.info(f"Wallet 3 (scalp): {self.account3.address[:10]}...")
+            self.logger.info(f"Wallet 3: {self.account3.address[:10]}...")
         if self.cfg.private_key_4:
             self.account4 = Account.from_key(self.cfg.private_key_4)
-            self.logger.info(f"Wallet 4 (scalp): {self.account4.address[:10]}...")
+            self.logger.info(f"Wallet 4: {self.account4.address[:10]}...")
 
     async def _sync_on_chain_positions(self, *, skip_sl_check: bool = False):
         """Scan on-chain positions for all wallets, sync state, and clean stale entries.
@@ -726,6 +833,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.tp_tx_hashes = saved.get("tp_tx_hashes", [])
                     pos.sl_tx_hash = saved.get("sl_tx_hash")
                     pos.order_history = saved.get("order_history", [])
+                    # Restore exchange identity (gmx/bitunix)
+                    if saved.get("exchange"):
+                        pos.exchange = saved["exchange"]
+                    if saved.get("bitunix_position_id"):
+                        pos.bitunix_position_id = saved["bitunix_position_id"]
 
                 # ── Path A: Original signal TPs available → ground truth ──
                 original_tps = saved.get("original_take_profits") if saved else None
@@ -1050,6 +1162,107 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         else:
             self.logger.info("No untracked on-chain positions found")
 
+        # ── Reconstruct Bitunix positions from saved state ──
+        # Bitunix positions can't be synced from chain — restore from state file
+        bx_synced = 0
+        for state_key, saved in saved_state.items():
+            if saved.get("exchange") != "bitunix":
+                continue
+            # Check if already tracked
+            already_tracked = any(
+                p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix'
+                and p.symbol == saved.get("symbol", "")
+                and p.side == saved.get("side", "")
+                for p in self.positions.values()
+            )
+            if already_tracked:
+                continue
+
+            # Parse state key: "wallet_id:market_addr:side"
+            parts = state_key.split(":", 2)
+            if len(parts) < 3:
+                continue
+            try:
+                wid = int(parts[0])
+            except ValueError:
+                continue
+            market_addr = parts[1]
+            side = parts[2]
+            symbol = saved.get("symbol", "???")
+            if symbol == "???":
+                continue  # Can't restore without symbol
+
+            # Rebuild TPs from saved original_take_profits
+            tps = []
+            for tp_data in saved.get("original_take_profits", []):
+                if tp_data.get("price", 0) > 0:
+                    tps.append(TakeProfitLevel(
+                        price=tp_data["price"],
+                        percentage=tp_data.get("close_pct", 0),
+                    ))
+
+            pos = Position(
+                id=str(uuid.uuid4()),
+                symbol=symbol,
+                side=side,
+                size_usd=saved.get("original_size_usd", 0),
+                leverage=saved.get("leverage", 10),
+                entry_price=saved.get("entry_price", 0),
+                stop_loss=saved.get("stop_loss"),
+                take_profits=tps,
+                market_addr=market_addr,
+                opened_at=saved.get("opened_at", time.time()),
+                wallet_id=wid,
+                original_size_usd=saved.get("original_size_usd", 0),
+                exchange="bitunix",
+                bitunix_position_id=saved.get("bitunix_position_id"),
+            )
+            pos.signal_id = saved.get("signal_id")
+            pos.sl_moved_to_entry = saved.get("sl_moved_to_entry", False)
+            pos.sl_move_label = saved.get("sl_move_label")
+            pos.realized_pnl = saved.get("realized_pnl", 0.0)
+            pos.verified_decreases = saved.get("verified_decreases", [])
+            pos.order_history = saved.get("order_history", [])
+            pos.processed_tx_hashes = set(saved.get("processed_tx_hashes", []))
+
+            self.positions[pos.id] = pos
+            bx_synced += 1
+            self.logger.info(
+                f"Sync: restored Bitunix {symbol} {side} [W{wid}] from saved state"
+            )
+
+        if bx_synced:
+            self.logger.info(f"Restored {bx_synced} Bitunix position(s) from state")
+            # Verify restored Bitunix positions still exist on exchange
+            if self.bitunix_client:
+                try:
+                    from bitunix_executor import to_bitunix_symbol
+                    exchange_positions = await asyncio.to_thread(
+                        self.bitunix_client.get_pending_positions
+                    )
+                    exchange_set = set()
+                    for ep in exchange_positions:
+                        sym = (ep.get("symbol") or "").replace("USDT", "")
+                        if sym.startswith("1000"):
+                            sym = sym[4:]
+                        raw_side = (ep.get("side") or "").upper()
+                        s = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
+                        exchange_set.add((sym, s))
+
+                    for pos in list(self.positions.values()):
+                        if not pos.is_open or getattr(pos, 'exchange', 'gmx') != 'bitunix':
+                            continue
+                        if (pos.symbol, pos.side) not in exchange_set:
+                            self.logger.warning(
+                                f"Sync: Bitunix {pos.symbol} {pos.side} not found on exchange — marking closed"
+                            )
+                            pos.is_open = False
+                            pos.closed_at = time.time()
+                            pos.exit_reason = "closed_while_offline"
+                            bx_synced -= 1
+                except Exception as e:
+                    self.logger.warning(f"Could not verify Bitunix positions on startup: {e}")
+
         # ── Post-sync: verify SL is at the correct level for inferred TP hits ──
         # Only on startup — skip when user runs /sync (SL is already on-chain)
         if skip_sl_check:
@@ -1365,10 +1578,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             }
             remaining_tps = [
                 tp for tp in pos.take_profits
-                if not any(
+                if tp.price > 0 and not any(
                     abs(tp.price - vtp) / tp.price < 0.01
                     for vtp in verified_tp_prices_resync
-                    if tp.price > 0
                 )
             ]
             for tp_level in remaining_tps:
@@ -1467,6 +1679,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self.signal_store.mark_rejected(signal_id, "exact duplicate signal")
                 return
             self._recent_signal_hashes[sig_hash] = now
+            self._save_signal_dedup()
 
             # Store for /lastsignal replay
             self.last_signal_text = text
@@ -1489,10 +1702,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self.signal_store.mark_rejected(signal_id, "validation failed")
                 return
 
-            # Pick wallet based on trade type:
-            #   swing → W1 only
-            #   scalp → W2, W3, W4 (first available)
-            wallet_id, acct = await self._pick_wallet(signal.symbol, signal.trade_type, is_long=signal.is_long)
+            # Pick first available wallet (W1 priority, then W2, W3, W4)
+            wallet_id, acct = await self._pick_wallet(signal.symbol, is_long=signal.is_long)
             if not acct:
                 reason = getattr(self, '_last_wallet_reject_reason', 'unknown')
                 self.signal_store.mark_rejected(signal_id, f"no available wallets: {reason}")
@@ -1518,7 +1729,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 return
 
             # Cap leverage at max_leverage first so collateral calculation is correct
-            signal.leverage = cap_leverage(signal.leverage, self.cfg.max_leverage)
+            signal.leverage = cap_leverage(signal.leverage, self.cfg.max_leverage, self.cfg.min_leverage)
 
             if open_count >= self.cfg.free_balance_after:
                 # Size from free USDC only — don't count deployed collateral
@@ -1616,6 +1827,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 await self.topup_eth_if_needed()
                 # Rebalance USDC between wallets after opening
                 await self._rebalance_wallets()
+                # Mirror trade to family members (fire-and-forget)
+                if self.family_members:
+                    task = asyncio.create_task(self._mirror_to_family(signal))
+                    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         except Exception as e:
             self.logger.error(f"Error processing signal: {e}\n{traceback.format_exc()}")
@@ -1787,6 +2002,201 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # OPEN — Real on-chain execution via open.py
     # ──────────────────────────────────────────────────────────────────────
     async def execute_open(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None, wallet_id: int = 1) -> tuple:
+        """Execute a full open signal based on exchange_mode.
+
+        Modes:
+            gmx    — Execute on GMX only (default, existing behavior)
+            bitunix — Execute on Bitunix only
+            mirror  — Execute on BOTH exchanges concurrently
+
+        Returns (Position, order_type) or (None, None) on failure."""
+
+        mode = self.exchange_mode
+
+        if mode == "bitunix":
+            return await self._execute_open_bitunix(signal, size_usd, collateral_usd, wallet_id)
+
+        if mode == "mirror":
+            # Execute on both exchanges concurrently
+            # GMX is the "primary" — its Position object is returned for tracking
+            gmx_task = asyncio.create_task(
+                self._execute_open_gmx(signal, size_usd, acct, collateral_usd, wallet_id)
+            )
+            bitunix_task = asyncio.create_task(
+                self._execute_open_bitunix(signal, size_usd, collateral_usd, wallet_id)
+            )
+
+            gmx_result = await gmx_task
+
+            # Await bitunix but don't let it block or fail the primary
+            bx_pos = None
+            try:
+                bx_pos, bx_type = await bitunix_task
+                if bx_pos:
+                    # Store Bitunix position so admin commands (/positions, /close) can see it
+                    bx_pos.signal_id = getattr(signal, 'signal_id', None) or signal.symbol
+                    self.positions[bx_pos.id] = bx_pos
+                    self._save_position_state()
+                    await self.notify(f"[MIRROR] Bitunix {signal.symbol} {signal.side} opened successfully")
+                else:
+                    await self.notify(f"[MIRROR] Bitunix {signal.symbol} {signal.side} FAILED")
+            except Exception as e:
+                bx_pos = None
+                self.logger.error(f"[MIRROR] Bitunix execution failed: {e}")
+                await self.notify(f"[MIRROR] Bitunix error: {e}")
+
+            # Return GMX result if available; fall back to Bitunix position
+            # so the signal is still marked as executed even if GMX failed
+            if gmx_result and gmx_result[0]:
+                return gmx_result
+            if bx_pos:
+                return bx_pos, "market"
+            return gmx_result
+
+        # Default: GMX only
+        return await self._execute_open_gmx(signal, size_usd, acct, collateral_usd, wallet_id)
+
+    async def _execute_open_bitunix(self, signal: Signal, size_usd: float,
+                                     collateral_usd: float = None, wallet_id: int = 1) -> tuple:
+        """Execute a signal on Bitunix — full flow matching intl-trading-bot.
+
+        Returns (Position, order_type) or (None, None)."""
+        if not self.bitunix_client:
+            self.logger.error("Bitunix client not initialized")
+            await self.notify("[BITUNIX] Execution failed: no API credentials configured")
+            return None, None
+
+        try:
+            # Apply Bitunix-specific TP distribution overrides (BX_TP_* env vars)
+            bx_tps = signal.take_profits
+            bx_pcts = _load_env_tp_dist(len(bx_tps), prefix="BX_TP")
+            if bx_pcts and sum(bx_pcts) > 0:
+                bx_tps = [TakeProfit(price=tp.price, close_pct=pct) for tp, pct in zip(signal.take_profits, bx_pcts)]
+                # Normalize so percentages sum to 1.0
+                total = sum(tp.close_pct for tp in bx_tps)
+                if abs(total - 1.0) > 0.001:
+                    bx_tps[-1] = TakeProfit(price=bx_tps[-1].price, close_pct=bx_tps[-1].close_pct + (1.0 - total))
+                self.logger.info(f"[BITUNIX] Using BX_TP overrides: {[f'{tp.close_pct:.1%}' for tp in bx_tps]}")
+
+            self.logger.info(
+                f"[BITUNIX] Opening {signal.symbol} {signal.side} "
+                f"size=${size_usd:.2f} @ {signal.leverage:.1f}x"
+            )
+
+            results = await asyncio.to_thread(
+                execute_bitunix_signal,
+                client=self.bitunix_client,
+                symbol=signal.symbol,
+                is_long=signal.is_long,
+                leverage=signal.leverage,
+                stop_loss=signal.stop_loss,
+                take_profits=bx_tps,
+                size_usd=size_usd,
+                margin_mode=self.cfg.bitunix_margin_mode,
+                dry_run=self.cfg.dry_run,
+            )
+
+            open_data = results.get("open") or {}
+            bitunix_position_id = results.get("position_id")
+            entry_price = float(open_data.get("price") or signal.entry_mid or signal.entry_low or 0)
+
+            # Create internal Position object for tracking
+            # Use bx_tps (with BX_TP overrides applied) instead of signal.take_profits
+            pos_id = str(uuid.uuid4())
+            position = Position(
+                id=pos_id,
+                symbol=signal.symbol,
+                side=signal.side,
+                size_usd=size_usd,
+                leverage=signal.leverage,
+                entry_price=entry_price,
+                stop_loss=signal.stop_loss,
+                take_profits=[
+                    TakeProfitLevel(price=tp.price, percentage=tp.close_pct)
+                    for tp in bx_tps
+                ],
+                market_addr=f"bitunix:{bitunix_position_id or 'unknown'}",
+                opened_at=time.time(),
+                wallet_id=wallet_id,
+                original_size_usd=size_usd,
+                exchange="bitunix",
+                bitunix_position_id=bitunix_position_id,
+            )
+            position.tx_hash = f"bitunix:{open_data.get('orderId', 'unknown')}"
+
+            # Register TP orders for monitoring
+            tp_results = results.get("tp", [])
+            if tp_results and hasattr(self, 'register_bitunix_tp_orders'):
+                self.register_bitunix_tp_orders(pos_id, tp_results)
+
+            # Record order history
+            position.order_history.append({
+                "order_type": "open", "exchange": "bitunix",
+                "orderId": open_data.get("orderId"),
+                "price": entry_price, "qty": open_data.get("qty"),
+                "status": "placed", "timestamp": time.time(),
+            })
+            for tp_r in tp_results:
+                position.order_history.append({
+                    "order_type": "tp", "exchange": "bitunix",
+                    "orderId": tp_r.get("orderId"), "price": tp_r.get("price"),
+                    "pct": tp_r.get("pct"),
+                    "status": "placed" if tp_r.get("orderId") else "failed",
+                    "error": tp_r.get("error"), "timestamp": time.time(),
+                })
+            sl_result = results.get("sl")
+            position.order_history.append({
+                "order_type": "sl", "exchange": "bitunix",
+                "orderId": sl_result, "price": signal.stop_loss,
+                "status": "placed" if sl_result else "failed",
+                "timestamp": time.time(),
+            })
+
+            # Critical alert if TP/SL failed
+            if results.get("tp_sl_failed"):
+                await self.notify(
+                    f"**CRITICAL** [BITUNIX] {signal.symbol} {signal.side}\n"
+                    f"Position OPEN but TP/SL orders FAILED!\n"
+                    f"Position is UNPROTECTED. Use /close or add orders manually."
+                )
+
+            failed_tps = [r for r in tp_results if not r.get("orderId")]
+            placed_tps = [r for r in tp_results if r.get("orderId")]
+
+            collateral = size_usd / signal.leverage if signal.leverage else size_usd
+            tp_list = "\n".join(
+                f"  TP{i+1}: ${tp.price:,.2f} ({tp.close_pct:.0%})"
+                for i, tp in enumerate(bx_tps)
+            )
+            status_parts = []
+            if placed_tps:
+                status_parts.append(f"{len(placed_tps)} TP placed")
+            if failed_tps:
+                status_parts.append(f"{len(failed_tps)} TP FAILED")
+            status_parts.append(f"SL {'placed' if sl_result else 'FAILED'}")
+
+            await self.notify(
+                f"**Position Opened** [BITUNIX]\n"
+                f"{signal.symbol} {signal.side} {signal.leverage:.0f}x\n"
+                f"Entry: ${entry_price:,.2f}\n"
+                f"Size: ${size_usd:,.2f} (${collateral:,.2f} collateral)\n"
+                f"SL: ${signal.stop_loss:,.2f}\n"
+                f"{tp_list}\n"
+                f"Orders: {', '.join(status_parts)}"
+            )
+
+            self.logger.info(
+                f"[BITUNIX] Position opened: {signal.symbol} {signal.side} "
+                f"pos_id={bitunix_position_id} entry=${entry_price:,.2f}"
+            )
+            return position, "market"
+
+        except Exception as e:
+            self.logger.error(f"[BITUNIX] Failed to execute open: {e}\n{traceback.format_exc()}")
+            await self.notify(f"[BITUNIX] Failed to open {signal.symbol} {signal.side}: {e}")
+            return None, None
+
+    async def _execute_open_gmx(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None, wallet_id: int = 1) -> tuple:
         """Execute a full open signal on-chain: MarketIncrease/LimitIncrease + TPs + SL.
 
         Returns (Position, order_type) where order_type is "market" or "limit", or (None, None) on failure."""
@@ -2198,6 +2608,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 continue
             if not pos.market_addr:
                 continue
+            # Skip Bitunix positions — they are monitored separately
+            if getattr(pos, 'exchange', 'gmx') == 'bitunix':
+                continue
             # Guard: if closed_at is already set, another coroutine beat us
             if pos.closed_at is not None:
                 continue
@@ -2425,6 +2838,40 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 # Track liquidation in health stats
                 if is_liquidation:
                     self.health_stats["liquidations"] = self.health_stats.get("liquidations", 0) + 1
+
+                # Mirror mode: auto-close the paired Bitunix position
+                if self.exchange_mode == "mirror" and self.bitunix_client:
+                    try:
+                        mirror_pos = next(
+                            (p for p in self.positions.values()
+                             if p.is_open
+                             and getattr(p, 'exchange', 'gmx') == 'bitunix'
+                             and p.symbol == pos.symbol
+                             and p.side == pos.side),
+                            None,
+                        )
+                        if mirror_pos:
+                            self.logger.info(
+                                f"[MIRROR] GMX {pos.symbol} closed — auto-closing Bitunix mirror"
+                            )
+                            closed = await self.close_bitunix_position(mirror_pos)
+                            if closed:
+                                mirror_pos.is_open = False
+                                mirror_pos.closed_at = time.time()
+                                mirror_pos.exit_reason = f"mirror_close:{exit_reason}"
+                                await self._record_trade(mirror_pos, exit_reason=mirror_pos.exit_reason)
+                                self._clear_position_state(mirror_pos)
+                                await self.notify(
+                                    f"[MIRROR] Bitunix {pos.symbol} {pos.side} auto-closed "
+                                    f"(GMX {exit_reason})"
+                                )
+                            else:
+                                await self.notify(
+                                    f"⚠️ [MIRROR] Failed to auto-close Bitunix {pos.symbol} {pos.side}. "
+                                    f"Use /close {pos.symbol} to close manually."
+                                )
+                    except Exception as me:
+                        self.logger.warning(f"[MIRROR] Failed to auto-close Bitunix: {me}")
 
             except Exception as e:
                 self.logger.debug(f"Failed to check position close for {pos.symbol}: {e}")

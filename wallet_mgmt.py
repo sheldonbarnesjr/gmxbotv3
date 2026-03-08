@@ -47,25 +47,30 @@ class WalletMixin:
     """
 
     def _get_account(self, wallet_id: int) -> Account:
-        """Get the Account object for a given wallet_id (1-4)."""
+        """Get the Account object for a given wallet_id (1-4).
+
+        Falls back to W1 if the requested wallet is not configured (with warning).
+        """
         if wallet_id == 4 and self.account4:
             return self.account4
         if wallet_id == 3 and self.account3:
             return self.account3
         if wallet_id == 2 and self.account2:
             return self.account2
-        if wallet_id != 1:
-            self.logger.warning(f"Wallet {wallet_id} not configured, falling back to W1")
+        if wallet_id not in (1, 2, 3, 4):
+            self.logger.error(f"Invalid wallet_id={wallet_id} — falling back to W1")
+        elif wallet_id != 1:
+            self.logger.warning(f"Wallet W{wallet_id} not configured — falling back to W1")
         return self.account
 
     def _all_wallets(self) -> List[tuple]:
         """Return list of (wallet_id, account) for all configured wallets."""
         wallets = [(1, self.account)]
-        if self.account2:
+        if self.account2 and hasattr(self.account2, 'address'):
             wallets.append((2, self.account2))
-        if self.account3:
+        if self.account3 and hasattr(self.account3, 'address'):
             wallets.append((3, self.account3))
-        if self.account4:
+        if self.account4 and hasattr(self.account4, 'address'):
             wallets.append((4, self.account4))
         return wallets
 
@@ -81,15 +86,10 @@ class WalletMixin:
         return wallets
 
     async def _pick_wallet(self, symbol: str, trade_type: str = "scalp", *, is_long: bool = True) -> tuple:
-        """Pick which wallet to use for a new position based on trade type.
+        """Pick the first available wallet for a new position.
 
-        Routing logic:
-          - swing/long-term → W1 only
-          - scalp → W2, W3, W4 (first available without that symbol+side)
-
+        All wallets are equal — W1 is tried first (priority), then W2, W3, W4.
         A wallet is only "busy" if it has the same symbol AND same side open.
-        E.g. a BTC SHORT on W2 does NOT block a new BTC SHORT with different
-        leverage/TPs from going on W3.
 
         Queries ON-CHAIN positions (not just internal tracking) so the bot
         is aware of positions opened manually or before a reboot.
@@ -99,15 +99,8 @@ class WalletMixin:
         if not market_addr:
             return 1, self.account  # unknown symbol, default to W1
 
-        if trade_type == "swing":
-            # Swing trades → only W1
-            wallets = [(1, self.account)]
-        else:
-            # Scalp trades → W2, W3, W4
-            wallets = self._scalp_wallets()
-            if not wallets:
-                # No scalp wallets configured, fall back to all wallets
-                wallets = self._all_wallets()
+        # All wallets treated equally, W1 has priority
+        wallets = self._all_wallets()
 
         skip_reasons = []
         for wid, acct in wallets:
@@ -133,7 +126,7 @@ class WalletMixin:
                 ]
                 if not matching:
                     self.logger.info(
-                        f"W{wid} ({acct.address[:10]}...) free for {symbol} {side_label} — selected [{trade_type}]"
+                        f"W{wid} ({acct.address[:10]}...) free for {symbol} {side_label} — selected"
                     )
                     return wid, acct
                 else:
@@ -148,7 +141,7 @@ class WalletMixin:
 
         # Store rejection details so caller can show them
         detail = "; ".join(skip_reasons) if skip_reasons else "unknown"
-        self.logger.warning(f"No wallet for {symbol} {side_label} [{trade_type}]: {detail}")
+        self.logger.warning(f"No wallet for {symbol} {side_label}: {detail}")
         self._last_wallet_reject_reason = detail
         return None, None
 

@@ -562,9 +562,17 @@ class SLTPMixin:
             total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
             if total_decreased > 0:
                 base_size = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
-                remaining_size = max(base_size - total_decreased, 0.01)
+                remaining_size = max(base_size - total_decreased, 0.0)
             else:
                 remaining_size = pos.size_usd
+
+            # Skip SL placement if remaining size is dust (below min position)
+            if remaining_size < cfg.min_position_usd:
+                self.logger.info(
+                    f"{pos.symbol} {pos.side}: remaining size ${remaining_size:.2f} below "
+                    f"min ${cfg.min_position_usd:.0f} — skipping SL placement"
+                )
+                return
 
             # 2. Create new SL order at new price (with retry)
             MAX_SL_ATTEMPTS = 3
@@ -712,6 +720,15 @@ class SLTPMixin:
         except Exception as e:
             self.logger.error(f"Error in move_sl: {e}")
             pos.sl_move_failed = True
+            self._save_position_state()
+            try:
+                await self.notify(
+                    f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                    f"SL move failed unexpectedly: {e}\n"
+                    f"Position may be UNPROTECTED — check manually."
+                )
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command: /sl <#> <target>

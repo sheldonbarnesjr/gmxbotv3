@@ -17,9 +17,9 @@ logger = logging.getLogger("GMXBot.risk")
 # Position sizing
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def cap_leverage(leverage: float, max_leverage: float) -> float:
-    """Clamp leverage to the maximum allowed."""
-    return max(1.0, min(leverage, max_leverage))
+def cap_leverage(leverage: float, max_leverage: float, min_leverage: float = 5.0) -> float:
+    """Clamp leverage between min and max allowed."""
+    return max(min_leverage, min(leverage, max_leverage))
 
 
 def calculate_position_size(

@@ -183,6 +183,7 @@ class Config:
     markets: Dict[str, str] = field(default_factory=dict)
 
     # ── Trading ──
+    min_leverage: float = 5.0
     max_leverage: float = 10.0
     max_position_usd: float = 50000.0
     min_position_usd: float = 2.0
@@ -205,6 +206,15 @@ class Config:
     heartbeat_interval: int = 30
     halt_on_price_stale: int = 120
     auto_resume_after: int = 300
+
+    # ── Bitunix ──
+    bitunix_api_key: str = ""
+    bitunix_secret_key: str = ""
+    bitunix_margin_mode: str = "ISOLATION"  # "ISOLATION" or "CROSS"
+
+    # ── Exchange Mode ──
+    # "gmx" = GMX only, "bitunix" = Bitunix only, "mirror" = both execute same trades
+    exchange_mode: str = "gmx"
 
     # ── Logging ──
     log_level: str = "INFO"
@@ -267,6 +277,7 @@ def load_config() -> Config:
         markets=markets,
 
         # Trading
+        min_leverage=_env_float("MIN_LEVERAGE", 5.0),
         max_leverage=_env_float("MAX_LEVERAGE", 10.0),
         max_position_usd=_env_float("MAX_POSITION_USD", 50000.0),
         min_position_usd=_env_float("MIN_POSITION_USD", 2.0),
@@ -289,6 +300,14 @@ def load_config() -> Config:
         heartbeat_interval=_env_int("HEARTBEAT_INTERVAL", 30),
         halt_on_price_stale=_env_int("HALT_ON_PRICE_STALE", 120),
         auto_resume_after=_env_int("AUTO_RESUME_AFTER", 300),
+
+        # Bitunix
+        bitunix_api_key=_env("BITUNIX_API_KEY", ""),
+        bitunix_secret_key=_env("BITUNIX_SECRET_KEY", ""),
+        bitunix_margin_mode=(_env("BITUNIX_MARGIN_MODE", "") or _env("MARGIN_MODE", "ISOLATION")).upper(),
+
+        # Exchange mode
+        exchange_mode=_env("EXCHANGE_MODE", "gmx").lower(),
 
         # Logging
         log_level=_env("LOG_LEVEL", "INFO").upper(),

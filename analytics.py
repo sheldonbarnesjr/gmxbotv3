@@ -68,6 +68,7 @@ class TradeRecord:
     opened_at: float
     closed_at: float
     wallet_id: int = 0  # 0 = unknown (legacy records), 1-4 = wallet
+    exchange: str = "gmx"  # "gmx" or "bitunix"
 
 
 class AnalyticsMixin:
@@ -110,6 +111,89 @@ class AnalyticsMixin:
             "avg_loss": sum(t.pnl_usd for t in losses) / len(losses) if losses else 0,
             "pnl": total_pnl,
         }
+
+    def calculate_platform_stats(self, exchange: str = None) -> Dict[str, Any]:
+        """Calculate performance stats optionally filtered by exchange platform."""
+        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        if exchange:
+            trades = [t for t in trades if getattr(t, 'exchange', 'gmx') == exchange]
+
+        if not trades:
+            return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0,
+                    "avg_win": 0, "avg_loss": 0, "pnl": 0, "best": 0, "worst": 0}
+
+        wins = [t for t in trades if t.pnl_usd > 0]
+        losses = [t for t in trades if t.pnl_usd < 0]
+        total_pnl = sum(t.pnl_usd for t in trades)
+
+        return {
+            "win_rate": len(wins) / len(trades) * 100 if trades else 0,
+            "wins": len(wins),
+            "losses": len(losses),
+            "total": len(trades),
+            "avg_win": sum(t.pnl_usd for t in wins) / len(wins) if wins else 0,
+            "avg_loss": sum(t.pnl_usd for t in losses) / len(losses) if losses else 0,
+            "pnl": total_pnl,
+            "best": max((t.pnl_usd for t in trades), default=0),
+            "worst": min((t.pnl_usd for t in trades), default=0),
+        }
+
+    def get_platform_comparison(self) -> str:
+        """Generate a formatted platform performance comparison message."""
+        gmx = self.calculate_platform_stats("gmx")
+        bx = self.calculate_platform_stats("bitunix")
+        combined = self.calculate_platform_stats()
+
+        gmx_open = [p for p in self.positions.values() if p.is_open and p.exchange == "gmx"]
+        bx_open = [p for p in self.positions.values() if p.is_open and p.exchange == "bitunix"]
+        gmx_exposure = sum(p.size_usd for p in gmx_open)
+        bx_exposure = sum(p.size_usd for p in bx_open)
+        gmx_upnl = sum(p.unrealized_pnl for p in gmx_open)
+        bx_upnl = sum(p.unrealized_pnl for p in bx_open)
+
+        def _fmt_stats(label: str, stats: dict, n_open: int, exposure: float, upnl: float) -> str:
+            if stats["total"] == 0 and n_open == 0:
+                return f"**{label}:** No trades\n"
+            wr = f"{stats['win_rate']:.1f}%" if stats["total"] else "N/A"
+            pnl_sign = "+" if stats["pnl"] >= 0 else ""
+            upnl_sign = "+" if upnl >= 0 else ""
+            lines = [f"**{label}**"]
+            if n_open > 0:
+                lines.append(f"  Open: {n_open} (${exposure:,.0f} exposure)")
+                lines.append(f"  Unrealized: {upnl_sign}${upnl:,.2f}")
+            if stats["total"] > 0:
+                lines.append(f"  Closed: {stats['total']} ({stats['wins']}W / {stats['losses']}L)")
+                lines.append(f"  Win Rate: {wr}")
+                lines.append(f"  Realized PnL: {pnl_sign}${stats['pnl']:,.2f}")
+                lines.append(f"  Avg Win: ${stats['avg_win']:,.2f}")
+                lines.append(f"  Avg Loss: ${stats['avg_loss']:,.2f}")
+                lines.append(f"  Best: ${stats['best']:+,.2f}")
+                lines.append(f"  Worst: ${stats['worst']:+,.2f}")
+            return "\n".join(lines) + "\n"
+
+        msg = "**Platform Performance**\n\n"
+        msg += _fmt_stats("GMX (On-Chain)", gmx, len(gmx_open), gmx_exposure, gmx_upnl)
+        msg += "\n"
+        msg += _fmt_stats("Bitunix (CEX)", bx, len(bx_open), bx_exposure, bx_upnl)
+
+        if combined["total"] > 0:
+            total_upnl = gmx_upnl + bx_upnl
+            total_sign = "+" if (combined["pnl"] + total_upnl) >= 0 else ""
+            msg += (
+                f"\n**Combined**\n"
+                f"  Total Trades: {combined['total']}\n"
+                f"  Win Rate: {combined['win_rate']:.1f}%\n"
+                f"  Realized: {'+'if combined['pnl']>=0 else ''}${combined['pnl']:,.2f}\n"
+                f"  Unrealized: {'+'if total_upnl>=0 else ''}${total_upnl:,.2f}\n"
+                f"  Net: {total_sign}${combined['pnl'] + total_upnl:,.2f}"
+            )
+
+        return msg
+
+    async def cmd_performance(self, chat_id: int):
+        """Send platform performance comparison to admin."""
+        msg = self.get_platform_comparison()
+        await self.send_message(chat_id, msg)
 
     async def calculate_win_rate_onchain(self, symbol: str = None, n: int = None) -> Dict[str, Any]:
         """Calculate win rate from on-chain PositionDecrease events (fee-inclusive PnL).
@@ -242,11 +326,12 @@ class AnalyticsMixin:
             opened_at=pos_obj.opened_at,
             closed_at=pos_obj.closed_at,
             wallet_id=getattr(pos_obj, 'wallet_id', 0),
+            exchange=getattr(pos_obj, 'exchange', 'gmx'),
         )
         self.trade_history.append(trade)
         self._save_trade_history()
         self.logger.info(
-            f"Trade recorded: {trade.symbol} {trade.side} "
+            f"Trade recorded: {trade.symbol} {trade.side} [{trade.exchange.upper()}] "
             f"PnL=${trade.pnl_usd:,.2f} ({trade.pnl_percentage:+.1f}%) [{exit_reason}]"
         )
 
@@ -567,6 +652,38 @@ class AnalyticsMixin:
         msg += "\n".join(today_lines)
         msg += "\n\n" + format_section("30 Days", month_stats)
         msg += "\n\n" + format_section("All Time", alltime_stats)
+
+        # ── Bitunix platform breakdown (from internal trade history) ──
+        bx_trades = [t for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix' and abs(t.pnl_usd) >= 1]
+        bx_open = [p for p in self.positions.values() if p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix']
+        if bx_trades or bx_open:
+            bx_today = [t for t in bx_trades if t.closed_at >= today_cutoff]
+            bx_month = [t for t in bx_trades if t.closed_at >= month_cutoff]
+            bx_upnl = sum(p.unrealized_pnl or 0 for p in bx_open)
+
+            def _bx_bucket(trades_list):
+                if not trades_list:
+                    return {"pnl": 0.0, "trades": 0, "wins": 0}
+                pnl = sum(t.pnl_usd for t in trades_list)
+                wins = sum(1 for t in trades_list if t.pnl_usd > 0)
+                return {"pnl": pnl, "trades": len(trades_list), "wins": wins}
+
+            def _bx_line(label, stats, unrealized=None):
+                wr = f"{stats['wins']}/{stats['trades']}" if stats["trades"] else "—"
+                wr_pct = f" | {stats['wins']/stats['trades']*100:.0f}% WR" if stats["trades"] else ""
+                line = f"  {label}: {_sign(stats['pnl'])}${stats['pnl']:,.2f}  ({wr}{wr_pct})"
+                if unrealized is not None and unrealized != 0:
+                    line += f"  |  open: {_sign(unrealized)}${unrealized:,.2f}"
+                return line
+
+            msg += "\n\n**Bitunix PnL**"
+            if bx_open:
+                msg += f" ({len(bx_open)} open)"
+            msg += "\n"
+            msg += _bx_line("Today", _bx_bucket(bx_today), bx_upnl) + "\n"
+            msg += _bx_line("30 Days", _bx_bucket(bx_month)) + "\n"
+            msg += _bx_line("All Time", _bx_bucket(bx_trades))
+
         await self.send_message(chat_id, msg)
 
     # ──────────────────────────────────────────────────────────────────────
