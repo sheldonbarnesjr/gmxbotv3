@@ -700,16 +700,46 @@ class WalletMixin:
             else:
                 change_str = ""
 
+            # Bitunix balance
+            bx_section = ""
+            bx_client = getattr(self, "bitunix_client", None)
+            ex_mode = getattr(self, "exchange_mode", "gmx")
+            if bx_client and ex_mode in ("bitunix", "mirror"):
+                try:
+                    from bitunix_executor import get_bitunix_balance, get_bitunix_positions
+                    bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
+                    bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
+                    bx_deployed = 0.0
+                    bx_pnl = 0.0
+                    for bp in bx_positions:
+                        bx_deployed += float(bp.get("margin", 0))
+                        bx_pnl += float(bp.get("unrealizedPNL", 0))
+                    bx_total = bx_bal + bx_deployed + bx_pnl
+                    bx_collateral = bx_total * cfg.portfolio_pct
+                    bx_pnl_sign = "+" if bx_pnl >= 0 else ""
+                    bx_pnl_pct = f" ({bx_pnl / bx_deployed * 100:+.1f}%)" if bx_deployed > 0 else ""
+                    bx_section = (
+                        "\n\n**Bitunix (CEX)**\n"
+                        f"Available USDT: ${bx_bal:,.2f}\n"
+                        f"Deployed Margin: ${bx_deployed:,.2f} | Positions: {len(bx_positions)}\n"
+                        f"Unrealized PnL: {bx_pnl_sign}${bx_pnl:,.2f}{bx_pnl_pct}\n"
+                        f"**Bitunix Total: ${bx_total:,.2f}**\n"
+                        f"Collateral/trade: ${bx_collateral:,.2f} ({cfg.portfolio_pct:.0%} of ${bx_total:,.2f})"
+                    )
+                except Exception as e:
+                    bx_section = f"\n\n**Bitunix (CEX)**\nError fetching balance: {e}"
+
             pnl_pct_str = f" ({total_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
             msg = (
-                "**Wallet Balance**\n\n"
+                "**GMX (On-Chain)**\n\n"
                 + "\n".join(wallet_lines)
-                + "\n\n**Combined**\n"
+                + "\n\n**Combined GMX**\n"
                 f"Free USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f}\n"
                 f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}{pnl_pct_str}\n"
-                f"**Total Portfolio: ${total_portfolio:,.2f}**{change_str}\n"
+                f"**GMX Total: ${total_portfolio:,.2f}**{change_str}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of ${total_portfolio:,.2f})"
+                + bx_section
             )
             await self.send_message(chat_id, msg)
         except Exception as e:
