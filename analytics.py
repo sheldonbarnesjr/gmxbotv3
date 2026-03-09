@@ -308,7 +308,7 @@ class AnalyticsMixin:
             side=pos_obj.side,
             entry_price=pos_obj.entry_price,
             exit_price=exit_price,
-            size_usd=pos_obj.size_usd,
+            size_usd=full_size,
             leverage=pos_obj.leverage,
             duration_hours=duration,
             pnl_usd=pnl_usd,
