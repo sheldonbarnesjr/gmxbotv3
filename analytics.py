@@ -201,15 +201,19 @@ class AnalyticsMixin:
         from collections import defaultdict
         from history import fetch_trade_history
 
-        # Clear local caches
-        self.trade_history = []
-        self._save_trade_history()
+        # Preserve Bitunix trades (not on-chain, would be lost otherwise)
+        bitunix_trades = [t for t in self.trade_history
+                          if getattr(t, 'exchange', 'gmx') == 'bitunix']
+
+        # Clear GMX trades and on-chain cache
+        self.trade_history = list(bitunix_trades)
         self._save_onchain_trades([])
 
         # Fetch fresh on-chain events across all wallets
         on_chain = await self._fetch_and_store_trades()
         if not on_chain:
-            self.logger.info("Trade rebuild: no on-chain events found")
+            self._save_trade_history()
+            self.logger.info("Trade rebuild: no on-chain events found (kept %d Bitunix trades)", len(bitunix_trades))
             return
 
         # Build market → symbol map
@@ -262,7 +266,9 @@ class AnalyticsMixin:
                 (last_event.get("timestamp", 0) - first_event.get("timestamp", 0)) / 3600,
                 0,
             )
-            pnl_pct = (total_pnl / total_size * 100) if total_size > 0 else 0
+            # PnL % cannot be accurately calculated without leverage info
+            # from on-chain data alone — set to 0 (shown as N/A in PDF)
+            pnl_pct = 0.0
 
             trade = TradeRecord(
                 id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
@@ -284,8 +290,9 @@ class AnalyticsMixin:
 
         self.trade_history.sort(key=lambda t: t.closed_at)
         self._save_trade_history()
+        gmx_count = len(self.trade_history) - len(bitunix_trades)
         self.logger.info(
-            f"Trade rebuild: {len(self.trade_history)} grouped trade(s) "
+            f"Trade rebuild: {gmx_count} GMX + {len(bitunix_trades)} Bitunix trade(s) "
             f"from {len(on_chain)} on-chain event(s)"
         )
 
@@ -967,7 +974,7 @@ class AnalyticsMixin:
         pdf.cell(0, 7, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
-        CARD_H = 22  # height per trade card (4 lines)
+        CARD_H = 27  # height per trade card (5 lines)
         row_y = pdf.get_y()
 
         for i, t in enumerate(unified):
@@ -984,7 +991,7 @@ class AnalyticsMixin:
             pnl = t["pnl_usd"]
             pnl_sign = _s(pnl)
             pct = t.get("pnl_percentage", 0)
-            pct_sign = "+" if pct >= 0 else ""
+            lev = t.get("leverage", 0)
             exch = t.get("exchange", "gmx").upper()
             ts = t["timestamp"]
             date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d, %I:%M %p") if ts else "Unknown"
@@ -999,16 +1006,24 @@ class AnalyticsMixin:
             pdf.cell(COL_W, LINE_H, f"#{i+1} {t['symbol']} {t['side']} {exch}")
             y += LINE_H
 
-            # PnL with %
+            # PnL with % (only show % if leverage is known)
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 7.5)
             pdf.set_xy(x, y)
-            pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)")
+            if lev and lev > 0 and pct != 0:
+                pct_sign = "+" if pct >= 0 else ""
+                pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)")
+            else:
+                pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f}")
             y += LINE_H
 
-            # Size
+            # Size + Collateral
             pdf.set_xy(x, y)
-            pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f}")
+            if lev and lev > 0:
+                collateral = t["size_usd"] / lev
+                pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  (${collateral:,.2f})")
+            else:
+                pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f}")
             y += LINE_H
 
             # Date

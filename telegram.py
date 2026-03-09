@@ -186,6 +186,8 @@ class CoreTelegramMixin:
                     return
                 if event.chat_id in self.pending_withdraw:
                     await self.handle_withdraw_reply(event.chat_id, text)
+                elif event.chat_id in self.pending_fund:
+                    await self.handle_fund_reply(event.chat_id, text)
                 elif event.chat_id in self.pending_collateral:
                     await self.handle_collateral_reply(event.chat_id, text)
                 elif event.chat_id in self.pending_signals:
@@ -302,6 +304,8 @@ class CoreTelegramMixin:
             elif cmd == "/confirm":
                 if chat_id in self.pending_withdraw:
                     await self.handle_withdraw_reply(chat_id, "CONFIRM")
+                elif chat_id in self.pending_fund:
+                    await self.handle_fund_reply(chat_id, "CONFIRM")
                 elif chat_id in self.pending_collateral:
                     await self.handle_collateral_reply(chat_id, "CONFIRM")
                 else:
@@ -337,6 +341,9 @@ class CoreTelegramMixin:
             elif cmd == "/wallet":
                 arg = " ".join(parts[1:]) if len(parts) > 1 else None
                 await self.cmd_wallet(chat_id, arg)
+            elif cmd == "/fund":
+                arg = " ".join(parts[1:]) if len(parts) > 1 else None
+                await self.cmd_fund_bitunix(chat_id, arg)
             elif cmd == "/cancel":
                 if chat_id in self.pending_withdraw:
                     state = self.pending_withdraw[chat_id].get("state", "")
@@ -348,6 +355,9 @@ class CoreTelegramMixin:
                             chat_id,
                             "Cannot cancel — transfer already in progress."
                         )
+                elif chat_id in self.pending_fund:
+                    del self.pending_fund[chat_id]
+                    await self.send_message(chat_id, "Fund transfer cancelled.")
                 elif chat_id in self.pending_closes:
                     del self.pending_closes[chat_id]
                     await self.send_message(chat_id, "Close cancelled.")
@@ -1817,7 +1827,7 @@ class CoreTelegramMixin:
         self.logger.info(f"PnL Update sent: today={t_sign}${today_total:,.2f}")
 
     async def send_weekly_summary(self):
-        """Send weekly summary with lifetime stats."""
+        """Send weekly summary with lifetime stats + trade history PDF."""
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
 
@@ -1840,6 +1850,27 @@ class CoreTelegramMixin:
 
         await self.notify(msg)
         self.logger.info(f"Weekly summary sent: lifetime PnL={l_sign}${lifetime_pnl:,.2f}")
+
+        # Attach trade history PDF
+        try:
+            PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
+            market_to_sym = {addr.lower(): sym for sym, addr in self.cfg.markets.items() if sym in PNL_SYMBOLS}
+            on_chain = await self._fetch_and_store_trades()
+            pdf_path = await asyncio.to_thread(self._generate_trade_pdf, on_chain, market_to_sym)
+
+            # Send via Telethon to notify_chat
+            if self.cfg.notify_chat and self.client:
+                await self.client.send_file(self.cfg.notify_chat, pdf_path, caption="Weekly Trade Report")
+
+            # Send via Bot API to admin DM
+            if self.cfg.telegram_bot_token and self.cfg.bot_admin_chat_id:
+                await self.send_admin_pdf(pdf_path, caption="Weekly Trade Report")
+
+            import os
+            os.remove(pdf_path)
+            self.logger.info("Weekly summary PDF sent")
+        except Exception as e:
+            self.logger.warning(f"Weekly summary PDF failed: {e}")
 
     # ── VIP Group Promo (weekly, 30 min after summary) ──
 
