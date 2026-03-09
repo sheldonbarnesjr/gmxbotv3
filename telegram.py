@@ -59,7 +59,7 @@ logger = logging.getLogger("GMXBot.telegram")
 # Help text
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HELP_TEXT = """**GMX V2 Bot Commands**
+HELP_TEXT = """**Trading Bot Commands**
 
 /balance — Wallet balances (auto-rebalances)
 /close — Close positions
@@ -444,48 +444,15 @@ class CoreTelegramMixin:
         is_halted = health["is_halted"]
         status = "HALTED" if is_halted else "ACTIVE"
         uptime_hours = health["uptime_seconds"] / 3600
-        heartbeat_age = time.time() - self.last_heartbeat
-        total_exposure = sum(p.size_usd for p in self.positions.values() if p.is_open)
-        wallet_lines = []
-        for wid, acct in self._all_wallets():
-            wallet_lines.append(f"W{wid}: {acct.address[:8]}...{acct.address[-6:]}")
-        wallet_str = "\n".join(wallet_lines) if wallet_lines else "N/A"
+        ex_mode = getattr(self, 'exchange_mode', 'gmx').upper()
+
         msg = (
-            "**GMX V2 Bot Status**\n\n"
+            "**Trading Bot Status**\n\n"
             f"Status: {status}\n"
             f"Mode: {'DRY RUN' if cfg.dry_run else 'LIVE'}\n"
-            f"Exchange: {getattr(self, 'exchange_mode', 'gmx').upper()}\n"
-            f"{wallet_str}\n"
-            f"Network: {cfg.network.upper()}\n"
-            f"Uptime: {uptime_hours:.1f}h\n"
-            f"Heartbeat: {heartbeat_age:.0f}s ago\n\n"
-            f"Positions: {health['open_positions']}/{health['total_positions']}\n"
-            f"Exposure: ${total_exposure:.0f}\n"
-            f"Price updates: {health['price_updates']}\n"
-            f"Signals: {health['signals_processed']}\n"
-            f"Trades: {health['trades_executed']}\n"
-            f"Errors: {health['errors']}"
+            f"Exchange: {ex_mode}\n"
+            f"Uptime: {uptime_hours:.1f}h"
         )
-        # Bitunix info when in bitunix/mirror mode
-        mode = getattr(self, 'exchange_mode', 'gmx')
-        if mode in ("bitunix", "mirror") and self.bitunix_client:
-            bx_open = [p for p in self.positions.values() if p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix']
-            bx_exposure = sum(p.size_usd for p in bx_open)
-            bx_upnl = sum(p.unrealized_pnl or 0 for p in bx_open)
-            upnl_sign = "+" if bx_upnl >= 0 else ""
-            msg += (
-                f"\n\n**BITUNIX**\n"
-                f"Positions: {len(bx_open)}\n"
-                f"Exposure: ${bx_exposure:,.0f}\n"
-                f"Unrealized: {upnl_sign}${bx_upnl:,.2f}"
-            )
-            try:
-                from bitunix_executor import get_bitunix_balance
-                bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
-                if bal:
-                    msg += f"\nAvailable: ${bal:,.2f}"
-            except Exception:
-                pass
         if is_halted:
             msg += f"\n\nHalt reason: {self.halt_reason}"
             msg += "\n\nUse `/status resume` to resume trading."
