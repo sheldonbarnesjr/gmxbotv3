@@ -265,6 +265,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Withdraw state: chat_id -> pending withdraw info
         self.pending_withdraw: Dict[int, Dict[str, Any]] = {}
+        self.pending_fund: Dict[int, Dict[str, Any]] = {}
 
         # Signal selection state: chat_id -> pending signal pick
         self.pending_signals: Dict[int, Dict[str, Any]] = {}
@@ -558,12 +559,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         self.logger.info(f"Exchange mode: {self.exchange_mode.upper()}")
 
-        # Load persisted trade history (PnL / win rate data)
-        self._load_trade_history()
-
         # Sync on-chain positions into internal tracking (survives reboots)
         # skip_sl_check=True: SL is already correct on-chain, don't infer & move
         await self._sync_on_chain_positions(skip_sl_check=True)
+
+        # Rebuild trade history from on-chain data (clear + re-fetch + group)
+        # This ensures a clean state every restart, grouping all position
+        # decreases for the same trade into a single aggregated record.
+        try:
+            await self._rebuild_trade_history_from_chain()
+        except Exception as e:
+            self.logger.warning(f"Trade history rebuild failed: {e}")
+            self._load_trade_history()  # fallback to persisted data
 
         # Load persisted failed orders for retry
         self.failed_order_queue = self._load_failed_orders()

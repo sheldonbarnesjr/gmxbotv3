@@ -45,7 +45,7 @@ ONCHAIN_TRADES_FILE = "onchain_trades.json"
 
 # Only show trades from this date forward (UTC midnight).
 # Change this date to reset your trade history starting point.
-TRADE_START_DATE = "2026-03-06"
+TRADE_START_DATE = "2026-03-07"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -190,6 +190,105 @@ class AnalyticsMixin:
 
         return msg
 
+    async def _rebuild_trade_history_from_chain(self):
+        """Clear and rebuild trade history from on-chain PositionDecrease events.
+
+        Groups all decrease events by (market, direction) into single aggregated
+        trades so that multiple TP hits for the same position appear as one trade.
+        Excludes currently-open positions (their events are still in-flight).
+        Called on every startup to ensure a clean, accurate state.
+        """
+        from collections import defaultdict
+        from history import fetch_trade_history
+
+        # Clear local caches
+        self.trade_history = []
+        self._save_trade_history()
+        self._save_onchain_trades([])
+
+        # Fetch fresh on-chain events across all wallets
+        on_chain = await self._fetch_and_store_trades()
+        if not on_chain:
+            self.logger.info("Trade rebuild: no on-chain events found")
+            return
+
+        # Build market → symbol map
+        market_to_sym = {}
+        for sym, addr in self.cfg.markets.items():
+            market_to_sym[addr.lower()] = sym
+
+        # Identify currently-open positions so we can exclude their events
+        open_keys = set()
+        for pos in self.positions.values():
+            if pos.is_open and pos.market_addr:
+                is_long = pos.side == "LONG"
+                open_keys.add((pos.market_addr.lower(), is_long))
+
+        # Group events by (market_address, is_long)
+        # On GMX each account has at most one position per (market, direction)
+        # at a time, so all decreases in the same group belong to the same trade.
+        groups = defaultdict(list)
+        for t in on_chain:
+            key = (t.get("market_address", "").lower(), t.get("is_long", True))
+            groups[key].append(t)
+
+        for (market, is_long), events in groups.items():
+            # Skip events belonging to still-open positions
+            if (market, is_long) in open_keys:
+                continue
+
+            sym = market_to_sym.get(market)
+            if not sym:
+                continue
+
+            side = "LONG" if is_long else "SHORT"
+
+            def _net(e):
+                return e.get("net_pnl_usd", e.get("pnl_usd", 0))
+
+            total_pnl = sum(_net(e) for e in events)
+            total_size = sum(e.get("size_delta_usd", 0) for e in events)
+
+            if abs(total_pnl) < 1:
+                continue  # skip dust
+
+            events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
+            last_event = events_sorted[-1]
+            first_event = events_sorted[0]
+            exit_price = last_event.get("execution_price", 0)
+            entry_price = first_event.get("execution_price", 0)
+
+            duration_hours = max(
+                (last_event.get("timestamp", 0) - first_event.get("timestamp", 0)) / 3600,
+                0,
+            )
+            pnl_pct = (total_pnl / total_size * 100) if total_size > 0 else 0
+
+            trade = TradeRecord(
+                id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
+                symbol=sym,
+                side=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                size_usd=total_size,
+                leverage=0,
+                duration_hours=duration_hours,
+                pnl_usd=total_pnl,
+                pnl_percentage=pnl_pct,
+                exit_reason="on-chain",
+                opened_at=first_event.get("timestamp", 0),
+                closed_at=last_event.get("timestamp", 0),
+                exchange="gmx",
+            )
+            self.trade_history.append(trade)
+
+        self.trade_history.sort(key=lambda t: t.closed_at)
+        self._save_trade_history()
+        self.logger.info(
+            f"Trade rebuild: {len(self.trade_history)} grouped trade(s) "
+            f"from {len(on_chain)} on-chain event(s)"
+        )
+
     async def cmd_performance(self, chat_id: int):
         """Send platform performance comparison to admin."""
         msg = self.get_platform_comparison()
@@ -215,16 +314,8 @@ class AnalyticsMixin:
         for sym, addr in self.cfg.markets.items():
             market_to_sym[addr.lower()] = sym
 
-        def _net(t):
-            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
-
-        trades = []
-        for t in all_trades:
-            if abs(_net(t)) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                trades.append({"pnl": _net(t), "sym": sym})
+        # Group by position (market + direction) so TPs count as one trade
+        trades = self._group_onchain_trades(all_trades, market_to_sym)
 
         if symbol:
             trades = [t for t in trades if t["sym"] == symbol.upper()]
@@ -407,20 +498,9 @@ class AnalyticsMixin:
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        # Fetch on-chain trades (merged with local store)
+        # Fetch on-chain trades and group by position (market + direction)
         all_trades = await self._fetch_and_store_trades()
-
-        def _net(t):
-            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
-
-        # Tag with symbol, exclude dust (< $1)
-        trades = []
-        for t in all_trades:
-            if abs(_net(t)) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                trades.append({"pnl": _net(t), "sym": sym})
+        trades = self._group_onchain_trades(all_trades, market_to_sym)
 
         if symbol:
             trades = [t for t in trades if t["sym"] == symbol.upper()]
@@ -459,6 +539,49 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command: /pnl
     # ──────────────────────────────────────────────────────────────────────
+
+    # ── On-chain trade grouping ──
+
+    def _group_onchain_trades(self, on_chain: List[Dict[str, Any]], market_to_sym: dict) -> List[Dict[str, Any]]:
+        """Group on-chain PositionDecrease events by (market, direction) into aggregated trades.
+
+        Returns a list of dicts with keys: sym, pnl, timestamp, market_address, is_long.
+        Each entry represents one logical trade (all decreases for the same position combined).
+        """
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for t in on_chain:
+            key = (t.get("market_address", "").lower(), t.get("is_long", True))
+            groups[key].append(t)
+
+        # Exclude currently-open positions
+        open_keys = set()
+        for pos in self.positions.values():
+            if pos.is_open and pos.market_addr:
+                is_long = pos.side == "LONG"
+                open_keys.add((pos.market_addr.lower(), is_long))
+
+        result = []
+        for (market, is_long), events in groups.items():
+            if (market, is_long) in open_keys:
+                continue
+            sym = market_to_sym.get(market)
+            if not sym:
+                continue
+
+            def _net(e):
+                return e.get("net_pnl_usd", e.get("pnl_usd", 0))
+
+            total_pnl = sum(_net(e) for e in events)
+            if abs(total_pnl) < 1:
+                continue
+            last_ts = max(e.get("timestamp", 0) for e in events)
+            result.append({"sym": sym, "pnl": total_pnl, "timestamp": last_ts,
+                           "market_address": market, "is_long": is_long})
+
+        result.sort(key=lambda x: x["timestamp"])
+        return result
 
     # ── On-chain trade local storage ──
 
@@ -553,36 +676,23 @@ class AnalyticsMixin:
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        # ── Fetch on-chain trades (merged with local store) ──
+        # ── Fetch on-chain trades, grouped by position (market + direction) ──
         all_trades = await self._fetch_and_store_trades()
-
-        def _net(t):
-            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
+        grouped = self._group_onchain_trades(all_trades, market_to_sym)
 
         def bucket_stats(trades_list):
             if not trades_list:
                 return {"pnl": 0.0, "trades": 0, "wins": 0}
-            pnl = sum(_net(t) for t in trades_list)
-            wins = sum(1 for t in trades_list if _net(t) > 0)
+            pnl = sum(t["pnl"] for t in trades_list)
+            wins = sum(1 for t in trades_list if t["pnl"] > 0)
             return {"pnl": pnl, "trades": len(trades_list), "wins": wins}
-
-        # Tag each trade with symbol, exclude dust trades (< $1 PnL)
-        tagged = []
-        for t in all_trades:
-            if abs(_net(t)) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                entry = dict(t)  # copy to avoid mutating stored data
-                entry["_sym"] = sym
-                tagged.append(entry)
 
         now_ts = int(time.time())
         month_cutoff = now_ts - 30 * 86400
 
-        today_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym and t["timestamp"] >= today_cutoff]) for sym in PNL_SYMBOLS}
-        month_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym and t["timestamp"] >= month_cutoff]) for sym in PNL_SYMBOLS}
-        alltime_stats = {sym: bucket_stats([t for t in tagged if t["_sym"] == sym]) for sym in PNL_SYMBOLS}
+        today_stats = {sym: bucket_stats([t for t in grouped if t["sym"] == sym and t["timestamp"] >= today_cutoff]) for sym in PNL_SYMBOLS}
+        month_stats = {sym: bucket_stats([t for t in grouped if t["sym"] == sym and t["timestamp"] >= month_cutoff]) for sym in PNL_SYMBOLS}
+        alltime_stats = {sym: bucket_stats([t for t in grouped if t["sym"] == sym]) for sym in PNL_SYMBOLS}
 
         # ── Open positions: unrealized from chain ──
         open_unrealized = {sym: 0.0 for sym in PNL_SYMBOLS}
