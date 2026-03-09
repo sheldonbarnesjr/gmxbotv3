@@ -854,10 +854,16 @@ class AnalyticsMixin:
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
     def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict) -> str:
-        """Build the PDF file with closed trade PnL summary + trade list."""
+        """Build the PDF file with 3-column PnL summary + 3-column trade grid."""
         ET = ZoneInfo("America/New_York")
+        LMARGIN = 10
+        PAGE_W = 210  # A4 width in mm
+        RMARGIN = 10
+        USABLE_W = PAGE_W - LMARGIN - RMARGIN  # 190mm
+        COL_W = USABLE_W / 3  # ~63.3mm per column
+        LINE_H = 5
 
-        # ── Use only fully-closed positions (trade_history), not partial TP hits ──
+        # ── Build unified trade list (GMX + Bitunix) ──
         unified = []
         for t in self.trade_history:
             unified.append({
@@ -866,153 +872,149 @@ class AnalyticsMixin:
                 "size_usd": t.size_usd,
                 "pnl_usd": t.pnl_usd,
                 "timestamp": t.closed_at,
-                "tx_hash": getattr(t, "tx_hash", "") or getattr(t, "id", ""),
-                "source": "local",
                 "entry_price": t.entry_price,
                 "exit_price": t.exit_price,
                 "leverage": t.leverage,
-                "exit_reason": t.exit_reason,
                 "pnl_percentage": t.pnl_percentage,
                 "exchange": getattr(t, "exchange", "gmx"),
             })
 
-        # Exclude dust trades (< $1 PnL) and sort newest first
-        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1 and t.get("exchange", "gmx") == "gmx"]
+        # Exclude dust trades (< $1 PnL), sort newest first
+        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1]
         unified.sort(key=lambda x: x["timestamp"], reverse=True)
 
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_page()
-
-        # ── Title ──
-        pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 12, "Closed Trades", new_x="LMARGIN", new_y="NEXT", align="C")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(
-            0, 6,
-            f"Generated: {datetime.now(ET).strftime('%b %d, %Y %I:%M %p ET')}",
-            new_x="LMARGIN", new_y="NEXT", align="C",
-        )
-        pdf.ln(6)
-
-        # ── Summary ──
-        total_pnl = sum(t["pnl_usd"] for t in unified)
-        wins = [t for t in unified if t["pnl_usd"] > 0]
-        losses = [t for t in unified if t["pnl_usd"] < 0]
-        win_rate = (len(wins) / len(unified) * 100) if unified else 0
-        avg_win = sum(t["pnl_usd"] for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0
-
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "Summary", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 10)
-
-        pnl_sign = "+" if total_pnl >= 0 else ""
-        summary_lines = [
-            f"Total Trades: {len(unified)}",
-            f"Win Rate: {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)",
-            f"Net PnL: {pnl_sign}${total_pnl:,.2f}",
-            f"Avg Win: +${avg_win:,.2f}" if avg_win >= 0 else f"Avg Win: ${avg_win:,.2f}",
-            f"Avg Loss: ${avg_loss:,.2f}",
-        ]
-        for line in summary_lines:
-            pdf.cell(0, 6, line, new_x="LMARGIN", new_y="NEXT")
-
-        pdf.ln(4)
-        pdf.set_draw_color(200, 200, 200)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(4)
-
-        # ── PnL Breakdown by Symbol (Today / 30d / All Time) ──
+        # ── Time buckets ──
         now = datetime.now(ET)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_cutoff = int(today_start.timestamp())
         now_ts = int(time.time())
         month_cutoff = now_ts - 30 * 86400
 
-        def _net(t):
-            return t.get("pnl_usd", 0)
-
         def _bucket(trades_list):
             if not trades_list:
-                return 0.0, 0, 0
-            pnl = sum(_net(t) for t in trades_list)
-            w = sum(1 for t in trades_list if _net(t) > 0)
-            return pnl, len(trades_list), w
+                return {"pnl": 0.0, "cnt": 0, "wins": 0}
+            pnl = sum(t["pnl_usd"] for t in trades_list)
+            w = sum(1 for t in trades_list if t["pnl_usd"] > 0)
+            return {"pnl": pnl, "cnt": len(trades_list), "wins": w}
 
         def _s(v):
             return "+" if v >= 0 else ""
 
+        buckets = []
         for label, cutoff in [("Today", today_cutoff), ("30 Days", month_cutoff), ("All Time", 0)]:
-            bucket = [t for t in unified if t["timestamp"] >= cutoff]
-            if not bucket and label != "Today":
-                continue
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(0, 7, label, new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", "", 9)
-            t_pnl, t_trades, t_wins = 0.0, 0, 0
+            b = [t for t in unified if t["timestamp"] >= cutoff]
+            stats = _bucket(b)
+            sym_stats = {}
             for sym in ("BTC", "ETH", "SOL"):
-                sym_trades = [t for t in bucket if t["symbol"] == sym]
-                pnl_s, cnt, w = _bucket(sym_trades)
-                t_pnl += pnl_s
-                t_trades += cnt
-                t_wins += w
-                wr = f"{w}/{cnt}" if cnt else "-"
-                pdf.cell(0, 5, f"  {sym}: {_s(pnl_s)}${pnl_s:,.2f}  ({wr})", new_x="LMARGIN", new_y="NEXT")
-            wr_pct = f"{t_wins / t_trades * 100:.0f}%" if t_trades else "-"
-            pdf.cell(0, 5, f"  Total: {_s(t_pnl)}${t_pnl:,.2f}  ({t_wins}/{t_trades} | {wr_pct} WR)", new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(2)
+                sym_stats[sym] = _bucket([t for t in b if t["symbol"] == sym])
+            losses = stats["cnt"] - stats["wins"]
+            wr = f"{stats['wins'] / stats['cnt'] * 100:.0f}%" if stats["cnt"] else "-"
+            buckets.append({"label": label, "stats": stats, "sym": sym_stats,
+                            "wr": wr, "losses": losses})
 
-        pdf.set_draw_color(200, 200, 200)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        # ── PDF setup ──
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        # ── Title ──
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, "Trade Report", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(0, 5, f"Generated: {now.strftime('%b %d, %Y %I:%M %p ET')}",
+                 new_x="LMARGIN", new_y="NEXT", align="C")
         pdf.ln(4)
 
-        # ── Trade List (GMX only, newest first) ──
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
+        # ── 3-Column Summary: Today | 30 Days | All Time ──
+        top_y = pdf.get_y()
+        for col_idx, bk in enumerate(buckets):
+            x = LMARGIN + col_idx * COL_W
+            y = top_y
+            s = bk["stats"]
+            pnl_sign = _s(s["pnl"])
 
-        for i, t in enumerate(unified, 1):
-            ts = t["timestamp"]
-            if ts:
-                trade_dt = datetime.fromtimestamp(ts, tz=ET)
-                date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
-            else:
-                date_str = "Unknown"
+            # Column header
+            pdf.set_xy(x, y)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(COL_W, 6, bk["label"], new_x="LMARGIN", new_y="NEXT")
+            y += 6
+
+            # Stats
+            pdf.set_font("Helvetica", "", 8)
+            lines = [
+                f"Trades: {s['cnt']}  ({s['wins']}W / {bk['losses']}L)",
+                f"Win Rate: {bk['wr']}",
+                f"Net PnL: {pnl_sign}${s['pnl']:,.2f}",
+            ]
+            for sym in ("BTC", "ETH", "SOL"):
+                ss = bk["sym"][sym]
+                wr = f"{ss['wins']}/{ss['cnt']}" if ss["cnt"] else "-"
+                lines.append(f"{sym}: {_s(ss['pnl'])}${ss['pnl']:,.2f}  ({wr})")
+
+            for line in lines:
+                pdf.set_xy(x, y)
+                pdf.cell(COL_W, LINE_H, line, new_x="LMARGIN", new_y="NEXT")
+                y += LINE_H
+
+        # Move below the tallest column
+        pdf.set_y(top_y + 6 + LINE_H * 6 + 4)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(LMARGIN, pdf.get_y(), LMARGIN + 3 * COL_W, pdf.get_y())
+        pdf.ln(4)
+
+        # ── 3-Column Trade Grid (newest to oldest) ──
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 7, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
+        CARD_H = 24  # height per trade card
+        row_y = pdf.get_y()
+
+        for i, t in enumerate(unified):
+            col = i % 3
+            if col == 0 and i > 0:
+                row_y += CARD_H + 2
+                # New page if needed
+                if row_y + CARD_H > pdf.h - 15:
+                    pdf.add_page()
+                    row_y = pdf.get_y()
+
+            x = LMARGIN + col * COL_W
+            y = row_y
 
             pnl = t["pnl_usd"]
-            pnl_sign = "+" if pnl >= 0 else ""
+            pnl_sign = _s(pnl)
+            exch = t.get("exchange", "gmx").upper()
+            ts = t["timestamp"]
+            date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d %I:%M %p") if ts else "Unknown"
 
+            # Trade header: #N SYM SIDE EXCHANGE
+            pdf.set_xy(x, y)
             if pnl >= 0:
                 pdf.set_text_color(0, 128, 0)
             else:
                 pdf.set_text_color(200, 0, 0)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(COL_W, LINE_H, f"#{i+1} {t['symbol']} {t['side']} {exch}")
+            y += LINE_H
 
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
-
+            # Details
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 9)
+            pdf.set_font("Helvetica", "", 7.5)
+
+            pdf.set_xy(x, y)
+            pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f}  |  Size: ${t['size_usd']:,.2f}")
+            y += LINE_H
 
             if t.get("entry_price") and t.get("exit_price"):
-                pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
-                lev = t.get("leverage", 0)
-                pct = t.get("pnl_percentage", 0)
-                pct_sign = "+" if pct >= 0 else ""
-                pdf.cell(
-                    0, 5,
-                    f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
-                    f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
-                    new_x="LMARGIN", new_y="NEXT",
-                )
-            else:
-                pdf.cell(
-                    0, 5,
-                    f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
-                    new_x="LMARGIN", new_y="NEXT",
-                )
+                pdf.set_xy(x, y)
+                pdf.cell(COL_W, LINE_H, f"Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}")
+                y += LINE_H
 
-            pdf.cell(0, 5, f"  Date: {date_str}", new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(2)
+            pdf.set_xy(x, y)
+            pdf.cell(COL_W, LINE_H, date_str)
+
+        pdf.ln(CARD_H + 4)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
         pdf.output(tmp.name)
