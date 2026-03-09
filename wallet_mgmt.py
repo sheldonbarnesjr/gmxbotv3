@@ -723,7 +723,17 @@ class WalletMixin:
 
             if bx_total > 0:
                 grand_total = total_portfolio + bx_total
-                msg += f"\n\n**Combined Total: ${grand_total:,.2f}**"
+                change_usd, change_pct, found = self._get_24h_balance_change(grand_total)
+                if found:
+                    chg_sign = "+" if change_pct >= 0 else ""
+                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}** ({chg_sign}{change_pct:.1f}% 24h)"
+                else:
+                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}**"
+            else:
+                change_usd, change_pct, found = self._get_24h_balance_change(total_portfolio)
+                if found:
+                    chg_sign = "+" if change_pct >= 0 else ""
+                    msg += f"\n\n({chg_sign}{change_pct:.1f}% 24h)"
 
             await self.send_message(chat_id, msg)
         except Exception as e:

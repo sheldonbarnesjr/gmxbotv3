@@ -262,41 +262,32 @@ class AnalyticsMixin:
         if pos_obj.closed_at is None:
             pos_obj.closed_at = time.time()
 
-        # Default to internal values (will be overwritten by on-chain data if available)
+        # Default exit price
         exit_price = pos_obj.current_price if pos_obj.current_price > 0 else pos_obj.entry_price
-        pnl_usd = None  # set from chain if available
 
-        # Try to get actual exit data from on-chain PositionDecrease events
-        market_addr = getattr(pos_obj, 'market_addr', None)
-        if market_addr and hasattr(self, 'w3') and self.w3:
-            try:
-                acct = self._get_account(getattr(pos_obj, 'wallet_id', 1))
-                decreases = await asyncio.to_thread(
-                    fetch_recent_position_decreases,
-                    self.w3, acct.address, market_addr,
-                    pos_obj.side == "LONG",
-                    lookback_seconds=1800,  # 30-min window
+        # Prefer verified_decreases (complete TP/SL hit history) over re-fetching from chain.
+        # The chain re-fetch has a 30-min window and may miss earlier TP fills.
+        verified = getattr(pos_obj, 'verified_decreases', None) or []
+        if verified:
+            pnl_usd = sum(d.get("net_pnl_usd", 0) for d in verified)
+            last_decrease = max(verified, key=lambda d: d.get("timestamp", 0))
+            if last_decrease.get("execution_price", 0) > 0:
+                exit_price = last_decrease["execution_price"]
+            # Add remaining position PnL if not fully closed by TPs
+            total_decreased = sum(d.get("size_delta_usd", 0) for d in verified)
+            base_size = pos_obj.original_size_usd if pos_obj.original_size_usd > 0 else pos_obj.size_usd
+            remaining_size = max(base_size - total_decreased, 0.0)
+            if remaining_size > 0 and exit_price > 0 and pos_obj.entry_price > 0:
+                remaining_pnl = calculate_unrealized_pnl(
+                    pos_obj.side, pos_obj.entry_price, exit_price, remaining_size
                 )
-                if decreases:
-                    # Use the most recent decrease event for exit price and close time
-                    latest = max(decreases, key=lambda d: d.get("timestamp", 0))
-                    if latest.get("execution_price", 0) > 0:
-                        exit_price = latest["execution_price"]
-                    if latest.get("timestamp"):
-                        pos_obj.closed_at = latest["timestamp"]
-                    # Sum net_pnl across all decrease events (partial TPs + final close)
-                    chain_pnl = sum(d.get("net_pnl_usd", 0) for d in decreases)
-                    if decreases:
-                        pnl_usd = chain_pnl
-                        self.logger.info(
-                            f"On-chain exit data: price=${exit_price:,.2f}, "
-                            f"net_pnl=${pnl_usd:,.2f} ({len(decreases)} event(s))"
-                        )
-            except Exception as e:
-                self.logger.debug(f"On-chain exit data unavailable for {pos_obj.symbol}: {e}")
-
-        # Fall back to internal calculation if chain data unavailable
-        if pnl_usd is None:
+                pnl_usd += remaining_pnl
+            self.logger.info(
+                f"Trade PnL from verified_decreases: ${pnl_usd:,.2f} "
+                f"({len(verified)} event(s)), exit=${exit_price:,.2f}"
+            )
+        else:
+            # No verified_decreases — use position's computed PnL
             if pos_obj.unrealized_pnl is not None and pos_obj.unrealized_pnl != 0.0:
                 pnl_usd = pos_obj.unrealized_pnl
             else:
@@ -916,9 +907,7 @@ class AnalyticsMixin:
                         new_x="LMARGIN", new_y="NEXT",
                     )
 
-                reason = t.get("exit_reason", "")
-                reason_str = f"  |  Reason: {reason}" if reason else ""
-                pdf.cell(0, 5, f"  Date: {date_str}{reason_str}", new_x="LMARGIN", new_y="NEXT")
+                pdf.cell(0, 5, f"  Date: {date_str}", new_x="LMARGIN", new_y="NEXT")
                 pdf.ln(2)
 
         _render_trade_group(gmx_trades, "GMX Trades")
