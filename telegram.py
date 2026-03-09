@@ -442,7 +442,7 @@ class CoreTelegramMixin:
         cfg = self.cfg
         health = self.get_health_report()
         is_halted = health["is_halted"]
-        status = "HALTED" if is_halted else "ACTIVE"
+        status = "🔴 HALTED" if is_halted else "🟢 ACTIVE"
         uptime_hours = health["uptime_seconds"] / 3600
         ex_mode = getattr(self, 'exchange_mode', 'gmx').upper()
 
