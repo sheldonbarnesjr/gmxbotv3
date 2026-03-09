@@ -680,15 +680,12 @@ class WalletMixin:
 
             total_portfolio = total_usdc + total_deployed + total_pnl
             collateral_per_trade = total_portfolio * cfg.portfolio_pct
-            pnl_sign = "+" if total_pnl >= 0 else ""
-            pnl_pct_str = f" ({total_pnl / total_deployed * 100:+.1f}%)" if total_deployed > 0 else ""
 
             msg = (
                 "**GMX**\n"
-                f"Free USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f} | Positions: {total_pos_count}\n"
-                f"Unrealized PnL: {pnl_sign}${total_pnl:,.2f}{pnl_pct_str}\n"
-                f"**GMX Total: ${total_portfolio:,.2f}**\n"
+                f"Free USDC: ${total_usdc:,.2f}\n"
+                f"GMX Total: ${total_portfolio:,.2f}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%})"
             )
 
@@ -708,14 +705,11 @@ class WalletMixin:
                         bx_pnl += float(bp.get("unrealizedPNL", 0))
                     bx_total = bx_bal + bx_deployed + bx_pnl
                     bx_collateral = bx_total * cfg.portfolio_pct
-                    bx_pnl_sign = "+" if bx_pnl >= 0 else ""
-                    bx_pnl_pct = f" ({bx_pnl / bx_deployed * 100:+.1f}%)" if bx_deployed > 0 else ""
                     msg += (
                         "\n\n**BITUNIX**\n"
-                        f"Available USDT: ${bx_bal:,.2f}\n"
                         f"Deployed: ${bx_deployed:,.2f} | Positions: {len(bx_positions)}\n"
-                        f"Unrealized PnL: {bx_pnl_sign}${bx_pnl:,.2f}{bx_pnl_pct}\n"
-                        f"**BITUNIX Total: ${bx_total:,.2f}**\n"
+                        f"Available USDT: ${bx_bal:,.2f}\n"
+                        f"BITUNIX Total: ${bx_total:,.2f}\n"
                         f"Collateral/trade: ${bx_collateral:,.2f} ({cfg.portfolio_pct:.0%})"
                     )
                 except Exception as e:
@@ -726,14 +720,9 @@ class WalletMixin:
                 change_usd, change_pct, found = self._get_24h_balance_change(grand_total)
                 if found:
                     chg_sign = "+" if change_pct >= 0 else ""
-                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}** ({chg_sign}{change_pct:.1f}% 24h)"
+                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}** ({chg_sign}{change_pct:.1f}% 24h) ✅"
                 else:
-                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}**"
-            else:
-                change_usd, change_pct, found = self._get_24h_balance_change(total_portfolio)
-                if found:
-                    chg_sign = "+" if change_pct >= 0 else ""
-                    msg += f"\n\n({chg_sign}{change_pct:.1f}% 24h)"
+                    msg += f"\n\n**Combined Total: ${grand_total:,.2f}** ✅"
 
             await self.send_message(chat_id, msg)
         except Exception as e:

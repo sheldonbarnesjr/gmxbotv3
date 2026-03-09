@@ -1988,8 +1988,28 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         mode = self.exchange_mode
 
+        # Calculate Bitunix-specific sizing from Bitunix balance
+        bx_size_usd = size_usd
+        bx_collateral_usd = collateral_usd
+        if mode in ("bitunix", "mirror") and self.bitunix_client:
+            try:
+                from bitunix_executor import get_bitunix_balance, get_bitunix_positions
+                bx_bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
+                bx_positions = await asyncio.to_thread(get_bitunix_positions, self.bitunix_client)
+                bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
+                bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
+                bx_total = bx_bal + bx_deployed + bx_pnl
+                bx_collateral_usd = bx_total * self.cfg.portfolio_pct
+                bx_size_usd = bx_collateral_usd * signal.leverage
+                self.logger.info(
+                    f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "
+                    f"collateral=${bx_collateral_usd:.2f}, size=${bx_size_usd:.2f}"
+                )
+            except Exception as e:
+                self.logger.warning(f"[BITUNIX] Could not fetch balance for sizing, using GMX sizing: {e}")
+
         if mode == "bitunix":
-            return await self._execute_open_bitunix(signal, size_usd, collateral_usd, wallet_id)
+            return await self._execute_open_bitunix(signal, bx_size_usd, bx_collateral_usd, wallet_id)
 
         if mode == "mirror":
             # Execute on both exchanges concurrently
@@ -1998,7 +2018,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 self._execute_open_gmx(signal, size_usd, acct, collateral_usd, wallet_id)
             )
             bitunix_task = asyncio.create_task(
-                self._execute_open_bitunix(signal, size_usd, collateral_usd, wallet_id)
+                self._execute_open_bitunix(signal, bx_size_usd, bx_collateral_usd, wallet_id)
             )
 
             gmx_result = await gmx_task
@@ -2774,13 +2794,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bs = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
                     remaining_pct = max(100.0 - (total_decreased / bs * 100 if bs > 0 else 0), 0)
 
-                    pnl_icon = "✅" if total_pnl >= 0 else "❌"
                     msg = (
-                        f"Position Closed GMX\n\n"
+                        f"Position Closed GMX ✅\n\n"
                         f"{pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
                         f"Exit: ${exit_price:,.2f}\n"
-                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_sign}{abs(pnl_pct):.1f}%) {pnl_icon}\n"
+                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_sign}{abs(pnl_pct):.1f}%)\n"
                         f"Duration: {duration:.1f}h"
                     )
                 await self.notify(msg)

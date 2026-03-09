@@ -416,13 +416,12 @@ class BitunixMonitorMixin:
                     collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
                     pnl_pct = (total_pnl / collateral * 100) if collateral > 0 else 0.0
                     pnl_sign = "+" if total_pnl >= 0 else "-"
-                    pnl_icon = "✅" if total_pnl >= 0 else "❌"
                     await self.notify(
-                        f"Position Closed BITUNIX\n\n"
+                        f"Position Closed BITUNIX ✅\n\n"
                         f"{pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
                         f"Exit: ${pos.current_price:,.2f}\n"
-                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_pct:+.1f}%) {pnl_icon}\n"
+                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_pct:+.1f}%)\n"
                         f"Duration: {pos.duration_hours:.1f}h"
                     )
 

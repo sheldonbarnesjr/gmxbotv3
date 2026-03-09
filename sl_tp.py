@@ -850,7 +850,7 @@ class SLTPMixin:
                     await self.send_message(chat_id, f"TP{tp_num} not found. Position has {len(sorted_tps)} TP(s).")
                     return
                 new_sl_price = sorted_tps[tp_num - 1].price
-                sl_label = f"TP{tp_num}"
+                sl_label = f"Target {tp_num}"
             else:
                 # Try parsing as a raw price
                 try:

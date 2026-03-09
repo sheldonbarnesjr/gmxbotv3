@@ -165,9 +165,8 @@ class NotificationsMixin:
             msg = (
                 f"🟢 Bot Online\n"
                 f"Combined USDC: ${total_usdc:,.2f}\n"
-                f"Deployed: ${total_deployed:,.2f}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of USDC)\n"
-                f"Open positions: {pos_count}"
+                f"Deployed: ${total_deployed:,.2f} | Open positions: {pos_count}"
             )
             await self.notify(msg)
         except Exception as e:

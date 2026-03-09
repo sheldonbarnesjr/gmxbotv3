@@ -342,13 +342,17 @@ def determine_new_sl_target(
     if tp_hits_count >= len(sorted_tps):
         return None, None
 
-    # TP1 or TP2 hit → SL to entry
-    if tp_hits_count <= 2:
+    # TP1 hit → SL to entry (breakeven)
+    if tp_hits_count == 1:
         return entry_price, "Entry"
 
-    # TP3+ hit → trail 2 levels back (TP3→TP1, TP4→TP2, TP5→TP3, etc.)
+    # TP2 hit → SL already at Entry from TP1, no move needed
+    if tp_hits_count == 2:
+        return None, None
+
+    # TP3+ hit → trail 2 levels back (TP3→Target 1, TP4→Target 2, TP5→Target 3, etc.)
     trail_idx = tp_hits_count - 3  # 0-indexed: TP3→0(TP1), TP4→1(TP2), ...
     if trail_idx < len(sorted_tps):
-        return _tp_price(trail_idx), f"TP{trail_idx + 1}"
+        return _tp_price(trail_idx), f"Target {trail_idx + 1}"
 
     return entry_price, "Entry"
