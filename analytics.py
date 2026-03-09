@@ -967,14 +967,13 @@ class AnalyticsMixin:
         pdf.cell(0, 7, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
-        CARD_H = 24  # height per trade card
+        CARD_H = 22  # height per trade card (4 lines)
         row_y = pdf.get_y()
 
         for i, t in enumerate(unified):
             col = i % 3
             if col == 0 and i > 0:
                 row_y += CARD_H + 2
-                # New page if needed
                 if row_y + CARD_H > pdf.h - 15:
                     pdf.add_page()
                     row_y = pdf.get_y()
@@ -984,11 +983,13 @@ class AnalyticsMixin:
 
             pnl = t["pnl_usd"]
             pnl_sign = _s(pnl)
+            pct = t.get("pnl_percentage", 0)
+            pct_sign = "+" if pct >= 0 else ""
             exch = t.get("exchange", "gmx").upper()
             ts = t["timestamp"]
-            date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d %I:%M %p") if ts else "Unknown"
+            date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d, %I:%M %p") if ts else "Unknown"
 
-            # Trade header: #N SYM SIDE EXCHANGE
+            # Header: #N SYM SIDE EXCHANGE
             pdf.set_xy(x, y)
             if pnl >= 0:
                 pdf.set_text_color(0, 128, 0)
@@ -998,19 +999,19 @@ class AnalyticsMixin:
             pdf.cell(COL_W, LINE_H, f"#{i+1} {t['symbol']} {t['side']} {exch}")
             y += LINE_H
 
-            # Details
+            # PnL with %
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 7.5)
-
             pdf.set_xy(x, y)
-            pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f}  |  Size: ${t['size_usd']:,.2f}")
+            pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)")
             y += LINE_H
 
-            if t.get("entry_price") and t.get("exit_price"):
-                pdf.set_xy(x, y)
-                pdf.cell(COL_W, LINE_H, f"Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}")
-                y += LINE_H
+            # Size
+            pdf.set_xy(x, y)
+            pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f}")
+            y += LINE_H
 
+            # Date
             pdf.set_xy(x, y)
             pdf.cell(COL_W, LINE_H, date_str)
 
