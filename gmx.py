@@ -21,6 +21,7 @@ import uuid
 import asyncio
 import hashlib
 import logging
+import signal as signal_mod
 import statistics
 import traceback
 from datetime import datetime, timedelta
@@ -638,6 +639,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Send startup notification to admin
         await self.send_startup_notification()
 
+        # Register signal handlers so systemd SIGTERM triggers graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal_mod.SIGTERM, signal_mod.SIGINT):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._handle_signal(s)))
+
         shutdown_reason = "Telegram disconnected"
         try:
             await self.client.run_until_disconnected()
@@ -649,6 +655,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             shutdown_reason = f"Fatal error: {e}"
         finally:
             await self.shutdown(shutdown_reason)
+
+    async def _handle_signal(self, sig):
+        """Handle SIGTERM/SIGINT by disconnecting Telethon, which unblocks run_until_disconnected."""
+        sig_name = signal_mod.Signals(sig).name
+        self.logger.info(f"Received {sig_name} — initiating graceful shutdown")
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
 
     async def shutdown(self, reason: str = "Bot stopped"):
         self.logger.info("Shutting down GMX Bot...")
