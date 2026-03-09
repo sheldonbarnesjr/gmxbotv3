@@ -266,9 +266,8 @@ class AnalyticsMixin:
                 (last_event.get("timestamp", 0) - first_event.get("timestamp", 0)) / 3600,
                 0,
             )
-            # PnL % cannot be accurately calculated without leverage info
-            # from on-chain data alone — set to 0 (shown as N/A in PDF)
-            pnl_pct = 0.0
+            # PnL % as return-on-position-size (not leveraged ROI)
+            pnl_pct = (total_pnl / total_size) * 100 if total_size > 0 else 0.0
 
             trade = TradeRecord(
                 id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
@@ -974,7 +973,7 @@ class AnalyticsMixin:
         pdf.cell(0, 7, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
-        CARD_H = 27  # height per trade card (5 lines)
+        CARD_H = 32  # height per trade card (5 lines + padding)
         row_y = pdf.get_y()
 
         for i, t in enumerate(unified):
@@ -1006,11 +1005,11 @@ class AnalyticsMixin:
             pdf.cell(COL_W, LINE_H, f"#{i+1} {t['symbol']} {t['side']} {exch}")
             y += LINE_H
 
-            # PnL with % (only show % if leverage is known)
+            # PnL with %
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Helvetica", "", 7.5)
             pdf.set_xy(x, y)
-            if lev and lev > 0 and pct != 0:
+            if pct != 0:
                 pct_sign = "+" if pct >= 0 else ""
                 pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)")
             else:
@@ -1024,6 +1023,16 @@ class AnalyticsMixin:
                 pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  (${collateral:,.2f})")
             else:
                 pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f}")
+            y += LINE_H
+
+            # Entry → Exit prices
+            entry_p = t.get("entry_price", 0)
+            exit_p = t.get("exit_price", 0)
+            pdf.set_xy(x, y)
+            if entry_p and exit_p:
+                pdf.cell(COL_W, LINE_H, f"Entry: ${entry_p:,.2f}  ->  Exit: ${exit_p:,.2f}")
+            elif exit_p:
+                pdf.cell(COL_W, LINE_H, f"Exit: ${exit_p:,.2f}")
             y += LINE_H
 
             # Date
