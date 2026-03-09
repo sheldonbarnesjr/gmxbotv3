@@ -18,7 +18,6 @@ import asyncio
 import logging
 from typing import Optional
 
-from close import fetch_positions as chain_fetch_positions
 import bot_api
 
 
@@ -131,43 +130,4 @@ class NotificationsMixin:
 
     async def send_startup_notification(self):
         """Send status update to admin when bot comes online."""
-        cfg = self.cfg
-        try:
-            total_usdc = 0.0
-            total_deployed = 0.0
-            pos_count = 0
-
-            for wid, acct in self._all_wallets():
-                usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
-                total_usdc += usdc
-
-                try:
-                    positions = await asyncio.to_thread(
-                        chain_fetch_positions, self.w3, acct.address
-                    )
-                    deployed = sum(p.collateral_amount for p in positions) if positions else 0.0
-                    n_pos = len(positions) if positions else 0
-                except Exception:
-                    deployed = 0.0
-                    n_pos = 0
-                total_deployed += deployed
-                pos_count += n_pos
-
-            # Include Bitunix positions
-            for pos in self.positions.values():
-                if pos.is_open and getattr(pos, 'exchange', 'gmx') == 'bitunix':
-                    bx_collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
-                    total_deployed += bx_collateral
-                    pos_count += 1
-
-            collateral_per_trade = total_usdc * cfg.portfolio_pct
-
-            msg = (
-                f"🟢 Bot Online\n"
-                f"Combined USDC: ${total_usdc:,.2f}\n"
-                f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of USDC)\n"
-                f"Deployed: ${total_deployed:,.2f} | Open positions: {pos_count}"
-            )
-            await self.notify(msg)
-        except Exception as e:
-            self.logger.error(f"Startup notification error: {e}")
+        await self.notify("🟢 Bot Online")

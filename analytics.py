@@ -767,7 +767,7 @@ class AnalyticsMixin:
             })
 
         # Exclude dust trades (< $1 PnL) and sort newest first
-        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1]
+        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1 and t.get("exchange", "gmx") == "gmx"]
         unified.sort(key=lambda x: x["timestamp"], reverse=True)
 
         pdf = FPDF()
@@ -857,65 +857,52 @@ class AnalyticsMixin:
         pdf.line(10, pdf.get_y(), 200, pdf.get_y())
         pdf.ln(4)
 
-        # ── Trade List grouped by platform (newest first within each) ──
-        gmx_trades = [t for t in unified if t.get("exchange", "gmx") == "gmx"]
-        bitunix_trades = [t for t in unified if t.get("exchange", "gmx") == "bitunix"]
+        # ── Trade List (GMX only, newest first) ──
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
 
-        def _render_trade_group(trades, group_label):
-            if not trades:
-                return
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.cell(0, 8, f"{group_label} ({len(trades)})", new_x="LMARGIN", new_y="NEXT")
+        for i, t in enumerate(unified, 1):
+            ts = t["timestamp"]
+            if ts:
+                trade_dt = datetime.fromtimestamp(ts, tz=ET)
+                date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
+            else:
+                date_str = "Unknown"
 
-            for i, t in enumerate(trades, 1):
-                ts = t["timestamp"]
-                if ts:
-                    trade_dt = datetime.fromtimestamp(ts, tz=ET)
-                    date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
-                else:
-                    date_str = "Unknown"
+            pnl = t["pnl_usd"]
+            pnl_sign = "+" if pnl >= 0 else ""
 
-                pnl = t["pnl_usd"]
-                pnl_sign = "+" if pnl >= 0 else ""
+            if pnl >= 0:
+                pdf.set_text_color(0, 128, 0)
+            else:
+                pdf.set_text_color(200, 0, 0)
 
-                if pnl >= 0:
-                    pdf.set_text_color(0, 128, 0)
-                else:
-                    pdf.set_text_color(200, 0, 0)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
 
-                pdf.set_font("Helvetica", "B", 10)
-                pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 9)
 
-                pdf.set_text_color(0, 0, 0)
-                pdf.set_font("Helvetica", "", 9)
+            if t.get("entry_price") and t.get("exit_price"):
+                pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
+                lev = t.get("leverage", 0)
+                pct = t.get("pnl_percentage", 0)
+                pct_sign = "+" if pct >= 0 else ""
+                pdf.cell(
+                    0, 5,
+                    f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
+                    f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
+                    new_x="LMARGIN", new_y="NEXT",
+                )
+            else:
+                pdf.cell(
+                    0, 5,
+                    f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
+                    new_x="LMARGIN", new_y="NEXT",
+                )
 
-                if t.get("entry_price") and t.get("exit_price"):
-                    pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
-                    lev = t.get("leverage", 0)
-                    pct = t.get("pnl_percentage", 0)
-                    pct_sign = "+" if pct >= 0 else ""
-                    pdf.cell(
-                        0, 5,
-                        f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
-                        f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
-                        new_x="LMARGIN", new_y="NEXT",
-                    )
-                else:
-                    pdf.cell(
-                        0, 5,
-                        f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
-                        new_x="LMARGIN", new_y="NEXT",
-                    )
-
-                pdf.cell(0, 5, f"  Date: {date_str}", new_x="LMARGIN", new_y="NEXT")
-                pdf.ln(2)
-
-        _render_trade_group(gmx_trades, "GMX Trades")
-        if gmx_trades and bitunix_trades:
-            pdf.set_draw_color(200, 200, 200)
-            pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-            pdf.ln(4)
-        _render_trade_group(bitunix_trades, "BITUNIX Trades")
+            pdf.cell(0, 5, f"  Date: {date_str}", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
         pdf.output(tmp.name)
