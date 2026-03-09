@@ -213,12 +213,30 @@ class BitunixMonitorMixin:
                         for t in tracked if t["hit"]
                     ]
 
+                    # Calculate PnL for notification
+                    realized_pnl = sum(d.get("net_pnl_usd", 0) for d in pos.verified_decreases)
+                    total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
+                    remaining_size = max(pos.size_usd - total_decreased, 0)
+                    unrealized_pnl = 0.0
+                    if pos.entry_price > 0 and remaining_size > 0 and pos.current_price:
+                        if pos.side == "LONG":
+                            unrealized_pnl = (pos.current_price - pos.entry_price) / pos.entry_price * remaining_size
+                        else:
+                            unrealized_pnl = (pos.entry_price - pos.current_price) / pos.entry_price * remaining_size
+                    total_pnl = realized_pnl + unrealized_pnl
+                    collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                    pnl_pct_str = f" ({total_pnl / collateral * 100:+.1f}%)" if collateral > 0 else ""
+                    r_sign = "+" if realized_pnl >= 0 else "-"
+                    u_sign = "+" if unrealized_pnl >= 0 else "-"
+                    t_sign = "+" if total_pnl >= 0 else "-"
+
                     # Notify each TP hit
                     for tp_info in new_hits:
                         await self.notify(
-                            f"**TP Hit** [{pos.exchange.upper()}] {pos.symbol} {pos.side}\n"
-                            f"TP @ ${tp_info['price']:,.2f} ({tp_info['pct']:.0%})\n"
-                            f"Hits: {total_hits}/{len(tracked)}"
+                            f"BITUNIX {pos.symbol} {pos.side} {pos.leverage:.1f}x: Target {total_hits} Hit ✅\n"
+                            f"Realized: {r_sign}${abs(realized_pnl):,.2f} @ ${tp_info['price']:,.2f}\n"
+                            f"Unrealized: {u_sign}${abs(unrealized_pnl):,.2f}\n"
+                            f"Total PnL: {t_sign}${abs(total_pnl):,.2f}{pnl_pct_str}"
                         )
 
                     # Persist position state with updated verified_decreases
@@ -297,8 +315,8 @@ class BitunixMonitorMixin:
             self._save_position_state()
 
             await self.notify(
-                f"**SL Moved** [{pos.exchange.upper()}] {pos.symbol} {pos.side}\n"
-                f"${old_sl:,.2f} -> ${new_sl:,.2f} ({label})"
+                f"SL Moved BITUNIX {pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
+                f"${old_sl:,.2f} -> ${new_sl:,.2f} ({label}) ✅"
             )
             logger.info(f"SL moved for {pos.symbol}: ${old_sl:,.2f} -> ${new_sl:,.2f} ({label})")
         except Exception as e:
@@ -306,7 +324,7 @@ class BitunixMonitorMixin:
             pos.sl_move_failed = True
             self._save_position_state()
             await self.notify(
-                f"**SL Move FAILED** [{pos.exchange.upper()}] {pos.symbol} {pos.side}\n"
+                f"⚠️ SL Move FAILED BITUNIX {pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                 f"Tried: ${new_sl:,.2f} ({label})\nError: {e}"
             )
 
@@ -394,12 +412,17 @@ class BitunixMonitorMixin:
                     await self._record_trade(pos, pos.exit_reason)
                     self._save_position_state()
 
-                    pnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+                    total_pnl = pos.unrealized_pnl or 0.0
+                    collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                    pnl_pct = (total_pnl / collateral * 100) if collateral > 0 else 0.0
+                    pnl_sign = "+" if total_pnl >= 0 else "-"
+                    pnl_icon = "✅" if total_pnl >= 0 else "❌"
                     await self.notify(
-                        f"**Position Closed** [BITUNIX] {pos.symbol} {pos.side}\n"
+                        f"Position Closed BITUNIX\n\n"
+                        f"{pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
-                        f"PnL: {pnl_sign}${pos.unrealized_pnl:,.2f}\n"
-                        f"Reason: {pos.exit_reason}\n"
+                        f"Exit: ${pos.current_price:,.2f}\n"
+                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_pct:+.1f}%) {pnl_icon}\n"
                         f"Duration: {pos.duration_hours:.1f}h"
                     )
 
@@ -442,7 +465,7 @@ class BitunixMonitorMixin:
                                         self._clear_position_state(gmx_pos_obj)
                                         await self.notify(
                                             f"[MIRROR] GMX {pos.symbol} {pos.side} auto-closed "
-                                            f"(Bitunix {pos.exit_reason})\nTX: {tx}"
+                                            f"(BITUNIX {pos.exit_reason})\nTX: {tx}"
                                         )
                                     else:
                                         await self.notify(

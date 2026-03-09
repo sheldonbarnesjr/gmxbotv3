@@ -113,22 +113,16 @@ class NotificationsMixin:
 
     async def notify_position_opened(self, position, order_type: str = "market"):
         """Notify about a newly opened position."""
-        tp_lines = ""
-        for i, tp in enumerate(position.take_profits):
-            tp_lines += f"  TP{i+1}: ${tp.price:,.2f} ({tp.percentage:.0%})\n"
-        order_label = "LIMIT ORDER" if order_type == "limit" else "MARKET ORDER"
-        sl_str = f"${position.stop_loss:,.2f}" if position.stop_loss is not None else "None"
-        wallet_label = f" [W{position.wallet_id}]" if hasattr(position, 'wallet_id') else ""
-        placed_count = len(position.take_profits)
-        tp_header = f"TPs: {placed_count}/{placed_count} placed"
+        tp_count = len(position.take_profits)
+        sl_placed = 1 if position.stop_loss is not None else 0
+        total_orders = tp_count + sl_placed
+        collateral = position.size_usd / position.leverage if position.leverage else position.size_usd
         msg = (
-            f"**Position Opened ({order_label})**\n\n"
-            f"{position.symbol} {position.side}{wallet_label}\n"
-            f"Size: ${position.size_usd:,.2f} @ {position.leverage:.0f}x\n"
+            f"Position Opened (GMX) ✅\n\n"
+            f"{position.symbol} {position.side} {position.leverage:.0f}x\n"
             f"Entry: ${position.entry_price:,.2f}\n"
-            f"SL: {sl_str}\n"
-            f"{tp_header}\n"
-            f"{tp_lines}"
+            f"Size: ${position.size_usd:,.2f} (${collateral:,.2f} collateral)\n"
+            f"{total_orders} open orders placed successfully ✅\n"
             f"TX: {position.tx_hash}"
         )
         if order_type == "limit":
@@ -142,9 +136,7 @@ class NotificationsMixin:
             total_usdc = 0.0
             total_deployed = 0.0
             pos_count = 0
-            wallet_lines = []
 
-            wallet_roles = {1: "swing", 2: "scalp", 3: "scalp", 4: "scalp"}
             for wid, acct in self._all_wallets():
                 usdc = await asyncio.to_thread(self._get_portfolio_value_for, acct)
                 total_usdc += usdc
@@ -161,25 +153,21 @@ class NotificationsMixin:
                 total_deployed += deployed
                 pos_count += n_pos
 
-                addr = f"{acct.address[:8]}...{acct.address[-6:]}"
-                role = wallet_roles.get(wid, "scalp")
-                wallet_lines.append(f"W{wid} ({role}): {addr} — ${usdc:,.2f} USDC")
+            # Include Bitunix positions
+            for pos in self.positions.values():
+                if pos.is_open and getattr(pos, 'exchange', 'gmx') == 'bitunix':
+                    bx_collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                    total_deployed += bx_collateral
+                    pos_count += 1
 
             collateral_per_trade = total_usdc * cfg.portfolio_pct
 
             msg = (
-                "🟢 **Bot Online**\n\n"
-                + "\n".join(wallet_lines) + "\n"
-                f"Network: {cfg.network.upper()}\n"
-                f"Mode: {'DRY RUN' if cfg.dry_run else 'LIVE'}\n"
-                f"Exchange: {getattr(self, 'exchange_mode', 'gmx').upper()}\n\n"
+                f"🟢 Bot Online\n"
                 f"Combined USDC: ${total_usdc:,.2f}\n"
                 f"Deployed: ${total_deployed:,.2f}\n"
                 f"Collateral/trade: ${collateral_per_trade:,.2f} ({cfg.portfolio_pct:.0%} of USDC)\n"
-                f"Open positions: {pos_count}\n\n"
-                f"Max leverage: {cfg.max_leverage:.0f}x\n"
-                f"Require TP/SL: {cfg.require_tp}/{cfg.require_sl}\n"
-                f"Channels: {', '.join(cfg.telegram_channels)}"
+                f"Open positions: {pos_count}"
             )
             await self.notify(msg)
         except Exception as e:

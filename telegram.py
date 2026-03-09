@@ -76,7 +76,7 @@ HELP_TEXT = """**GMX V2 Bot Commands**
 /tradesize — Show/change trade size
 /wallet — Deposit (d) or withdraw (w) USDC
 
-**Wallets:** W1=swing, W2-W4=scalps"""
+"""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -401,10 +401,10 @@ class CoreTelegramMixin:
             await self.send_message(
                 chat_id,
                 f"**Exchange Mode:** {mode.upper()}\n"
-                f"Bitunix API: {bx_status}\n\n"
+                f"BITUNIX API: {bx_status}\n\n"
                 f"Usage: /exchange <gmx|bitunix|mirror>\n"
                 f"  gmx — GMX only (on-chain)\n"
-                f"  bitunix — Bitunix only (CEX)\n"
+                f"  bitunix — BITUNIX only (CEX)\n"
                 f"  mirror — Both execute same trades"
             )
             return
@@ -416,7 +416,7 @@ class CoreTelegramMixin:
         if arg in ("bitunix", "mirror") and not self.bitunix_client:
             await self.send_message(
                 chat_id,
-                f"Cannot switch to {arg.upper()}: Bitunix API credentials not configured.\n"
+                f"Cannot switch to {arg.upper()}: BITUNIX API credentials not configured.\n"
                 f"Set BITUNIX_API_KEY and BITUNIX_SECRET_KEY in .env"
             )
             return
@@ -474,7 +474,7 @@ class CoreTelegramMixin:
             bx_upnl = sum(p.unrealized_pnl or 0 for p in bx_open)
             upnl_sign = "+" if bx_upnl >= 0 else ""
             msg += (
-                f"\n\n**Bitunix**\n"
+                f"\n\n**BITUNIX**\n"
                 f"Positions: {len(bx_open)}\n"
                 f"Exposure: ${bx_exposure:,.0f}\n"
                 f"Unrealized: {upnl_sign}${bx_upnl:,.2f}"
@@ -547,7 +547,7 @@ class CoreTelegramMixin:
                 await self.send_message(
                     chat_id,
                     f"[BITUNIX] Failed to close {pos.symbol} {pos.side}. "
-                    f"Check Bitunix manually."
+                    f"Check BITUNIX manually."
                 )
         except Exception as e:
             await self.send_message(chat_id, f"[BITUNIX] Close error: {e}")
@@ -574,12 +574,35 @@ class CoreTelegramMixin:
             await self.send_message(chat_id, "No open positions or orders.")
             return
 
+        SEPARATOR = "\n────────────────────────────────\n"
+
+        def _fmt_sign(value: float) -> str:
+            """Format with sign before dollar: +$X or -$X"""
+            sign = "+" if value >= 0 else "-"
+            return f"{sign}${abs(value):,.2f}"
+
         msg = ""
         open_pos_markets = {p.market.lower() for p in positions}
+        gmx_count = len(positions)
+        bx_count = len(bx_positions)
+
+        header_parts = []
+        if gmx_count:
+            header_parts.append(f"{gmx_count} GMX")
+        if bx_count:
+            header_parts.append(f"{bx_count} BITUNIX")
+        total_count = gmx_count + bx_count
+        if total_count:
+            msg += f"**Open Positions [{total_count}]**\n"
+
+        need_separator = False
 
         if positions:
-            msg += f"**Positions ({len(positions)})**\n"
             for i, pos in enumerate(positions, 1):
+                if need_separator:
+                    msg += SEPARATOR
+                need_separator = True
+
                 side = "LONG" if pos.is_long else "SHORT"
                 display_price = pos.current_price
 
@@ -597,7 +620,6 @@ class CoreTelegramMixin:
                 else:
                     pnl = pos.unrealized_pnl if pos.unrealized_pnl else 0.0
                     pnl_pct = pos.pnl_percentage if pos.pnl_percentage else 0.0
-                pnl_icon = "+" if pnl >= 0 else ""
 
                 wid = getattr(pos, '_wallet_id', 1)
                 pos_orders = [o for o in orders
@@ -608,9 +630,7 @@ class CoreTelegramMixin:
                 sl_orders = [o for o in pos_orders if o["order_type"] == 6]
                 limit_orders = [o for o in pos_orders if o["order_type"] in (2, 3)]
 
-                wid_label = ""
-                if hasattr(pos, '_wallet_id'):
-                    wid_label = f" [W{wid}]"
+                wid_label = " GMX"
 
                 # Look up internal position for TP hit / realized PnL info
                 internal = None
@@ -623,176 +643,142 @@ class CoreTelegramMixin:
                         internal = ip
                         break
 
-                # TP hit info from internal state — use verified_decreases as source of truth
+                # TP hit info from internal state
                 tp_hits = 0
                 total_tps = 0
                 sl_label = None
                 realized_pnl = 0.0
                 if internal:
-                    # Use verified_decreases as source of truth for TP hits
                     tp_hits = internal.tp_hits_count
                     total_tps = len([tp for tp in internal.take_profits if tp.price > 0])
                     tp_hits = min(tp_hits, total_tps)
                     sl_label = internal.sl_move_label
-                    # Use verified realized PnL from internal state (validated by sync)
                     realized_pnl = internal.realized_pnl if tp_hits > 0 else 0.0
 
                 current_str = f"${display_price:,.2f}" if display_price else "N/A"
                 entry_str = f"${pos.entry_price:,.2f}" if pos.entry_price else "N/A"
+
+                # Price change % from entry
+                price_chg_str = ""
+                if display_price and pos.entry_price and pos.entry_price > 0:
+                    price_chg = ((display_price - pos.entry_price) / pos.entry_price) * 100
+                    price_chg_str = f" ({price_chg:+.0f}%)"
+
                 msg += (
                     f"\n**#{i} {pos.symbol} {side}{wid_label}**\n"
-                    f"  Size:    ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
-                    f"  Collateral: ${pos.collateral_amount:,.2f}\n"
-                    f"  Entry:   {entry_str}\n"
-                    f"  Current: {current_str}\n"
+                    f"${pos.size_usd:,.2f} @ {pos.leverage:.1f}x - Collateral: ${pos.collateral_amount:,.2f}\n"
+                    f"Entry: {entry_str} - Current: {current_str}{price_chg_str}\n"
                 )
-
-                # On-chain fee breakdown (when available)
-                is_onchain = getattr(pos, 'pnl_source', 'local') == "onchain"
-                fee_line = ""
-                if is_onchain:
-                    total_fees = pos.borrowing_fee_usd + pos.funding_fee_usd + pos.closing_fee_usd
-                    fee_line = f"  Fees:    -${total_fees:,.2f} (borrow: ${pos.borrowing_fee_usd:,.2f}, fund: ${pos.funding_fee_usd:,.2f}, close: ${pos.closing_fee_usd:,.2f})\n"
 
                 if tp_hits > 0:
                     total_pnl_combined = realized_pnl + pnl
-                    r_sign = "+" if realized_pnl >= 0 else ""
-                    t_sign = "+" if total_pnl_combined >= 0 else ""
                     msg += (
-                        f"  TPs:     {tp_hits}/{total_tps} hit"
-                        + (f" (SL → {sl_label})" if sl_label else "")
-                        + "\n"
-                        f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
-                        f"  Unrealized: {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                        f"Realized: {_fmt_sign(realized_pnl)} - "
+                        f"Unrealized: {_fmt_sign(pnl)} ({pnl:+.0f}%)\n"
+                        f"  Total PnL: {_fmt_sign(total_pnl_combined)}\n"
                     )
-                    if fee_line:
-                        msg += fee_line
-                    msg += f"  Total PnL: {t_sign}${total_pnl_combined:,.2f}\n"
                 else:
-                    msg += f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
-                    if fee_line:
-                        msg += fee_line
+                    msg += f"PnL: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
 
-                if sl_orders or tp_orders or (internal and tp_hits > 0):
-                    msg += "  TP & SL:\n"
+                # Hit targets first
+                hit_tp_num = 0
+                if internal and internal.verified_decreases:
+                    hit_data = []
+                    for d in internal.verified_decreases:
+                        hp = d.get("matched_tp_price", 0)
+                        if hp > 0:
+                            hit_data.append({
+                                "price": hp,
+                                "pnl": d.get("net_pnl_usd", 0),
+                                "size": d.get("size_delta_usd", 0),
+                            })
+                    hit_data.sort(key=lambda x: x["price"], reverse=(not pos.is_long))
+                    for hd in hit_data:
+                        hit_tp_num += 1
+                        # Calculate close % for this hit
+                        close_pct = (hd["size"] / pos.original_size_usd * 100) if pos.original_size_usd > 0 else 0
+                        fmt_pct = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
+                        pnl_str = f" {_fmt_sign(hd['pnl'])}" if hd["pnl"] != 0 else ""
+                        msg += f"Target {hit_tp_num} ✅ ${hd['price']:,.2f} (closed {fmt_pct}%{pnl_str})\n"
 
-                    # Show verified hit TPs first with checkmark
-                    hit_tp_num = 0
-                    if internal and internal.verified_decreases:
-                        # Build hit TPs from verified_decreases (source of truth)
-                        hit_prices = [
-                            d.get("matched_tp_price", 0)
-                            for d in internal.verified_decreases
-                            if d.get("matched_tp_price", 0) > 0
-                        ]
-                        hit_prices_sorted = sorted(hit_prices, reverse=(not pos.is_long))
-                        for hp in hit_prices_sorted:
-                            hit_tp_num += 1
-                            msg += f"  TP{hit_tp_num} ✅ ${hp:,.2f} — HIT\n"
+                # Remaining on-chain TPs
+                sorted_tps = sorted(
+                    tp_orders,
+                    key=lambda x: x.get("trigger_price", 0) or 0,
+                    reverse=not pos.is_long,
+                )
+                tp_num_offset = hit_tp_num
+                total_tp_size = sum(o.get("size_usd", 0) or 0 for o in sorted_tps)
+                for j, o in enumerate(sorted_tps, 1):
+                    tp_num = tp_num_offset + j
+                    tp_price = o.get("trigger_price", 0) or 0
+                    tp_size = o.get("size_usd", 0) or 0
 
-                    # Remaining on-chain TPs — numbered after hit TPs
-                    sorted_tps = sorted(
-                        tp_orders,
-                        key=lambda x: x.get("trigger_price", 0) or 0,
-                        reverse=not pos.is_long,
-                    )
-                    tp_num_offset = hit_tp_num  # offset so TP numbering continues
-                    # Total TP size across all orders — use this as denominator so
-                    # percentages stay correct even after adding/removing collateral.
-                    total_tp_size = sum(o.get("size_usd", 0) or 0 for o in sorted_tps)
-                    for j, o in enumerate(sorted_tps, 1):
-                        tp_num = tp_num_offset + j
-                        tp_price = o.get("trigger_price", 0) or 0
+                    # Close %
+                    close_pct_str = ""
+                    if tp_size > 0 and total_tp_size > 0:
+                        close_pct = (tp_size / total_tp_size) * 100
+                        fmt = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
+                        close_pct_str = f"closes {fmt}% @ "
+                    elif internal:
+                        hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
+                        remaining_tps = [t for t in internal.take_profits if t.price not in hit_tp_prices]
+                        remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
+                        if j - 1 < len(remaining_tps_sorted):
+                            close_pct_str = f"closes {remaining_tps_sorted[j-1].percentage:.0%} @ "
 
-                        # % of position closing at this TP
-                        tp_size = o.get("size_usd", 0) or 0
-                        close_pct_str = ""
-                        if tp_size > 0 and total_tp_size > 0:
-                            close_pct = (tp_size / total_tp_size) * 100
-                            fmt = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
-                            close_pct_str = f" (closes {fmt}%)"
-                        elif internal:
-                            hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
-                            remaining_tps = [t for t in internal.take_profits if t.price not in hit_tp_prices]
-                            remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
-                            if j - 1 < len(remaining_tps_sorted):
-                                close_pct_str = f" (closes {remaining_tps_sorted[j-1].percentage:.0%})"
-
-                        if tp_price and pos.entry_price and pos.entry_price > 0:
-                            price_chg = ((tp_price - pos.entry_price) / pos.entry_price) * 100
-
-                            if pos.is_long:
-                                pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
-                            else:
-                                pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
-
-                            tp_close_size = tp_size if tp_size > 0 else pos.size_usd
-                            proj = pnl_per_dollar * tp_close_size
-
-                            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
-                            tp_collateral = collateral * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else collateral
-                            pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
-                            pnl_pct_sign = "+" if pnl_pct >= 0 else ""
-
-                            proj_sign = "+" if proj >= 0 else ""
-                            chg_sign = "+" if price_chg >= 0 else ""
-                            sym = pos.symbol or ""
-                            msg += (
-                                f"  TP{tp_num}{close_pct_str} @ ${tp_price:,.2f}\n"
-                                f"     ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
-                            )
-                        elif tp_price:
-                            msg += f"  TP{tp_num}{close_pct_str} @ ${tp_price:,.2f}\n"
+                    if tp_price and pos.entry_price and pos.entry_price > 0:
+                        if pos.is_long:
+                            pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
                         else:
-                            msg += f"  TP{tp_num} @ unknown\n"
+                            pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
 
-                    # SL at the bottom — deduplicate if multiple exist on-chain
-                    if len(sl_orders) > 1:
-                        msg += f"  ⚠️ {len(sl_orders)} SL orders found\n"
-                    shown_sl = sl_orders[:1]
-                    for o in shown_sl:
-                        sl_price = o.get("trigger_price", 0) or 0
-                        if sl_price and pos.entry_price and pos.entry_price > 0:
-                            price_chg = ((sl_price - pos.entry_price) / pos.entry_price) * 100
+                        tp_close_size = tp_size if tp_size > 0 else pos.size_usd
+                        proj = pnl_per_dollar * tp_close_size
 
-                            if pos.is_long:
-                                pnl_per_dollar = (sl_price - pos.entry_price) / pos.entry_price
-                            else:
-                                pnl_per_dollar = (pos.entry_price - sl_price) / pos.entry_price
+                        collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                        tp_collateral = collateral * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else collateral
+                        proj_pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
 
-                            proj = pnl_per_dollar * pos.size_usd
+                        msg += (
+                            f"Target {tp_num} ({close_pct_str}${tp_price:,.2f})\n"
+                            f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
+                        )
+                    elif tp_price:
+                        msg += f"Target {tp_num} ({close_pct_str}${tp_price:,.2f})\n"
+                    else:
+                        msg += f"Target {tp_num} @ unknown\n"
 
-                            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
-                            pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
-                            pnl_pct_sign = "+" if pnl_pct >= 0 else ""
-
-                            proj_sign = "+" if proj >= 0 else ""
-                            chg_sign = "+" if price_chg >= 0 else ""
-                            sym = pos.symbol or ""
-                            msg += (
-                                f"  SL  @ ${sl_price:,.2f}\n"
-                                f"     ({pnl_pct_sign}{pnl_pct:.1f}% PnL, {proj_sign}${proj:,.2f} projected, {sym} {chg_sign}{price_chg:.2f}%)\n"
-                            )
-                        elif sl_price:
-                            msg += f"  SL  @ ${sl_price:,.2f}\n"
+                # Stop Loss
+                if len(sl_orders) > 1:
+                    msg += f"⚠️ {len(sl_orders)} Stop Loss orders found\n"
+                for o in sl_orders[:1]:
+                    sl_price = o.get("trigger_price", 0) or 0
+                    if sl_price and pos.entry_price and pos.entry_price > 0:
+                        if pos.is_long:
+                            pnl_per_dollar = (sl_price - pos.entry_price) / pos.entry_price
                         else:
-                            msg += f"  SL  @ unknown\n"
+                            pnl_per_dollar = (pos.entry_price - sl_price) / pos.entry_price
+
+                        proj = pnl_per_dollar * pos.size_usd
+                        collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                        proj_pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
+
+                        msg += (
+                            f"Stop Loss @ ${sl_price:,.2f}\n"
+                            f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
+                        )
+                    elif sl_price:
+                        msg += f"Stop Loss @ ${sl_price:,.2f}\n"
+                    else:
+                        msg += f"Stop Loss @ unknown\n"
 
                 if limit_orders:
-                    msg += "  Limit Orders:\n"
                     for o in limit_orders:
                         lp = o.get("trigger_price", 0) or 0
                         price_str = f"${lp:,.2f}" if lp else "market"
                         size = o.get("size_usd", 0) or 0
-                        msg += f"    Limit @ {price_str}  (${size:,.2f})\n"
-
-            total_pnl = sum(p.unrealized_pnl for p in positions)
-            total_size = sum(p.size_usd for p in positions)
-            total_collateral = sum(p.collateral_amount for p in positions)
-            pnl_pct_str = f" ({total_pnl / total_collateral * 100:+.1f}%)" if total_collateral > 0 else ""
-            any_onchain = any(getattr(p, 'pnl_source', 'local') == "onchain" for p in positions)
-            pnl_tag = " (on-chain)" if any_onchain else ""
-            msg += f"\nTotal Size: ${total_size:,.2f}  |  Collateral: ${total_collateral:,.2f}  |  PnL: ${total_pnl:+.2f}{pnl_pct_str}{pnl_tag}\n"
+                        msg += f"Limit @ {price_str} (${size:,.2f})\n"
 
         # Pending limit entry orders
         pending_entries = [
@@ -801,7 +787,9 @@ class CoreTelegramMixin:
             and o["market"].lower() not in open_pos_markets
         ]
         if pending_entries:
-            msg += f"\n**Limit Orders ({len(pending_entries)})** _(pending entry)_\n"
+            if need_separator:
+                msg += SEPARATOR
+            msg += f"**Limit Orders ({len(pending_entries)})** _(pending entry)_\n"
             for o in pending_entries:
                 side = "LONG" if o.get("is_long") else "SHORT"
                 tp = o.get("trigger_price", 0) or 0
@@ -810,41 +798,116 @@ class CoreTelegramMixin:
 
         # ── Bitunix Positions (from internal tracking) ──
         if bx_positions:
-            msg += f"\n**Bitunix Positions ({len(bx_positions)})**\n"
             for i, pos in enumerate(bx_positions, 1):
+                if need_separator:
+                    msg += SEPARATOR
+                need_separator = True
+
                 pnl = pos.unrealized_pnl or 0.0
-                pnl_icon = "+" if pnl >= 0 else ""
                 collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
                 pnl_pct = (pnl / collateral * 100) if collateral > 0 else 0.0
                 current_str = f"${pos.current_price:,.2f}" if pos.current_price else "N/A"
 
+                # Price change % from entry
+                price_chg_str = ""
+                if pos.current_price and pos.entry_price and pos.entry_price > 0:
+                    price_chg = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100
+                    price_chg_str = f" ({price_chg:+.0f}%)"
+
+                # Realized PnL from verified_decreases
+                realized_pnl = sum(
+                    d.get("net_pnl_usd", 0)
+                    for d in (pos.verified_decreases or [])
+                )
+                tp_hits = len(pos.verified_decreases or [])
+                sl_label = getattr(pos, 'sl_move_label', None)
+
                 msg += (
-                    f"\n**#{i} {pos.symbol} {pos.side}** [BITUNIX]\n"
-                    f"  Size:    ${pos.size_usd:,.2f} @ {pos.leverage:.1f}x\n"
-                    f"  Entry:   ${pos.entry_price:,.2f}\n"
-                    f"  Current: {current_str}\n"
-                    f"  PnL:     {pnl_icon}${pnl:,.2f} ({pnl_icon}{pnl_pct:.1f}%)\n"
+                    f"\n**#{i} {pos.symbol} {pos.side} BITUNIX**\n"
+                    f"${pos.size_usd:,.2f} @ {pos.leverage:.1f}x - Collateral: ${collateral:,.2f}\n"
+                    f"Entry: ${pos.entry_price:,.2f} - Current: {current_str}{price_chg_str}\n"
                 )
 
+                if tp_hits > 0:
+                    total_pnl_combined = realized_pnl + pnl
+                    msg += (
+                        f"Realized: {_fmt_sign(realized_pnl)} - "
+                        f"Unrealized: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+                        f"  Total PnL: {_fmt_sign(total_pnl_combined)}\n"
+                    )
+                else:
+                    msg += f"PnL: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+
+                # Targets from _bx_tp_tracking
                 tracked = self._bx_tp_tracking.get(pos.id, [])
                 if tracked:
-                    tp_hits = sum(1 for t in tracked if t.get("hit"))
-                    msg += f"  TPs:     {tp_hits}/{len(tracked)} hit\n"
-                    for j, tp in enumerate(sorted(tracked, key=lambda t: t.get("price", 0)), 1):
-                        status = "HIT" if tp.get("hit") else "pending"
-                        icon = " ✅" if tp.get("hit") else ""
+                    is_long = pos.side == "LONG"
+                    sorted_tracked = sorted(
+                        tracked,
+                        key=lambda t: t.get("price", 0),
+                        reverse=not is_long,
+                    )
+
+                    # Build map from verified_decreases for per-target realized PnL
+                    vd_by_price = {}
+                    for d in (pos.verified_decreases or []):
+                        mp = d.get("matched_tp_price", 0)
+                        if mp > 0:
+                            vd_by_price[mp] = d
+
+                    for j, tp in enumerate(sorted_tracked, 1):
                         tp_price = tp.get("price", 0) or 0
                         tp_pct = tp.get("pct", 0) or 0
-                        msg += f"  TP{j}{icon} @ ${tp_price:,.2f} ({tp_pct:.0%}) — {status}\n"
+                        pct_str = f"{tp_pct * 100:.0f}" if tp_pct >= 0.01 else f"{tp_pct * 100:.1f}"
+
+                        if tp.get("hit"):
+                            # Find realized PnL for this specific target
+                            vd = vd_by_price.get(tp_price, {})
+                            hit_pnl = vd.get("net_pnl_usd", 0)
+                            pnl_str = f" {_fmt_sign(hit_pnl)}" if hit_pnl != 0 else ""
+                            msg += f"Target {j} ✅ ${tp_price:,.2f} (closed {pct_str}%{pnl_str})\n"
+                        else:
+                            msg += f"Target {j} (closes {pct_str}% @ ${tp_price:,.2f})\n"
+                            # Projected PnL for pending targets
+                            if tp_price and pos.entry_price and pos.entry_price > 0:
+                                if is_long:
+                                    pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
+                                else:
+                                    pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
+                                tp_close_size = pos.size_usd * tp_pct if tp_pct > 0 else pos.size_usd
+                                proj = pnl_per_dollar * tp_close_size
+                                tp_collateral = collateral * tp_pct if tp_pct > 0 else collateral
+                                proj_pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
+                                msg += f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
 
                 if pos.stop_loss and pos.stop_loss > 0:
-                    sl_label = f" ({pos.sl_move_label})" if getattr(pos, 'sl_move_label', None) else ""
-                    msg += f"  SL  @ ${pos.stop_loss:,.2f}{sl_label}\n"
+                    sl_move = f" ({pos.sl_move_label})" if sl_label else ""
+                    msg += f"Stop Loss @ ${pos.stop_loss:,.2f}{sl_move}\n"
+                    if pos.entry_price and pos.entry_price > 0:
+                        if pos.side == "LONG":
+                            pnl_per_dollar = (pos.stop_loss - pos.entry_price) / pos.entry_price
+                        else:
+                            pnl_per_dollar = (pos.entry_price - pos.stop_loss) / pos.entry_price
+                        proj = pnl_per_dollar * pos.size_usd
+                        proj_pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
+                        msg += f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
 
                 if pos.opened_at:
                     dur_h = (time.time() - pos.opened_at) / 3600
-                    msg += f"  Duration: {dur_h:.1f}h\n"
+                    msg += f"Duration: {dur_h:.1f}h\n"
 
+        # Summary footer
+        if positions or bx_positions:
+            msg += SEPARATOR
+
+        if positions:
+            total_pnl = sum(p.unrealized_pnl for p in positions)
+            total_size = sum(p.size_usd for p in positions)
+            total_collateral = sum(p.collateral_amount for p in positions)
+            pnl_pct_str = f" ({total_pnl / total_collateral * 100:+.1f}%)" if total_collateral > 0 else ""
+            msg += f"GMX: ${total_size:,.0f} size | PnL: {_fmt_sign(total_pnl)}{pnl_pct_str}\n"
+
+        if bx_positions:
             bx_total_pnl = sum(p.unrealized_pnl or 0 for p in bx_positions)
             bx_total_size = sum(p.size_usd for p in bx_positions)
             bx_total_collateral = sum(
@@ -852,7 +915,12 @@ class CoreTelegramMixin:
                 for p in bx_positions
             )
             bx_pnl_pct = f" ({bx_total_pnl / bx_total_collateral * 100:+.1f}%)" if bx_total_collateral > 0 else ""
-            msg += f"\nBitunix Total: ${bx_total_size:,.0f} size  |  PnL: ${bx_total_pnl:+.2f}{bx_pnl_pct}\n"
+            msg += f"BITUNIX: ${bx_total_size:,.0f} size | PnL: {_fmt_sign(bx_total_pnl)}{bx_pnl_pct}\n"
+
+        if positions and bx_positions:
+            combined_pnl = sum(p.unrealized_pnl for p in positions) + sum(p.unrealized_pnl or 0 for p in bx_positions)
+            combined_size = sum(p.size_usd for p in positions) + sum(p.size_usd for p in bx_positions)
+            msg += f"Combined: ${combined_size:,.0f} size | PnL: {_fmt_sign(combined_pnl)}\n"
 
         await self.send_message(chat_id, msg)
 
@@ -924,7 +992,7 @@ class CoreTelegramMixin:
             # Show Bitunix positions
             if bx_positions:
                 idx = len(positions) + 1 if positions else 1
-                msg += f"\n**Bitunix Positions ({len(bx_positions)})**\n"
+                msg += f"\n**BITUNIX Positions ({len(bx_positions)})**\n"
                 for i, bp in enumerate(bx_positions, idx):
                     pnl = bp.unrealized_pnl or 0
                     pnl_sign = "+" if pnl >= 0 else ""
@@ -1151,7 +1219,7 @@ class CoreTelegramMixin:
             side = "LONG" if cp.is_long else "SHORT"
             pnl_sign = "+" if cp.unrealized_pnl >= 0 else ""
             msg += (
-                f"**{i}.** {cp.symbol} {side} [W{wid}]\n"
+                f"**{i}.** {cp.symbol} {side} GMX\n"
                 f"   Size: ${cp.size_usd:,.2f} @ {cp.leverage:.1f}x\n"
                 f"   Entry: ${cp.entry_price:,.2f}  |  Current: ${cp.current_price:,.2f}\n"
                 f"   Collateral: ${cp.collateral_amount:,.2f}\n"
@@ -1241,7 +1309,7 @@ class CoreTelegramMixin:
 
         await self.send_message(
             chat_id,
-            f"Increasing {cp.symbol} {side} [W{wid}]\n"
+            f"Increasing {cp.symbol} {side} GMX\n"
             f"Adding: ${amount:.2f} collateral → ${additional_size:.2f} size @ {cp.leverage:.1f}x\n"
             "Executing..."
         )
@@ -1301,7 +1369,7 @@ class CoreTelegramMixin:
 
         await self.send_message(
             chat_id,
-            f"Decreasing {cp.symbol} {side} [W{wid}]\n"
+            f"Decreasing {cp.symbol} {side} GMX\n"
             f"Removing: ${amount:.2f} collateral → -${size_reduction:.2f} size @ {cp.leverage:.1f}x\n"
             "Executing..."
         )
@@ -1637,11 +1705,8 @@ class CoreTelegramMixin:
     _last_pnl_threshold: int = 0
 
     async def pnl_alert_loop(self):
-        """Check total PnL % every 60s and alert when it crosses a 10% threshold.
-
-        Also records a balance snapshot and syncs positions every hour.
-        """
-        _hour_counter = 0  # track iterations for hourly tasks
+        """Hourly housekeeping: balance snapshot + position sync."""
+        _hour_counter = 0
         while True:
             try:
                 await asyncio.sleep(60)
@@ -1662,55 +1727,10 @@ class CoreTelegramMixin:
                     except Exception as e:
                         self.logger.debug(f"Hourly position sync failed: {e}")
 
-                # Fetch all open positions across wallets
-                PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
-                total_pnl = 0.0
-                total_collateral = 0.0
-                pos_lines = []
-                try:
-                    for wid, acct in self._all_wallets():
-                        cps = await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
-                        for cp in cps:
-                            sym = cp.symbol.upper().split("/")[0]
-                            if sym not in PNL_SYMBOLS:
-                                continue
-                            total_pnl += cp.unrealized_pnl
-                            total_collateral += cp.collateral_amount
-                            side = "LONG" if cp.is_long else "SHORT"
-                            p_sign = "+" if cp.unrealized_pnl >= 0 else ""
-                            pct_sign = "+" if cp.pnl_percentage >= 0 else ""
-                            pos_lines.append(
-                                f"{sym} {side} [W{wid}]  {p_sign}${cp.unrealized_pnl:,.2f} ({pct_sign}{cp.pnl_percentage:.1f}%)"
-                            )
-                except Exception as e:
-                    self.logger.debug(f"PnL alert: could not fetch positions: {e}")
-                    continue
-
-                if not pos_lines or total_collateral <= 0:
-                    continue
-
-                total_pct = total_pnl / total_collateral * 100
-                # Bucket: -10.3% → -1, +22% → +2, +5% → 0
-                if total_pct >= 0:
-                    bucket = int(total_pct // 10)
-                else:
-                    bucket = -int((-total_pct) // 10)
-                    if (-total_pct) % 10 != 0:
-                        bucket -= 1
-
-                if bucket != self._last_pnl_threshold:
-                    self._last_pnl_threshold = bucket
-                    await self._send_pnl_alert(total_pnl, total_pct, pos_lines)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"PnL alert loop error: {e}")
-
-    async def _send_pnl_alert(self, total_pnl: float, total_pct: float, pos_lines: list):
-        """Format and send a PnL threshold alert."""
-        t_sign = "+" if total_pnl >= 0 else ""
-        pct_sign = "+" if total_pct >= 0 else ""
+                self.logger.error(f"Housekeeping loop error: {e}")
         msg = f"PnL Alert: {t_sign}${total_pnl:,.2f} ({pct_sign}{total_pct:.1f}%)\n\n"
         msg += "\n".join(pos_lines)
         await self.notify(msg)
@@ -1778,10 +1798,25 @@ class CoreTelegramMixin:
                     pnl_pct_h = cp.pnl_percentage
                     pnl_pct_sign = "+" if pnl_pct_h >= 0 else ""
                     open_lines.append(
-                        f"  {sym} {side} [W{wid}]: {t_sign}${total_pos:,.2f} ({pnl_pct_sign}{pnl_pct_h:.1f}%)"
+                        f"    {sym} {side} GMX: {t_sign}${total_pos:,.2f} ({pnl_pct_sign}{pnl_pct_h:.1f}%)"
                     )
         except Exception as e:
             self.logger.warning(f"PnL Update: could not fetch positions: {e}")
+
+        # ── Bitunix open positions (unrealized PnL) ──
+        for pos in self.positions.values():
+            if not pos.is_open or getattr(pos, 'exchange', 'gmx') != 'bitunix':
+                continue
+            bx_pnl = pos.unrealized_pnl or 0.0
+            unrealized_pnl += bx_pnl
+            open_count += 1
+            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+            bx_pct = (bx_pnl / collateral * 100) if collateral > 0 else 0.0
+            p_sign = "+" if bx_pnl >= 0 else ""
+            pct_sign = "+" if bx_pct >= 0 else ""
+            open_lines.append(
+                f"    {pos.symbol} {pos.side} BITUNIX: {p_sign}${bx_pnl:,.2f} ({pct_sign}{bx_pct:.1f}%)"
+            )
 
         # Today's total = closed trades + open unrealized
         today_total = realized_pnl + unrealized_pnl
@@ -1805,70 +1840,36 @@ class CoreTelegramMixin:
 
         msg = f"PnL Update — {now.strftime('%I:%M %p ET')}\n\n"
 
-        msg += f"**Today ({realized_count} closed)**\n"
-        msg += f"  Closed:     {r_sign}${realized_pnl:,.2f}\n"
+        msg += f"  Realized:   {r_sign}${realized_pnl:,.2f}\n"
         msg += f"  Unrealized: {u_sign}${unrealized_pnl:,.2f} ({open_count} open)\n"
         if open_lines:
             msg += "\n".join(open_lines) + "\n"
-        msg += f"  Today Total: {t_sign}${today_total:,.2f}"
+        msg += f"  Current PnL: {t_sign}${today_total:,.2f}"
 
         await self.notify(msg)
         self.logger.info(f"PnL Update sent: today={t_sign}${today_total:,.2f}")
 
     async def send_weekly_summary(self):
-        """Send weekly summary with lifetime stats and per-symbol breakdown."""
+        """Send weekly summary with lifetime stats."""
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
 
-        PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
-
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            if sym in PNL_SYMBOLS:
-                market_to_sym[addr.lower()] = sym
-
-        all_trades = await self._fetch_and_store_trades()
-
-        def _net(t):
-            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
-
-        tagged = []
-        for t in all_trades:
-            if abs(_net(t)) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                entry = dict(t)
-                entry["_sym"] = sym
-                tagged.append(entry)
-
-        # ── Lifetime stats ──
-        lifetime_pnl = sum(_net(t) for t in tagged)
-        lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
-        lifetime_losses = sum(1 for t in tagged if _net(t) <= 0)
-        lifetime_count = len(tagged)
+        # Use fully-closed trades only (not partial TP hits)
+        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        lifetime_count = len(trades)
+        lifetime_pnl = sum(t.pnl_usd for t in trades)
+        lifetime_wins = sum(1 for t in trades if t.pnl_usd > 0)
+        lifetime_losses = sum(1 for t in trades if t.pnl_usd <= 0)
         lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
-
-        # ── Per-symbol breakdown (lifetime) ──
-        symbol_lines = []
-        for sym in ("BTC", "ETH", "SOL"):
-            sym_trades = [t for t in tagged if t["_sym"] == sym]
-            if sym_trades:
-                sym_pnl = sum(_net(t) for t in sym_trades)
-                sym_sign = "+" if sym_pnl >= 0 else ""
-                sym_w = sum(1 for t in sym_trades if _net(t) > 0)
-                symbol_lines.append(f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}/{len(sym_trades)} wins)")
 
         l_sign = "+" if lifetime_pnl >= 0 else ""
 
         msg = (
             f"Weekly Summary — {now.strftime('%b %d, %Y')}\n\n"
             f"Lifetime ({lifetime_count} trades)\n"
-            f"  PnL: {l_sign}${lifetime_pnl:,.2f}\n"
             f"  Win Rate: {lifetime_winrate:.0f}% ({lifetime_wins}W / {lifetime_losses}L)\n"
+            f"  PnL: {l_sign}${lifetime_pnl:,.2f}"
         )
-        if symbol_lines:
-            msg += "\n".join(symbol_lines)
 
         await self.notify(msg)
         self.logger.info(f"Weekly summary sent: lifetime PnL={l_sign}${lifetime_pnl:,.2f}")

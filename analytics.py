@@ -756,48 +756,23 @@ class AnalyticsMixin:
         """Build the PDF file with closed trade PnL summary + trade list."""
         ET = ZoneInfo("America/New_York")
 
-        # ── Normalize on-chain trades into unified dicts ──
+        # ── Use only fully-closed positions (trade_history), not partial TP hits ──
         unified = []
-        seen_keys = set()
-        for t in on_chain_trades:
-            tx = t.get("tx_hash", "")
-            li = t.get("log_index", 0)
-            key = f"{tx}:{li}" if tx else ""
-            sym = market_to_sym.get((t.get("market_address") or "").lower(), "???")
-            side = "LONG" if t.get("is_long") else "SHORT"
-            pnl = t.get("net_pnl_usd", t.get("pnl_usd", 0.0))
-            unified.append({
-                "symbol": sym,
-                "side": side,
-                "size_usd": t.get("size_delta_usd", 0.0),
-                "pnl_usd": pnl,
-                "timestamp": t.get("timestamp", 0),
-                "tx_hash": tx,
-                "source": "chain",
-            })
-            if key:
-                seen_keys.add(key)
-            if tx:
-                seen_keys.add(tx)  # also track bare tx_hash for local dedup
-
-        # Add local trades that aren't already in on-chain set
         for t in self.trade_history:
-            tx = getattr(t, "tx_hash", "") or getattr(t, "id", "")
-            if tx in seen_keys:
-                continue
             unified.append({
                 "symbol": t.symbol,
                 "side": t.side,
                 "size_usd": t.size_usd,
                 "pnl_usd": t.pnl_usd,
                 "timestamp": t.closed_at,
-                "tx_hash": tx,
+                "tx_hash": getattr(t, "tx_hash", "") or getattr(t, "id", ""),
                 "source": "local",
                 "entry_price": t.entry_price,
                 "exit_price": t.exit_price,
                 "leverage": t.leverage,
                 "exit_reason": t.exit_reason,
                 "pnl_percentage": t.pnl_percentage,
+                "exchange": getattr(t, "exchange", "gmx"),
             })
 
         # Exclude dust trades (< $1 PnL) and sort newest first
@@ -810,7 +785,7 @@ class AnalyticsMixin:
 
         # ── Title ──
         pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 12, "GMX V2 Closed Trades", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.cell(0, 12, "Closed Trades", new_x="LMARGIN", new_y="NEXT", align="C")
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(
             0, 6,
@@ -891,56 +866,67 @@ class AnalyticsMixin:
         pdf.line(10, pdf.get_y(), 200, pdf.get_y())
         pdf.ln(4)
 
-        # ── Trade List (newest first) ──
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
+        # ── Trade List grouped by platform (newest first within each) ──
+        gmx_trades = [t for t in unified if t.get("exchange", "gmx") == "gmx"]
+        bitunix_trades = [t for t in unified if t.get("exchange", "gmx") == "bitunix"]
 
-        for i, t in enumerate(unified, 1):
-            ts = t["timestamp"]
-            if ts:
-                trade_dt = datetime.fromtimestamp(ts, tz=ET)
-                date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
-            else:
-                date_str = "Unknown"
+        def _render_trade_group(trades, group_label):
+            if not trades:
+                return
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, f"{group_label} ({len(trades)})", new_x="LMARGIN", new_y="NEXT")
 
-            pnl = t["pnl_usd"]
-            pnl_sign = "+" if pnl >= 0 else ""
+            for i, t in enumerate(trades, 1):
+                ts = t["timestamp"]
+                if ts:
+                    trade_dt = datetime.fromtimestamp(ts, tz=ET)
+                    date_str = trade_dt.strftime("%b %d, %Y %I:%M %p")
+                else:
+                    date_str = "Unknown"
 
-            # Green for wins, red for losses
-            if pnl >= 0:
-                pdf.set_text_color(0, 128, 0)
-            else:
-                pdf.set_text_color(200, 0, 0)
+                pnl = t["pnl_usd"]
+                pnl_sign = "+" if pnl >= 0 else ""
 
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
+                if pnl >= 0:
+                    pdf.set_text_color(0, 128, 0)
+                else:
+                    pdf.set_text_color(200, 0, 0)
 
-            pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 9)
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.cell(0, 6, f"#{i}  {t['symbol']} {t['side']}", new_x="LMARGIN", new_y="NEXT")
 
-            # Show entry/exit if available (local trades), otherwise just size + PnL
-            if t.get("entry_price") and t.get("exit_price"):
-                pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
-                lev = t.get("leverage", 0)
-                pct = t.get("pnl_percentage", 0)
-                pct_sign = "+" if pct >= 0 else ""
-                pdf.cell(
-                    0, 5,
-                    f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
-                    f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
-                    new_x="LMARGIN", new_y="NEXT",
-                )
-            else:
-                pdf.cell(
-                    0, 5,
-                    f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
-                    new_x="LMARGIN", new_y="NEXT",
-                )
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_font("Helvetica", "", 9)
 
-            reason = t.get("exit_reason", "")
-            reason_str = f"  |  Reason: {reason}" if reason else ""
-            pdf.cell(0, 5, f"  Date: {date_str}{reason_str}", new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(2)
+                if t.get("entry_price") and t.get("exit_price"):
+                    pdf.cell(0, 5, f"  Entry: ${t['entry_price']:,.2f}  |  Exit: ${t['exit_price']:,.2f}", new_x="LMARGIN", new_y="NEXT")
+                    lev = t.get("leverage", 0)
+                    pct = t.get("pnl_percentage", 0)
+                    pct_sign = "+" if pct >= 0 else ""
+                    pdf.cell(
+                        0, 5,
+                        f"  Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  |  "
+                        f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)",
+                        new_x="LMARGIN", new_y="NEXT",
+                    )
+                else:
+                    pdf.cell(
+                        0, 5,
+                        f"  Size: ${t['size_usd']:,.2f}  |  PnL: {pnl_sign}${pnl:,.2f}",
+                        new_x="LMARGIN", new_y="NEXT",
+                    )
+
+                reason = t.get("exit_reason", "")
+                reason_str = f"  |  Reason: {reason}" if reason else ""
+                pdf.cell(0, 5, f"  Date: {date_str}{reason_str}", new_x="LMARGIN", new_y="NEXT")
+                pdf.ln(2)
+
+        _render_trade_group(gmx_trades, "GMX Trades")
+        if gmx_trades and bitunix_trades:
+            pdf.set_draw_color(200, 200, 200)
+            pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+            pdf.ln(4)
+        _render_trade_group(bitunix_trades, "BITUNIX Trades")
 
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
         pdf.output(tmp.name)

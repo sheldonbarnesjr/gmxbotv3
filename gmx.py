@@ -687,7 +687,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Send shutdown notice via Bot API (works even if Telethon is down)
         try:
-            await self.notify_admin(f"🔴 Bot Offline — {reason}")
+            await self.notify_admin("🔴 Bot Offline")
         except Exception:
             pass
 
@@ -1108,6 +1108,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         for pos_id, pos in list(self.positions.items()):
             if not pos.is_open or not pos.market_addr:
                 continue
+            if getattr(pos, 'exchange', 'gmx') != 'gmx':
+                continue  # Bitunix positions verified separately below
             key = (pos.wallet_id, pos.market_addr.lower(), pos.side)
             # If we successfully fetched this wallet's data but the position isn't there
             if pos.wallet_id in wallet_chain_data and key not in on_chain_set:
@@ -1232,36 +1234,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             )
 
         if bx_synced:
-            self.logger.info(f"Restored {bx_synced} Bitunix position(s) from state")
-            # Verify restored Bitunix positions still exist on exchange
-            if self.bitunix_client:
-                try:
-                    from bitunix_executor import to_bitunix_symbol
-                    exchange_positions = await asyncio.to_thread(
-                        self.bitunix_client.get_pending_positions
-                    )
-                    exchange_set = set()
-                    for ep in exchange_positions:
-                        sym = (ep.get("symbol") or "").replace("USDT", "")
-                        if sym.startswith("1000"):
-                            sym = sym[4:]
-                        raw_side = (ep.get("side") or "").upper()
-                        s = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
-                        exchange_set.add((sym, s))
-
-                    for pos in list(self.positions.values()):
-                        if not pos.is_open or getattr(pos, 'exchange', 'gmx') != 'bitunix':
-                            continue
-                        if (pos.symbol, pos.side) not in exchange_set:
-                            self.logger.warning(
-                                f"Sync: Bitunix {pos.symbol} {pos.side} not found on exchange — marking closed"
-                            )
-                            pos.is_open = False
-                            pos.closed_at = time.time()
-                            pos.exit_reason = "closed_while_offline"
-                            bx_synced -= 1
-                except Exception as e:
-                    self.logger.warning(f"Could not verify Bitunix positions on startup: {e}")
+            self.logger.info(
+                f"Restored {bx_synced} Bitunix position(s) from state "
+                f"(will be verified by monitor loop)"
+            )
 
         # ── Post-sync: verify SL is at the correct level for inferred TP hits ──
         # Only on startup — skip when user runs /sync (SL is already on-chain)
@@ -1751,17 +1727,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 return
 
             # Notify that we're executing
-            tp_list = ", ".join(f"${tp.price:,.0f} ({tp.close_pct:.0%})" for tp in signal.take_profits)
+            ex_mode = getattr(self, 'exchange_mode', 'gmx')
+            if ex_mode == 'mirror':
+                ex_label = "GMX & BITUNIX"
+            elif ex_mode == 'bitunix':
+                ex_label = "BITUNIX"
+            else:
+                ex_label = "GMX"
             await self.notify(
-                f"Executing {signal.symbol} {signal.side}{wallet_label} [{type_label}]\n"
-                f"Entry: ${signal.entry_low:,.0f}-${signal.entry_high:,.0f}\n"
-                f"TP: {tp_list}\n"
-                f"SL: ${signal.stop_loss:,.0f}\n"
-                f"Portfolio: ${total_portfolio:.0f} (free: ${free_usdc:.0f} + deployed)\n"
-                f"Sizing: {self.cfg.portfolio_pct:.0%} of {sizing_label}\n"
-                f"Collateral: ${collateral_usd:.0f}\n"
-                f"Size: ${size_usd:.0f} @ {signal.leverage:.0f}x\n"
-                f"Mode: {'DRY RUN' if self.cfg.dry_run else 'LIVE'}"
+                f"Executing {signal.symbol} {signal.side} {ex_label} [{type_label}]\n"
+                f"Entry: ${signal.entry_low:,.0f}-${signal.entry_high:,.0f}"
             )
 
             # Check that the selected wallet has enough USDC for the collateral.
@@ -2037,13 +2012,13 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bx_pos.signal_id = getattr(signal, 'signal_id', None) or signal.symbol
                     self.positions[bx_pos.id] = bx_pos
                     self._save_position_state()
-                    await self.notify(f"[MIRROR] Bitunix {signal.symbol} {signal.side} opened successfully")
+                    await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} opened successfully")
                 else:
-                    await self.notify(f"[MIRROR] Bitunix {signal.symbol} {signal.side} FAILED")
+                    await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} FAILED")
             except Exception as e:
                 bx_pos = None
                 self.logger.error(f"[MIRROR] Bitunix execution failed: {e}")
-                await self.notify(f"[MIRROR] Bitunix error: {e}")
+                await self.notify(f"[MIRROR] BITUNIX error: {e}")
 
             # Return GMX result if available; fall back to Bitunix position
             # so the signal is still marked as executed even if GMX failed
@@ -2175,14 +2150,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 status_parts.append(f"{len(failed_tps)} TP FAILED")
             status_parts.append(f"SL {'placed' if sl_result else 'FAILED'}")
 
+            total_placed = len(placed_tps) + (1 if sl_result else 0)
+            total_failed = len(failed_tps) + (0 if sl_result else 1)
+            if total_failed == 0:
+                order_line = f"{total_placed} open orders placed successfully ✅"
+            else:
+                order_line = f"{total_placed} open orders placed, {total_failed} FAILED ❌"
             await self.notify(
-                f"**Position Opened** [BITUNIX]\n"
+                f"Position Opened (BITUNIX) ✅\n\n"
                 f"{signal.symbol} {signal.side} {signal.leverage:.0f}x\n"
                 f"Entry: ${entry_price:,.2f}\n"
                 f"Size: ${size_usd:,.2f} (${collateral:,.2f} collateral)\n"
-                f"SL: ${signal.stop_loss:,.2f}\n"
-                f"{tp_list}\n"
-                f"Orders: {', '.join(status_parts)}"
+                f"{order_line}"
             )
 
             self.logger.info(
@@ -2795,44 +2774,15 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bs = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
                     remaining_pct = max(100.0 - (total_decreased / bs * 100 if bs > 0 else 0), 0)
 
-                    if exit_reason == "All TPs Filled":
-                        close_line = "All TPs Filled"
-                    elif "Closed at" in exit_reason:
-                        close_line = f"Closed {remaining_pct:.0f}% at {pos.sl_move_label or 'Entry'} (${exit_price:,.2f})"
-                    elif exit_reason == "SL Hit":
-                        close_line = f"SL Hit (${exit_price:,.2f})"
-                    else:
-                        close_line = exit_reason
-
+                    pnl_icon = "✅" if total_pnl >= 0 else "❌"
                     msg = (
-                        f"**Position Closed**\n\n"
-                        f"{pos.symbol} {pos.side} [W{pos.wallet_id}]\n"
-                        f"{close_line}\n"
+                        f"Position Closed GMX\n\n"
+                        f"{pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
                         f"Exit: ${exit_price:,.2f}\n"
-                    )
-                    # Show realized/remaining breakdown only if TPs were partially hit
-                    if realized_pnl != 0 and tp_hits > 0 and exit_reason != "All TPs Filled":
-                        r_sign = "+" if realized_pnl >= 0 else ""
-                        rm_sign = "+" if remaining_pnl >= 0 else ""
-                        msg += (
-                            f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
-                            f"Remaining:      {rm_sign}${remaining_pnl:,.2f}\n"
-                        )
-                    msg += (
-                        f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
+                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_sign}{abs(pnl_pct):.1f}%) {pnl_icon}\n"
                         f"Duration: {duration:.1f}h"
                     )
-
-                    # Build targets line: TP1 ✅ TP2 ✅ TP3 TP4 TP5
-                    if total_tps > 0:
-                        targets = []
-                        for i in range(total_tps):
-                            label = f"TP{i+1}"
-                            if i < tp_hits:
-                                label += " ✅"
-                            targets.append(label)
-                        msg += f"\n\nTargets: {' '.join(targets)}"
                 await self.notify(msg)
 
                 # Track liquidation in health stats
@@ -2862,12 +2812,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                                 await self._record_trade(mirror_pos, exit_reason=mirror_pos.exit_reason)
                                 self._clear_position_state(mirror_pos)
                                 await self.notify(
-                                    f"[MIRROR] Bitunix {pos.symbol} {pos.side} auto-closed "
+                                    f"[MIRROR] BITUNIX {pos.symbol} {pos.side} auto-closed "
                                     f"(GMX {exit_reason})"
                                 )
                             else:
                                 await self.notify(
-                                    f"⚠️ [MIRROR] Failed to auto-close Bitunix {pos.symbol} {pos.side}. "
+                                    f"⚠️ [MIRROR] Failed to auto-close BITUNIX {pos.symbol} {pos.side}. "
                                     f"Use /close {pos.symbol} to close manually."
                                 )
                     except Exception as me:

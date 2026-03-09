@@ -237,14 +237,15 @@ class SLTPMixin:
 
                     col = pos.collateral_usd
                     pnl_pct_str = f" ({total_pnl / col * 100:+.1f}%)" if col > 0 else ""
+                    # Get execution price from the latest verified decrease
+                    latest_vd = pos.verified_decreases[-1] if pos.verified_decreases else {}
+                    exec_price = latest_vd.get("execution_price", pos.current_price or 0)
                     try:
                         await self.notify(
-                            f"✅ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                            f"TP{pos.tp_hits_count} hit @ ${pos.current_price:,.0f}\n"
-                            f"TPs: {pos.tp_hits_count}/{len(pos.take_profits)}\n"
-                            f"Realized:   {r_sign}${realized_pnl:,.2f}\n"
+                            f"GMX {pos.symbol} {pos.side} {pos.leverage:.1f}x: Target {pos.tp_hits_count} Hit ✅\n"
+                            f"Realized: {r_sign}${realized_pnl:,.2f} @ ${exec_price:,.2f}\n"
                             f"Unrealized: {u_sign}${unrealized_pnl:,.2f}\n"
-                            f"Total PnL:  {t_sign}${total_pnl:,.2f}{pnl_pct_str}"
+                            f"Total PnL: {t_sign}${total_pnl:,.2f}{pnl_pct_str}"
                         )
                     except Exception:
                         pass
@@ -700,6 +701,7 @@ class SLTPMixin:
                 self.logger.debug(f"Post-creation SL verify failed: {e}")
 
             # 4. Update in-memory state
+            old_sl = pos.stop_loss
             pos.sl_moved_to_entry = True
             pos.sl_move_label = sl_label
             pos.stop_loss = new_sl_price
@@ -710,11 +712,10 @@ class SLTPMixin:
 
             # 5. Notify admin (auto mode only — manual callers send their own)
             if not manual:
+                old_sl_str = f"${old_sl:,.2f}" if old_sl else "None"
                 await self.notify(
-                    f"🎯 {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                    f"{pos.tp_hits_count} TP(s) hit!\n"
-                    f"SL moved to {sl_label} (${new_sl_price:,.2f})\n"
-                    f"TX: {new_sl_txh}"
+                    f"SL Moved GMX {pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
+                    f"{old_sl_str} -> ${new_sl_price:,.2f} ({sl_label}) ✅"
                 )
 
         except Exception as e:
