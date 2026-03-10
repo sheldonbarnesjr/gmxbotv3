@@ -25,7 +25,7 @@ import asyncio
 import logging
 import tempfile
 import statistics
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -208,10 +208,10 @@ class AnalyticsMixin:
         # Preserve Bitunix trades (not on-chain, would be lost otherwise)
         bitunix_trades = [t for t in self.trade_history
                           if getattr(t, 'exchange', 'gmx') == 'bitunix']
+        self.logger.info(f"Rebuild: preserving {len(bitunix_trades)} Bitunix trade(s)")
 
-        # Clear GMX trades and on-chain cache
+        # Clear GMX trades (Bitunix trades are kept in the list)
         self.trade_history = list(bitunix_trades)
-        self._save_onchain_trades([])
 
         # Fetch fresh on-chain events across all wallets
         on_chain, all_created_orders = await self._fetch_and_store_trades()
@@ -620,7 +620,7 @@ class AnalyticsMixin:
             data = [asdict(t) for t in self.trade_history]
             atomic_json_write(TRADE_HISTORY_FILE, data)
         except Exception as e:
-            logger.warning(f"Failed to save trade history: {e}")
+            logger.error(f"CRITICAL: Failed to save trade history: {e}", exc_info=True)
 
     async def cmd_reset(self, chat_id: int):
         """Wipe local trade history cache. Hidden command."""
@@ -636,15 +636,25 @@ class AnalyticsMixin:
         if data:
             self.trade_history = []
             skipped = 0
+            valid_fields = {f.name for f in fields(TradeRecord)}
             for record in data:
                 try:
-                    self.trade_history.append(TradeRecord(**record))
+                    filtered = {k: v for k, v in record.items() if k in valid_fields}
+                    self.trade_history.append(TradeRecord(**filtered))
                 except Exception as e:
                     skipped += 1
-                    logger.warning(f"Skipping corrupt trade record: {e}")
+                    logger.warning(
+                        f"Skipping corrupt trade record "
+                        f"(id={record.get('id','?')}, exchange={record.get('exchange','?')}): {e}"
+                    )
+            gmx_count = sum(1 for t in self.trade_history if t.exchange == 'gmx')
+            bx_count = sum(1 for t in self.trade_history if t.exchange == 'bitunix')
             if skipped:
                 logger.warning(f"Skipped {skipped} corrupt trade record(s)")
-            logger.info(f"Loaded {len(self.trade_history)} trade(s) from {TRADE_HISTORY_FILE}")
+            logger.info(
+                f"Loaded {len(self.trade_history)} trade(s) from {TRADE_HISTORY_FILE} "
+                f"({gmx_count} GMX, {bx_count} Bitunix)"
+            )
 
     def get_health_report(self) -> Dict[str, Any]:
         """Get bot health status.

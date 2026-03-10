@@ -565,12 +565,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Load persisted trade history first so Bitunix trades can be preserved
         self._load_trade_history()
+        bx_loaded = sum(1 for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix')
+        self.logger.info(f"Post-load: {len(self.trade_history)} trades ({bx_loaded} Bitunix)")
 
         # Rebuild trade history from on-chain data (clear + re-fetch + group)
         # This ensures a clean state every restart, grouping all position
         # decreases for the same trade into a single aggregated record.
         try:
             await self._rebuild_trade_history_from_chain()
+            bx_after = sum(1 for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix')
+            self.logger.info(f"Post-rebuild: {len(self.trade_history)} trades ({bx_after} Bitunix)")
         except Exception as e:
             self.logger.warning(f"Trade history rebuild failed: {e}")
             self._load_trade_history()  # fallback to persisted data
