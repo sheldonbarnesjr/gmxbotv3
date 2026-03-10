@@ -1218,8 +1218,11 @@ class AnalyticsMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     async def cmd_pdf(self, chat_id: int):
-        """Generate and send a PDF with PnL summary + full trade history."""
-        await self.send_message(chat_id, "Fetching on-chain trades & generating PDF...")
+        """Generate and send a PDF with PnL summary + full trade history.
+
+        Queries GMX on-chain + Bitunix API directly — no dependency on trade_history.json.
+        """
+        await self.send_message(chat_id, "Fetching trades from chain & exchange API...")
 
         # Build market_address → symbol map
         PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
@@ -1231,13 +1234,22 @@ class AnalyticsMixin:
         # Fetch on-chain trades (merged with local store)
         on_chain, _created_orders = await self._fetch_and_store_trades()
 
-        if not on_chain and not self.trade_history:
+        # Fetch Bitunix closed trades from API
+        bx_trades = []
+        if self.bitunix_client:
+            try:
+                bx_trades = await self._fetch_bitunix_trade_history()
+                self.logger.info(f"/trades: {len(bx_trades)} Bitunix trade(s) from API")
+            except Exception as e:
+                self.logger.warning(f"/trades: Bitunix fetch failed: {e}")
+
+        if not on_chain and not bx_trades:
             await self.send_message(chat_id, "No trades to export.")
             return
 
         try:
             pdf_path = await asyncio.to_thread(
-                self._generate_trade_pdf, on_chain, market_to_sym
+                self._generate_trade_pdf, on_chain, market_to_sym, bx_trades
             )
             bot_api_chats = getattr(self, '_bot_api_chats', set())
             if chat_id in bot_api_chats:
@@ -1253,8 +1265,14 @@ class AnalyticsMixin:
             self.logger.error(f"PDF generation failed: {e}")
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
-    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict) -> str:
-        """Build the PDF file with 3-column PnL summary + 3-column trade grid."""
+    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict, bx_api_trades: list = None) -> str:
+        """Build the PDF file with 3-column PnL summary + 3-column trade grid.
+
+        Builds unified trade list from:
+          - GMX: on-chain PositionDecrease events grouped into closed positions
+          - Bitunix: closed positions fetched from exchange API (bx_api_trades)
+        No dependency on trade_history.json.
+        """
         ET = ZoneInfo("America/New_York")
         LMARGIN = 10
         PAGE_W = 210  # A4 width in mm
@@ -1263,9 +1281,62 @@ class AnalyticsMixin:
         COL_W = USABLE_W / 3  # ~63.3mm per column
         LINE_H = 5
 
-        # ── Build unified trade list (GMX + Bitunix) ──
+        # ── Build unified trade list from API sources ──
         unified = []
-        for t in self.trade_history:
+
+        # GMX: group on-chain decreases into closed positions
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for t in on_chain_trades:
+            key = (t.get("market_address", "").lower(), t.get("is_long", True))
+            groups[key].append(t)
+
+        # Exclude currently-open positions
+        open_keys = set()
+        for pos in self.positions.values():
+            if pos.is_open and pos.market_addr:
+                is_long = pos.side == "LONG"
+                open_keys.add((pos.market_addr.lower(), is_long))
+
+        for (market, is_long), events in groups.items():
+            if (market, is_long) in open_keys:
+                continue
+            sym = market_to_sym.get(market)
+            if not sym:
+                continue
+            total_pnl = sum(e.get("pnl_usd", 0) for e in events)
+            if abs(total_pnl) < 1:
+                continue
+            total_size = sum(e.get("size_delta_usd", 0) for e in events)
+            last_ts = max(e.get("timestamp", 0) for e in events)
+            first_ts = min(e.get("timestamp", 0) for e in events)
+            # Try to get entry price from first event
+            entry_p = events[0].get("execution_price", 0) if events else 0
+            exit_p = events[-1].get("execution_price", 0) if events else 0
+            side = "LONG" if is_long else "SHORT"
+            duration_h = (last_ts - first_ts) / 3600 if last_ts > first_ts else 0
+
+            unified.append({
+                "symbol": sym,
+                "side": side,
+                "size_usd": total_size,
+                "pnl_usd": total_pnl,
+                "timestamp": last_ts,
+                "entry_price": entry_p,
+                "exit_price": exit_p,
+                "leverage": 0,
+                "pnl_percentage": 0,
+                "exchange": "gmx",
+                "tp_hits": 0,
+                "tp_details": [],
+                "sl_details": None,
+                "unfilled_targets": [],
+                "duration_hours": duration_h,
+                "opened_at": first_ts,
+            })
+
+        # Bitunix: from API-fetched TradeRecords
+        for t in (bx_api_trades or []):
             unified.append({
                 "symbol": t.symbol,
                 "side": t.side,
@@ -1276,7 +1347,7 @@ class AnalyticsMixin:
                 "exit_price": t.exit_price,
                 "leverage": t.leverage,
                 "pnl_percentage": t.pnl_percentage,
-                "exchange": getattr(t, "exchange", "gmx"),
+                "exchange": getattr(t, "exchange", "bitunix"),
                 "tp_hits": getattr(t, "tp_hits", 0),
                 "tp_details": getattr(t, "tp_details", None) or [],
                 "sl_details": getattr(t, "sl_details", None),
