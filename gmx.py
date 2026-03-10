@@ -591,9 +591,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         except Exception as e:
             self.logger.warning(f"Startup TP catch-up failed: {e}")
 
-        # Verify SL orders exist for all synced positions
+        # Verify SL orders exist for all synced positions (GMX only — Bitunix SLs are on their exchange)
         for pos in list(self.positions.values()):
             if not pos.is_open or not pos.market_addr or not pos.stop_loss:
+                continue
+            if getattr(pos, 'exchange', 'gmx') == 'bitunix':
                 continue
             try:
                 acct = self._get_account(pos.wallet_id)
@@ -1219,18 +1221,21 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 continue
 
             # Parse state key: "wallet_id:market_addr:side"
-            parts = state_key.split(":", 2)
-            if len(parts) < 3:
+            # For Bitunix, market_addr contains colons (e.g. "bitunix:123456"),
+            # so use saved fields instead of parsing from key.
+            parts = state_key.split(":", 1)
+            if len(parts) < 2:
                 continue
             try:
                 wid = int(parts[0])
             except ValueError:
                 continue
-            market_addr = parts[1]
-            side = parts[2]
+            market_addr = saved.get("bitunix_position_id") or parts[1].rsplit(":", 1)[0]
+            market_addr = f"bitunix:{market_addr}" if not market_addr.startswith("bitunix:") else market_addr
+            side = saved.get("side", "")
             symbol = saved.get("symbol", "???")
-            if symbol == "???":
-                continue  # Can't restore without symbol
+            if symbol == "???" or not side:
+                continue  # Can't restore without symbol/side
 
             # Rebuild TPs from saved original_take_profits
             tps = []
