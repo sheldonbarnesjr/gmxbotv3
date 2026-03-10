@@ -6,3 +6,5 @@ fpdf2
 requests
 python-telegram-bot>=20.0
 cryptography
+fastapi
+uvicorn[standard]
