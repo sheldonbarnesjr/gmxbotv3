@@ -121,8 +121,7 @@ class NotificationsMixin:
             f"{position.symbol} {position.side} {position.leverage:.0f}x\n"
             f"Entry: ${position.entry_price:,.2f}\n"
             f"Size: ${position.size_usd:,.2f} (${collateral:,.2f} collateral)\n"
-            f"{total_orders} open orders placed successfully ✅\n"
-            f"TX: {position.tx_hash}"
+            f"{total_orders} open orders placed successfully ✅"
         )
         if order_type == "limit":
             msg += "\n\nLimit order placed — waiting for price to reach entry."

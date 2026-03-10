@@ -1735,7 +1735,7 @@ class CoreTelegramMixin:
                 market_to_sym[addr.lower()] = sym
 
         # ── Today's realized trades from on-chain (all wallets, stored locally) ──
-        all_stored = await self._fetch_and_store_trades()
+        all_stored, _created = await self._fetch_and_store_trades()
         today_trades = [t for t in all_stored if t.get("timestamp", 0) >= today_cutoff]
 
         # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum.
@@ -1855,7 +1855,7 @@ class CoreTelegramMixin:
         try:
             PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
             market_to_sym = {addr.lower(): sym for sym, addr in self.cfg.markets.items() if sym in PNL_SYMBOLS}
-            on_chain = await self._fetch_and_store_trades()
+            on_chain, _created = await self._fetch_and_store_trades()
             pdf_path = await asyncio.to_thread(self._generate_trade_pdf, on_chain, market_to_sym)
 
             # Send via Telethon to notify_chat
@@ -1918,7 +1918,7 @@ class CoreTelegramMixin:
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        all_trades = await self._fetch_and_store_trades()
+        all_trades, _created = await self._fetch_and_store_trades()
 
         def _net(t):
             return t.get("net_pnl_usd", t.get("pnl_usd", 0))
