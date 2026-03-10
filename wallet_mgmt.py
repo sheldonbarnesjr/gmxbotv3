@@ -31,7 +31,7 @@ from open import (
 )
 from state_io import atomic_json_write
 
-BALANCE_SNAPSHOTS_FILE = "balance_snapshots.json"
+BALANCE_SNAPSHOTS_FILE = "json/balance_snapshots.json"
 MAX_SNAPSHOT_AGE_HOURS = 48
 
 
@@ -210,19 +210,28 @@ class WalletMixin:
     # Balance snapshots (for 24h change tracking)
     # ──────────────────────────────────────────────────────────────────────
 
+    _snapshot_lock = None  # initialized in __init__ or first use
+
     def _save_balance_snapshot(self, total_portfolio: float):
-        """Append a balance snapshot and prune entries older than 48h."""
-        snapshots = self._load_balance_snapshots()
-        snapshots.append({
-            "timestamp": time.time(),
-            "total_portfolio": total_portfolio,
-        })
-        cutoff = time.time() - (MAX_SNAPSHOT_AGE_HOURS * 3600)
-        snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
-        try:
-            atomic_json_write(BALANCE_SNAPSHOTS_FILE, snapshots)
-        except Exception as e:
-            self.logger.warning(f"Failed to save balance snapshot: {e}")
+        """Append a balance snapshot and prune entries older than 48h.
+
+        Uses a threading lock to prevent concurrent load-modify-write races.
+        """
+        if self._snapshot_lock is None:
+            import threading
+            self._snapshot_lock = threading.Lock()
+        with self._snapshot_lock:
+            snapshots = self._load_balance_snapshots()
+            snapshots.append({
+                "timestamp": time.time(),
+                "total_portfolio": total_portfolio,
+            })
+            cutoff = time.time() - (MAX_SNAPSHOT_AGE_HOURS * 3600)
+            snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
+            try:
+                atomic_json_write(BALANCE_SNAPSHOTS_FILE, snapshots)
+            except Exception as e:
+                self.logger.warning(f"Failed to save balance snapshot: {e}")
 
     def _load_balance_snapshots(self) -> list:
         """Load balance snapshots from disk."""

@@ -62,12 +62,15 @@ class NotificationsMixin:
             except Exception as e:
                 self.logger.error(f"Notify (Bot API) to {chat_id} failed: {e}")
 
-        if not sent and not self._notify_chat_warned:
-            self.logger.warning(
-                "No notification channels available — set NOTIFY_CHAT or "
-                "TELEGRAM_BOT_TOKEN in .env, and DM the bot to register."
-            )
-            self._notify_chat_warned = True
+        if not sent:
+            if not self._notify_chat_warned:
+                self.logger.warning(
+                    "No notification channels available — set NOTIFY_CHAT or "
+                    "TELEGRAM_BOT_TOKEN in .env, and DM the bot to register."
+                )
+                self._notify_chat_warned = True
+            else:
+                self.logger.warning("Notification delivery failed (all channels)")
 
         return sent
 

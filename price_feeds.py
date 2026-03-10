@@ -39,6 +39,7 @@ class PriceFeedsMixin:
                 break
             except Exception as e:
                 self.logger.error(f"Price update loop error: {e}")
+                await asyncio.sleep(self.cfg.price_update_interval)
 
     async def update_all_prices(self):
         """Fetch fresh prices for all tracked symbols."""
@@ -54,6 +55,15 @@ class PriceFeedsMixin:
                     self.health_stats["price_updates"] += 1
             except Exception as e:
                 self.logger.warning(f"Failed to update {symbol} price: {e}")
+
+        # Check for stale prices — warn if ALL symbols are stale
+        all_stale = all(
+            symbol not in self.price_cache or not self.price_cache[symbol].is_fresh
+            for symbol in ALLOWED_SYMBOLS
+        )
+        if all_stale and self.price_cache:
+            ages = {s: f"{self.price_cache[s].age_seconds:.0f}s" for s in self.price_cache}
+            self.logger.warning(f"All prices stale: {ages}")
 
     async def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current price from cache or fetch if stale."""

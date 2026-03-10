@@ -59,8 +59,7 @@ class BitunixClient:
         self.secret_key = secret_key
         self.timeout = timeout
         self._session = requests.Session()
-        # Rate limiter: simple semaphore-based throttle
-        self._rate_semaphore = threading.Semaphore(max_requests_per_sec)
+        self._max_rps = max_requests_per_sec
         self._rate_lock = threading.Lock()
         self._request_timestamps: list = []
 
@@ -74,7 +73,7 @@ class BitunixClient:
             self._request_timestamps = [
                 t for t in self._request_timestamps if now - t < 1.0
             ]
-            if len(self._request_timestamps) >= 10:
+            if len(self._request_timestamps) >= self._max_rps:
                 sleep_time = 1.0 - (now - self._request_timestamps[0])
                 if sleep_time > 0:
                     time.sleep(sleep_time)

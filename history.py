@@ -17,6 +17,23 @@ from web3 import Web3
 
 log = logging.getLogger("GMXBot.history")
 
+# ── Block timestamp cache ────────────────────────────────────────────────────
+_block_ts_cache: Dict[int, int] = {}
+
+
+def _get_block_ts(w3, block_num: int) -> int:
+    """Return block timestamp, caching results. Returns 0 for pruned blocks."""
+    if block_num in _block_ts_cache:
+        return _block_ts_cache[block_num]
+    try:
+        blk = w3.eth.get_block(block_num)
+        ts = blk["timestamp"]
+    except Exception as e:
+        log.warning(f"Failed to fetch block {block_num} timestamp (pruned?): {e}")
+        return 0
+    _block_ts_cache[block_num] = ts
+    return ts
+
 # GMX V2 EventEmitter on Arbitrum
 _EVENT_EMITTER = "0xC8ee91A54287DB53897056e12D9819156D3822Fb"
 
@@ -55,6 +72,38 @@ _TOKEN_DECIMALS = {
     "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f": 8,   # WBTC
     "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": 6,   # USDT
 }
+
+
+_FALLBACK_CHUNK_SIZE = 500_000  # ~1.5 days on Arbitrum
+
+
+def _chunked_get_logs(w3, filter_params: dict) -> list:
+    """Fetch logs, trying the full range first and chunking only on failure.
+
+    Arbitrum RPCs generally support large log ranges when topic filters narrow
+    the result set.  Only falls back to chunked fetching if the RPC returns an
+    error (e.g. range-too-large or 429).
+    """
+    try:
+        return w3.eth.get_logs(filter_params)
+    except Exception as first_err:
+        log.debug(f"_chunked_get_logs: full-range call failed, chunking: {first_err}")
+
+    from_block = filter_params.get("fromBlock", 0)
+    to_block = filter_params.get("toBlock", w3.eth.block_number)
+
+    all_logs = []
+    chunk_start = from_block
+    while chunk_start <= to_block:
+        chunk_end = min(chunk_start + _FALLBACK_CHUNK_SIZE - 1, to_block)
+        chunk_params = {**filter_params, "fromBlock": chunk_start, "toBlock": chunk_end}
+        try:
+            chunk_logs = w3.eth.get_logs(chunk_params)
+            all_logs.extend(chunk_logs)
+        except Exception as e:
+            log.warning(f"_chunked_get_logs: chunk {chunk_start}-{chunk_end} failed: {e}")
+        chunk_start = chunk_end + 1
+    return all_logs
 
 
 def _get_event_log1_abi():
@@ -121,7 +170,8 @@ def _build_order_type_map(receipt, emitter_addr_lower, el2_contract, order_execu
                 "order_type": order_type,
                 "trigger_price": 0,
             }
-        except Exception:
+        except Exception as e:
+            log.warning(f"Event parse failed (block={rlog.get('blockNumber', '?')}): {e}")
             continue
 
     return order_type_map
@@ -158,7 +208,7 @@ def _fetch_trigger_prices(w3, account, from_block, current_block):
     order_created_topic = "0x" + Web3.keccak(text="OrderCreated").hex()
 
     try:
-        created_logs = w3.eth.get_logs({
+        created_logs = _chunked_get_logs(w3, {
             "address": emitter_addr,
             "fromBlock": from_block,
             "toBlock": current_block,
@@ -212,7 +262,10 @@ def _fetch_trigger_prices(w3, account, from_block, current_block):
 
             if trigger_price_raw > 0:
                 # Price precision = 10^(30 - index_token_decimals)
-                idx_dec = _MARKET_INDEX_DECIMALS.get(market_addr, 18)
+                idx_dec = _MARKET_INDEX_DECIMALS.get(market_addr)
+                if idx_dec is None:
+                    log.warning(f"Unknown market decimals for {market_addr}, defaulting to 18")
+                    idx_dec = 18
                 precision = 10 ** (30 - idx_dec)
                 price = trigger_price_raw / precision
                 trigger_map[order_key_hex] = price
@@ -225,7 +278,8 @@ def _fetch_trigger_prices(w3, account, from_block, current_block):
                     "order_type": order_type,
                     "block_number": rlog["blockNumber"],
                 })
-        except Exception:
+        except Exception as e:
+            log.warning(f"Event parse failed (block={rlog.get('blockNumber', '?')}): {e}")
             continue
 
     log.debug(f"_fetch_trigger_prices: found {len(trigger_map)} trigger prices, {len(all_orders)} orders")
@@ -257,7 +311,7 @@ def _fetch_position_increase_timestamps(
     account_topic = "0x" + "0" * 24 + account_lower.replace("0x", "")
 
     try:
-        logs = w3.eth.get_logs({
+        logs = _chunked_get_logs(w3, {
             "address": emitter_addr,
             "fromBlock": from_block,
             "toBlock": current_block,
@@ -290,15 +344,15 @@ def _fetch_position_increase_timestamps(
                     is_long = item["value"]
 
             block_num = rlog["blockNumber"]
-            blk = w3.eth.get_block(block_num)
-            ts = blk["timestamp"]
+            ts = _get_block_ts(w3, block_num)
 
             key = (market_addr, is_long)
             if key not in result:
                 result[key] = []
             result[key].append(ts)
 
-        except Exception:
+        except Exception as e:
+            log.warning(f"Event parse failed (block={rlog.get('blockNumber', '?')}): {e}")
             continue
 
     # Sort each list of timestamps
@@ -347,7 +401,7 @@ def fetch_trade_history(
 
     # Get all OrderExecuted events where this wallet is topic3
     try:
-        exec_logs = w3.eth.get_logs({
+        exec_logs = _chunked_get_logs(w3, {
             "address": emitter_addr,
             "fromBlock": from_block,
             "toBlock": current_block,
@@ -500,9 +554,8 @@ def fetch_trade_history(
 
                 net_pnl = base_pnl + price_impact - fees_usd
 
-                # Get block timestamp
-                blk = w3.eth.get_block(block_num)
-                ts = blk["timestamp"]
+                # Get block timestamp (cached)
+                ts = _get_block_ts(w3, block_num)
 
                 # Filter by since_timestamp
                 if since_timestamp and ts < since_timestamp:
@@ -512,7 +565,11 @@ def fetch_trade_history(
                 log_idx = rlog.get("logIndex", 0)
 
                 # Compute USD execution price: sizeDeltaUsd / sizeDeltaInTokens
-                idx_dec = _MARKET_INDEX_DECIMALS.get((market_addr or "").lower(), 18)
+                _market_key = (market_addr or "").lower()
+                idx_dec = _MARKET_INDEX_DECIMALS.get(_market_key)
+                if idx_dec is None:
+                    log.warning(f"Unknown market decimals for {_market_key}, defaulting to 18")
+                    idx_dec = 18
                 if size_delta > 0 and size_delta_in_tokens > 0:
                     tokens_float = size_delta_in_tokens / (10 ** idx_dec)
                     execution_price = size_delta / tokens_float if tokens_float > 0 else 0
@@ -593,7 +650,7 @@ def fetch_recent_position_decreases(
     order_executed_topic = "0x" + Web3.keccak(text="OrderExecuted").hex()
 
     try:
-        exec_logs = w3.eth.get_logs({
+        exec_logs = _chunked_get_logs(w3, {
             "address": emitter_addr,
             "fromBlock": from_block,
             "toBlock": current_block,
@@ -736,7 +793,11 @@ def fetch_recent_position_decreases(
 
                 # Compute USD execution price: sizeDeltaUsd / sizeDeltaInTokens
                 # (This is the ENTRY price in GMX V2, not exit)
-                idx_dec = _MARKET_INDEX_DECIMALS.get((event_market or "").lower(), 18)
+                _market_key = (event_market or "").lower()
+                idx_dec = _MARKET_INDEX_DECIMALS.get(_market_key)
+                if idx_dec is None:
+                    log.warning(f"Unknown market decimals for {_market_key}, defaulting to 18")
+                    idx_dec = 18
                 if size_delta > 0 and size_delta_in_tokens > 0:
                     tokens_float = size_delta_in_tokens / (10 ** idx_dec)
                     execution_price = size_delta / tokens_float if tokens_float > 0 else 0
@@ -749,7 +810,7 @@ def fetch_recent_position_decreases(
                 order_type = order_info.get("order_type") if isinstance(order_info, dict) else order_info
                 trigger_price = trigger_price_map.get(order_key, 0) if order_key else 0
 
-                blk = w3.eth.get_block(block_num)
+                blk_ts = _get_block_ts(w3, block_num)
 
                 results.append({
                     "market_address": event_market or "",
@@ -762,7 +823,7 @@ def fetch_recent_position_decreases(
                     "net_pnl_usd": net_pnl,
                     "price_impact_usd": price_impact,
                     "total_fees_usd": fees_usd,
-                    "timestamp": blk["timestamp"],
+                    "timestamp": blk_ts,
                     "tx_hash": tx_hash,
                     "log_index": rlog.get("logIndex", 0),
                     "order_type": order_type,  # 5=TP, 6=SL, 4=MarketDecrease, None=unknown
@@ -776,4 +837,179 @@ def fetch_recent_position_decreases(
         f"fetch_recent_position_decreases: {len(results)} decrease(s) "
         f"for {account[:10]} market={market_lower[:10]}..."
     )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Shared rich-trade builder — used by analytics rebuild AND diagnostics
+# ---------------------------------------------------------------------------
+
+def build_rich_trades(on_chain_events: list, created_orders: list,
+                      open_keys: set, market_to_sym: dict) -> list:
+    """Parse on-chain PositionDecrease events into rich trade dicts.
+
+    Groups events by (market, direction, opened_at), excludes open positions,
+    and enriches each trade with tp_details, sl_details, unfilled_targets,
+    leverage, pnl_percentage, entry/exit prices, and duration.
+
+    Returns list of dicts (not TradeRecords) so callers can convert as needed.
+    """
+    from collections import defaultdict
+
+    def _net(e):
+        return e.get("net_pnl_usd", e.get("pnl_usd", 0))
+
+    def _fill_price(entry, base_pnl, size_delta, long):
+        if entry <= 0 or size_delta <= 0:
+            return entry
+        ratio = base_pnl / size_delta
+        return entry * (1 + ratio) if long else entry * (1 - ratio)
+
+    # Group events by (market_address, is_long)
+    groups = defaultdict(list)
+    for t in on_chain_events:
+        key = (t.get("market_address", "").lower(), t.get("is_long", True))
+        groups[key].append(t)
+
+    results = []
+
+    for (market, is_long), raw_events in groups.items():
+        if (market, is_long) in open_keys:
+            continue
+        sym = market_to_sym.get(market)
+        if not sym:
+            continue
+        side = "LONG" if is_long else "SHORT"
+
+        # Split into separate positions by opened_at timestamp
+        position_groups = defaultdict(list)
+        for e in raw_events:
+            position_groups[e.get("opened_at", 0)].append(e)
+
+        if list(position_groups.keys()) == [0]:
+            all_event_lists = [raw_events]
+        else:
+            orphans = position_groups.pop(0, [])
+            all_event_lists = list(position_groups.values())
+            for orphan in orphans:
+                ots = orphan.get("timestamp", 0)
+                best_group = None
+                best_diff = float("inf")
+                for group in all_event_lists:
+                    group_ts = max(e.get("timestamp", 0) for e in group)
+                    diff = abs(ots - group_ts)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_group = group
+                if best_group is not None:
+                    best_group.append(orphan)
+                elif all_event_lists:
+                    all_event_lists[-1].append(orphan)
+
+        for events in all_event_lists:
+            total_pnl = sum(_net(e) for e in events)
+            total_size = sum(e.get("size_delta_usd", 0) for e in events)
+            if abs(total_pnl) < 1:
+                continue
+
+            events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
+            first_event = events_sorted[0]
+            last_event = events_sorted[-1]
+            entry_price = first_event.get("execution_price", 0)
+
+            exit_price = _fill_price(
+                entry_price, last_event.get("pnl_usd", 0),
+                last_event.get("size_delta_usd", 0), is_long
+            )
+
+            open_ts = first_event.get("opened_at", 0) or first_event.get("timestamp", 0)
+            close_ts = last_event.get("timestamp", 0)
+            duration_hours = max((close_ts - open_ts) / 3600, 0)
+
+            total_collateral = sum(e.get("collateral_delta_usd", 0) for e in events)
+            leverage = total_size / total_collateral if total_collateral > 0 else 0
+            pnl_pct = (total_pnl / total_collateral * 100) if total_collateral > 0 else 0.0
+
+            # TP details (order_type 5 = limit/TP)
+            tp_hit_count = sum(1 for e in events if e.get("order_type") == 5)
+            tp_details = []
+            for e in events:
+                if e.get("order_type") == 5:
+                    tp_size = e.get("size_delta_usd", 0)
+                    tp_base = e.get("pnl_usd", 0)
+                    tp_fill = _fill_price(entry_price, tp_base, tp_size, is_long)
+                    tp_pnl = e.get("net_pnl_usd", tp_base)
+                    pct_closed = (tp_size / total_size * 100) if total_size > 0 else 0
+                    tp_details.append({"price": tp_fill, "pct": pct_closed, "pnl": tp_pnl})
+
+            # SL details (non-TP events with size)
+            sl_events = [e for e in events if e.get("order_type") != 5
+                         and e.get("size_delta_usd", 0) > 0]
+            sl_details = None
+            if sl_events:
+                sl_ev = sl_events[-1]
+                sl_fill = _fill_price(entry_price, sl_ev.get("pnl_usd", 0),
+                                      sl_ev.get("size_delta_usd", 0), is_long)
+                sl_size = sum(e.get("size_delta_usd", 0) for e in sl_events)
+                sl_pnl = sum(_net(e) for e in sl_events)
+                sl_pct = (sl_size / total_size * 100) if total_size > 0 else 0
+                sl_details = {"price": sl_fill, "pct": sl_pct, "pnl": sl_pnl}
+
+            # Unfilled targets from OrderCreated events
+            filled_trigger_prices = set()
+            for e in events:
+                if e.get("order_type") == 5:
+                    filled_trigger_prices.add(round(e.get("trigger_price", 0), 2))
+            for tp in tp_details:
+                filled_trigger_prices.add(round(tp["price"], 2))
+
+            ref_evt = events_sorted[0]
+            ref_block = ref_evt.get("block_number", 0)
+            ref_ts = ref_evt.get("timestamp", 0)
+            last_block = events_sorted[-1].get("block_number", 0)
+            if ref_block and ref_ts and open_ts and open_ts > 0:
+                block_diff = int((ref_ts - open_ts) / 0.25)
+                open_block_est = max(ref_block - block_diff - 100, 0)
+            else:
+                open_block_est = 0
+            close_block = last_block + 100 if last_block else 0
+
+            unfilled_targets = []
+            seen_prices = set()
+            for order in created_orders:
+                if (order.get("market") == market
+                        and order.get("is_long") == is_long
+                        and order.get("order_type") == 5):
+                    ob = order.get("block_number", 0)
+                    if open_block_est and close_block and not (open_block_est <= ob <= close_block):
+                        continue
+                    tp_price = round(order["trigger_price"], 2)
+                    if tp_price not in filled_trigger_prices and tp_price not in seen_prices:
+                        unfilled_targets.append({"price": order["trigger_price"]})
+                        seen_prices.add(tp_price)
+            if is_long:
+                unfilled_targets.sort(key=lambda x: x["price"])
+            else:
+                unfilled_targets.sort(key=lambda x: x["price"], reverse=True)
+
+            results.append({
+                "symbol": sym,
+                "side": side,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "size_usd": total_size,
+                "leverage": round(leverage, 1),
+                "duration_hours": duration_hours,
+                "pnl_usd": total_pnl,
+                "pnl_percentage": pnl_pct,
+                "opened_at": open_ts,
+                "closed_at": close_ts,
+                "exchange": "gmx",
+                "tp_hits": tp_hit_count,
+                "tp_details": tp_details,
+                "sl_details": sl_details,
+                "unfilled_targets": unfilled_targets if unfilled_targets else [],
+            })
+
+    results.sort(key=lambda t: t["closed_at"])
     return results

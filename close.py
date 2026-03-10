@@ -13,7 +13,7 @@ import logging
 import functools
 import urllib.request
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from web3 import Web3
 from eth_account import Account
@@ -323,40 +323,61 @@ CHAINLINK_ABI = [
 ]
 _chainlink_decimals_cache_close: dict = {}
 
+# Cache of last successfully fetched prices, keyed by symbol_pair (uppercase).
+# Used as a final fallback when all price sources fail.
+_last_known_prices: Dict[str, float] = {}
+
 
 def fetch_current_price(symbol_pair: str, w3=None) -> float:
     """Fetch current price from Chainlink on-chain feeds (primary).
-    Falls back to CoinGecko only if Chainlink unavailable."""
+    Falls back to CoinGecko only if Chainlink unavailable.
+    Falls back to last-known cached price if all sources fail."""
+
+    key = symbol_pair.upper()
 
     # ── Primary: Chainlink on-chain ──
-    feed_addr = CHAINLINK_FEEDS.get(symbol_pair.upper())
+    feed_addr = CHAINLINK_FEEDS.get(key)
     if feed_addr and w3:
         try:
             feed = w3.eth.contract(
                 address=Web3.to_checksum_address(feed_addr), abi=CHAINLINK_ABI
             )
             result = feed.functions.latestRoundData().call()
-            if symbol_pair.upper() not in _chainlink_decimals_cache_close:
-                _chainlink_decimals_cache_close[symbol_pair.upper()] = feed.functions.decimals().call()
-            decimals = _chainlink_decimals_cache_close[symbol_pair.upper()]
+            if key not in _chainlink_decimals_cache_close:
+                _chainlink_decimals_cache_close[key] = feed.functions.decimals().call()
+            decimals = _chainlink_decimals_cache_close[key]
             price = result[1] / (10 ** decimals)
             if price > 0:
+                _last_known_prices[key] = float(price)
                 return float(price)
         except Exception as e:
             log.warning(f"Chainlink price failed for {symbol_pair}: {e}")
 
     # ── Fallback: CoinGecko ──
-    coin_id = COINGECKO_IDS.get(symbol_pair.upper())
-    if not coin_id:
-        return 0.0
-    try:
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        return float(data[coin_id]["usd"])
-    except Exception:
-        return 0.0
+    coin_id = COINGECKO_IDS.get(key)
+    if coin_id:
+        try:
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+            price = float(data[coin_id]["usd"])
+            if price > 0:
+                _last_known_prices[key] = price
+                return price
+        except Exception:
+            pass
+
+    # ── Final fallback: last-known cached price ──
+    cached = _last_known_prices.get(key)
+    if cached and cached > 0:
+        log.warning(
+            f"All price sources failed for {symbol_pair} — "
+            f"using last-known cached price ${cached:,.2f}"
+        )
+        return cached
+
+    return 0.0
 
 # ── Reader getPositionInfo ABI (for accurate PnL with fees) ──
 # The return type is a deeply nested struct. We define the full ABI
@@ -754,12 +775,15 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
         else:
             price_diff = entry_price - current_price
 
-        if entry_price > 0:
-            unrealized_pnl = (price_diff / entry_price) * collateral_amount * leverage
-            pnl_percentage = (unrealized_pnl / collateral_amount) * 100
+        if entry_price <= 0:
+            unrealized_pnl = 0.0
+            pnl_percentage = 0.0
         else:
-            unrealized_pnl = 0
-            pnl_percentage = 0
+            unrealized_pnl = (price_diff / entry_price) * collateral_amount * leverage
+            if collateral_amount > 0:
+                pnl_percentage = (unrealized_pnl / collateral_amount) * 100
+            else:
+                pnl_percentage = 0.0
         
         gpos = GMXPosition(
             market=market,

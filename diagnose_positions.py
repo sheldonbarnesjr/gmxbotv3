@@ -640,42 +640,99 @@ async def diagnose_pnl():
 
 
 async def diagnose_trades():
-    """Simulate /trades — show what trade history PDF would contain."""
-    from state_io import safe_json_read
+    """Simulate /trades — uses centralized trade_rebuilder for consistent data."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trade_rebuilder import rebuild_all_trades
 
-    trade_history = safe_json_read("trade_history.json", default=[])
+    ET = ZoneInfo("America/New_York")
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
-    if not trade_history:
-        return "**Trade History (PDF preview)**\n" + "=" * 37 + "\n\nNo closed trades recorded yet.\n\nThe /trades PDF will populate when positions fully close (all TPs hit or SL triggered)."
+    # Build wallets list matching bot format: [(wallet_id, account)]
+    wallets = []
+    for idx, pk in enumerate(PRIVATE_KEYS):
+        if not pk:
+            continue
+        wallets.append((idx + 1, Account.from_key(pk)))
 
-    # Filter dust
-    trades = [t for t in trade_history if abs(t.get("pnl_usd", 0)) >= 1]
-    trades.sort(key=lambda x: x.get("closed_at", 0), reverse=True)
+    # Bitunix client
+    bx_client = BitunixClient(BX_KEY, BX_SECRET) if BX_KEY and BX_SECRET else None
 
-    msg = f"**Trade History (PDF preview)**\n{'=' * 37}\n\n"
-    msg += f"{len(trades)} closed trade(s)\n\n"
+    # Use centralized rebuilder (same as bot)
+    all_trades = await rebuild_all_trades(
+        w3, wallets, MARKETS, bitunix_client=bx_client, open_positions=None,
+    )
 
-    for i, t in enumerate(trades[:10], 1):  # Show last 10
-        sym = t.get("symbol", "?")
-        side = t.get("side", "?")
-        exchange = t.get("exchange", "gmx").upper()
-        pnl = t.get("pnl_usd", 0)
-        pnl_pct = t.get("pnl_percentage", 0)
-        size = t.get("size_usd", 0)
-        leverage = t.get("leverage", 0)
-        entry = t.get("entry_price", 0)
-        exit_p = t.get("exit_price", 0)
-        tp_hits = t.get("tp_hits", 0)
-        reason = t.get("exit_reason", "?")
+    # Convert TradeRecords to display dicts
+    trades = []
+    for t in all_trades:
+        if abs(t.pnl_usd) < 1:
+            continue
+        trades.append({
+            "symbol": t.symbol, "side": t.side,
+            "exchange": t.exchange.upper() if t.exchange else "GMX",
+            "pnl": t.pnl_usd, "size": t.size_usd, "leverage": t.leverage,
+            "entry": t.entry_price, "exit": t.exit_price,
+            "closed_at": t.closed_at, "duration_h": t.duration_hours,
+            "tp_hits": t.tp_hits, "sl_hit": t.sl_details is not None,
+            "tp_details": t.tp_details or [], "sl_details": t.sl_details,
+            "unfilled_targets": t.unfilled_targets or [], "pnl_pct": t.pnl_percentage,
+        })
 
-        result = "WIN" if pnl > 0 else "LOSS"
-        msg += f"**{i}. {sym} {side} {exchange}** — {result}\n"
-        msg += f"  PnL: {_fmt_sign(pnl)} ({pnl_pct:+.1f}%)\n"
-        msg += f"  Size: ${size:,.2f} @{leverage:.0f}x\n"
-        msg += f"  Entry: ${entry:,.2f} → Exit: ${exit_p:,.2f}\n"
-        if tp_hits:
-            msg += f"  TP hits: {tp_hits}\n"
-        msg += f"  Reason: {reason}\n\n"
+    if not trades:
+        return f"**Trade History**\n{'=' * 37}\n\nNo closed trades found."
+
+    trades.sort(key=lambda x: x["closed_at"], reverse=True)
+
+    msg = f"**Trade History ({len(trades)} trades)**\n{'=' * 37}\n\n"
+
+    for i, t in enumerate(trades[:10], 1):
+        result = "WIN" if t["pnl"] > 0 else "LOSS"
+        pnl_pct = t.get("pnl_pct", 0)
+        if pnl_pct == 0 and t["leverage"] > 0 and t["size"] > 0:
+            collateral = t["size"] / t["leverage"]
+            pnl_pct = (t["pnl"] / collateral * 100) if collateral > 0 else 0
+
+        msg += f"**{i}. {t['symbol']} {t['side']} {t['exchange']}** — {result}\n"
+        msg += f"  PnL: {_fmt_sign(t['pnl'])}"
+        if pnl_pct != 0:
+            msg += f" ({pnl_pct:+.1f}%)"
+        msg += "\n"
+        if t["size"] > 0:
+            if t["leverage"] > 0:
+                msg += f"  Size: ${t['size']:,.2f} @{t['leverage']:.0f}x\n"
+            else:
+                msg += f"  Size: ${t['size']:,.2f}\n"
+        if t["entry"] > 0:
+            msg += f"  Entry: ${t['entry']:,.2f} → Exit: ${t['exit']:,.2f}\n"
+
+        # Show individual TP details with prices
+        tp_details = t.get("tp_details", [])
+        for ti, tp in enumerate(tp_details, 1):
+            tp_line = f"  TP{ti}: ${tp['price']:,.2f}"
+            if tp.get("pnl"):
+                tp_line += f" — {_fmt_sign(tp['pnl'])}"
+            if tp.get("pct"):
+                tp_line += f" ({tp['pct']:.0f}%)"
+            msg += tp_line + "\n"
+
+        # Show SL details
+        sl = t.get("sl_details")
+        if sl:
+            sl_line = f"  SL: ${sl['price']:,.2f}"
+            if sl.get("pnl"):
+                sl_line += f" — {_fmt_sign(sl['pnl'])}"
+            msg += sl_line + "\n"
+
+        # Show unfilled targets
+        for uf in t.get("unfilled_targets", []):
+            msg += f"  TP (unfilled): ${uf['price']:,.2f}\n"
+
+        if t["duration_h"] >= 24:
+            msg += f"  Duration: {t['duration_h']/24:.1f}d\n"
+        elif t["duration_h"] >= 1:
+            msg += f"  Duration: {t['duration_h']:.1f}h\n"
+        msg += "\n"
 
     return msg
 

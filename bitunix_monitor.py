@@ -30,7 +30,7 @@ class BitunixMonitorMixin:
         notify(): async method
     """
 
-    BX_TP_TRACKING_FILE = "bx_tp_tracking.json"
+    BX_TP_TRACKING_FILE = "json/bx_tp_tracking.json"
 
     def _init_bitunix_monitor(self):
         """Call from GMXBot.__init__ to initialize Bitunix monitor state."""

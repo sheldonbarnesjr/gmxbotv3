@@ -8,6 +8,7 @@ __pycache__/
 *.session
 
 # Logs
+logs/
 *.log
 
 # IDE
@@ -23,25 +24,26 @@ __pycache__/
 # pytest
 .pytest_cache/
 
-# Generated text output / notes
-*.txt
+# Generated PDFs
 *.pdf
 
-# Generated data exports & backtest results
-backtest_results.json
-signals_full.json
-onchain_trades.json
+# JSON state & data files (runtime)
+json/
 tmp*.json
 
 # State backups & temp files (from state_io atomic writes)
 *.json.bak
 .state_*.tmp
 
-# Config docs (generated analysis, not source code)
-leverage_tiered_tp_config.md
-max_ev_tp1_entry_config.md
+# Text output / notes
+txt/
+
+# Markdown docs (generated analysis, not source code)
+md/leverage_tiered_tp_config.md
+md/max_ev_tp1_entry_config.md
 
 # Test files
+tests/
 test_*.py
 
 # Sales bot data (tx hashes, sale logs)
@@ -54,14 +56,9 @@ sales.py
 verify_payment.py
 
 # Backtest & analysis files
-backtest.py
-trade_backtest.py
+backtest/
 signal_analyzer.py
 scan_history.py
-backtest_results*.json
-official_backtest.json
-signals_major.json
-wick_backtest_results.json
 *.xlsx
 
 # Sub-projects (resale & intl bots — separate repos)

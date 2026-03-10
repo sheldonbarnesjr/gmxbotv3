@@ -52,6 +52,7 @@ _SENTINEL = object()
 
 def safe_json_read(filepath: str, default: Any = _SENTINEL) -> Any:
     """Read JSON with fallback to .bak if primary file is corrupted."""
+    used_backup = False
     for path in [filepath, filepath + ".bak"]:
         if not os.path.exists(path):
             continue
@@ -59,9 +60,16 @@ def safe_json_read(filepath: str, default: Any = _SENTINEL) -> Any:
             with open(path, "r") as f:
                 data = json.load(f)
             if path.endswith(".bak"):
-                logger.warning(f"Primary {filepath} corrupted — loaded from backup")
+                logger.warning(
+                    f"Primary {filepath} corrupted — loaded from backup. "
+                    f"Data may be stale (backup size={os.path.getsize(path)} bytes)"
+                )
+                used_backup = True
             return data
         except (json.JSONDecodeError, Exception) as e:
             logger.warning(f"Failed to read {path}: {e}")
             continue
+    if not used_backup:
+        # Both primary and backup failed or don't exist
+        pass
     return default if default is not _SENTINEL else {}

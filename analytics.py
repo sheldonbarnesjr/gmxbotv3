@@ -40,8 +40,8 @@ from state_io import atomic_json_write, safe_json_read
 
 logger = logging.getLogger("GMXBot.analytics")
 
-TRADE_HISTORY_FILE = "trade_history.json"
-ONCHAIN_TRADES_FILE = "onchain_trades.json"
+TRADE_HISTORY_FILE = "json/trade_history.json"
+ONCHAIN_TRADES_FILE = "json/onchain_trades.json"
 
 # Only show trades from this date forward (UTC midnight).
 # Change this date to reset your trade history starting point.
@@ -195,224 +195,21 @@ class AnalyticsMixin:
         return msg
 
     async def _rebuild_trade_history_from_chain(self):
-        """Clear and rebuild trade history from on-chain PositionDecrease events.
+        """Rebuild trade history using centralized trade_rebuilder.
 
-        Groups all decrease events by (market, direction) into single aggregated
-        trades so that multiple TP hits for the same position appear as one trade.
-        Excludes currently-open positions (their events are still in-flight).
-        Called on every startup to ensure a clean, accurate state.
+        Delegates to rebuild_all_trades() which queries on-chain RPC + Bitunix API,
+        overwrites onchain_trades.json and trade_history.json with fresh data.
         """
-        from collections import defaultdict
-        from history import fetch_trade_history
+        from trade_rebuilder import rebuild_all_trades
 
-        # Preserve Bitunix trades (not on-chain, would be lost otherwise)
-        bitunix_trades = [t for t in self.trade_history
-                          if getattr(t, 'exchange', 'gmx') == 'bitunix']
-        self.logger.info(f"Rebuild: preserving {len(bitunix_trades)} Bitunix trade(s) from memory")
-
-        # If no Bitunix trades in memory, fetch from Bitunix API
-        if not bitunix_trades and getattr(self, 'bitunix_client', None):
-            fetched = await self._fetch_bitunix_trade_history()
-            if fetched:
-                bitunix_trades = fetched
-                self.logger.info(f"Rebuild: fetched {len(fetched)} Bitunix trade(s) from API")
-
-        # Clear GMX trades (Bitunix trades are kept in the list)
-        self.trade_history = list(bitunix_trades)
-
-        # Fetch fresh on-chain events across all wallets
-        on_chain, all_created_orders = await self._fetch_and_store_trades()
-        if not on_chain:
-            self._save_trade_history()
-            self.logger.info("Trade rebuild: no on-chain events found (kept %d Bitunix trades)", len(bitunix_trades))
-            return
-
-        # Build market → symbol map
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            market_to_sym[addr.lower()] = sym
-
-        # Identify currently-open positions so we can exclude their events
-        open_keys = set()
-        for pos in self.positions.values():
-            if pos.is_open and pos.market_addr:
-                is_long = pos.side == "LONG"
-                open_keys.add((pos.market_addr.lower(), is_long))
-
-        # Group events by (market_address, is_long)
-        # On GMX each account has at most one position per (market, direction)
-        # at a time, so all decreases in the same group belong to the same trade.
-        groups = defaultdict(list)
-        for t in on_chain:
-            key = (t.get("market_address", "").lower(), t.get("is_long", True))
-            groups[key].append(t)
-
-        for (market, is_long), raw_events in groups.items():
-            # Skip events belonging to still-open positions
-            if (market, is_long) in open_keys:
-                continue
-
-            sym = market_to_sym.get(market)
-            if not sym:
-                continue
-
-            side = "LONG" if is_long else "SHORT"
-
-            def _net(e):
-                return e.get("net_pnl_usd", e.get("pnl_usd", 0))
-
-            # Split into separate trades by opened_at timestamp
-            position_groups = defaultdict(list)
-            for e in raw_events:
-                oa = e.get("opened_at", 0)
-                position_groups[oa].append(e)
-
-            if list(position_groups.keys()) == [0]:
-                all_event_lists = [raw_events]
-            else:
-                orphans = position_groups.pop(0, [])
-                all_event_lists = list(position_groups.values())
-                for orphan in orphans:
-                    ots = orphan.get("timestamp", 0)
-                    best_group = None
-                    best_diff = float("inf")
-                    for group in all_event_lists:
-                        group_ts = max(e.get("timestamp", 0) for e in group)
-                        diff = abs(ots - group_ts)
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_group = group
-                    if best_group is not None:
-                        best_group.append(orphan)
-                    elif all_event_lists:
-                        all_event_lists[-1].append(orphan)
-
-            for events in all_event_lists:
-                total_pnl = sum(_net(e) for e in events)
-                total_size = sum(e.get("size_delta_usd", 0) for e in events)
-
-                if abs(total_pnl) < 1:
-                    continue  # skip dust
-
-                events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
-                last_event = events_sorted[-1]
-                first_event = events_sorted[0]
-                # GMX V2: execution_price in PositionDecrease = entry price
-                entry_price = first_event.get("execution_price", 0)
-
-                def _fill_price(entry, base_pnl, size_delta, long):
-                    if entry <= 0 or size_delta <= 0:
-                        return entry
-                    ratio = base_pnl / size_delta
-                    return entry * (1 + ratio) if long else entry * (1 - ratio)
-
-                le = last_event
-                exit_price = _fill_price(
-                    entry_price, le.get("pnl_usd", 0), le.get("size_delta_usd", 0), is_long
-                )
-
-                # Use opened_at from PositionIncrease event (actual open time)
-                open_ts = first_event.get("opened_at", 0) or first_event.get("timestamp", 0)
-                close_ts = last_event.get("timestamp", 0)
-                duration_hours = max((close_ts - open_ts) / 3600, 0)
-                # Collateral from on-chain collateralDeltaAmount
-                total_collateral = sum(e.get("collateral_delta_usd", 0) for e in events)
-                leverage = total_size / total_collateral if total_collateral > 0 else 0
-                pnl_pct = (total_pnl / total_collateral * 100) if total_collateral > 0 else 0.0
-
-                # Count TP hits (order_type 5 = limit/TP order)
-                tp_hit_count = sum(1 for e in events if e.get("order_type") == 5)
-                tp_details = []
-                for e in events:
-                    if e.get("order_type") == 5:
-                        tp_size = e.get("size_delta_usd", 0)
-                        tp_base = e.get("pnl_usd", 0)
-                        tp_fill = _fill_price(entry_price, tp_base, tp_size, is_long)
-                        tp_pnl = e.get("net_pnl_usd", tp_base)
-                        pct_closed = (tp_size / total_size * 100) if total_size > 0 else 0
-                        tp_details.append({"price": tp_fill, "pct": pct_closed, "pnl": tp_pnl})
-
-                # SL details: derive actual fill price from basePnl
-                sl_events = [e for e in events if e.get("order_type") != 5 and e.get("size_delta_usd", 0) > 0]
-                sl_details = None
-                if sl_events:
-                    sl_ev = sl_events[-1]
-                    sl_fill = _fill_price(entry_price, sl_ev.get("pnl_usd", 0), sl_ev.get("size_delta_usd", 0), is_long)
-                    sl_size = sum(e.get("size_delta_usd", 0) for e in sl_events)
-                    sl_pnl = sum(e.get("net_pnl_usd", e.get("pnl_usd", 0)) for e in sl_events)
-                    sl_pct = (sl_size / total_size * 100) if total_size > 0 else 0
-                    sl_details = {"price": sl_fill, "pct": sl_pct, "pnl": sl_pnl}
-
-                # Detect unfilled targets from OrderCreated events
-                # Filter orders to this position's lifetime using block range
-                filled_trigger_prices = set()
-                for e in events:
-                    if e.get("order_type") == 5:
-                        filled_trigger_prices.add(round(e.get("trigger_price", 0), 2))
-                for tp in tp_details:
-                    filled_trigger_prices.add(round(tp["price"], 2))
-
-                # Estimate open block from opened_at timestamp using a reference event
-                ref_evt = events_sorted[0]
-                ref_block = ref_evt.get("block_number", 0)
-                ref_ts = ref_evt.get("timestamp", 0)
-                last_block = events_sorted[-1].get("block_number", 0)
-                # Arbitrum ~0.25s blocks; estimate open block from opened_at
-                if ref_block and ref_ts and open_ts and open_ts > 0:
-                    block_diff = int((ref_ts - open_ts) / 0.25)
-                    open_block_est = max(ref_block - block_diff - 100, 0)  # 100 block buffer
-                else:
-                    open_block_est = 0
-                close_block = last_block + 100 if last_block else 0  # small buffer
-
-                unfilled_targets = []
-                seen_prices = set()
-                for order in all_created_orders:
-                    if (order.get("market") == market
-                            and order.get("is_long") == is_long
-                            and order.get("order_type") == 5):
-                        ob = order.get("block_number", 0)
-                        # Only include orders created during this position's lifetime
-                        if open_block_est and close_block and not (open_block_est <= ob <= close_block):
-                            continue
-                        tp_price = round(order["trigger_price"], 2)
-                        if tp_price not in filled_trigger_prices and tp_price not in seen_prices:
-                            unfilled_targets.append({"price": order["trigger_price"]})
-                            seen_prices.add(tp_price)
-                if is_long:
-                    unfilled_targets.sort(key=lambda x: x["price"])
-                else:
-                    unfilled_targets.sort(key=lambda x: x["price"], reverse=True)
-
-                trade = TradeRecord(
-                    id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
-                    symbol=sym,
-                    side=side,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    size_usd=total_size,
-                    leverage=round(leverage, 1),
-                    duration_hours=duration_hours,
-                    pnl_usd=total_pnl,
-                    pnl_percentage=pnl_pct,
-                    exit_reason="on-chain",
-                    opened_at=open_ts,
-                    closed_at=close_ts,
-                    exchange="gmx",
-                    tp_hits=tp_hit_count,
-                    tp_details=tp_details,
-                    sl_details=sl_details,
-                    unfilled_targets=unfilled_targets if unfilled_targets else None,
-                )
-                self.trade_history.append(trade)
-
-        self.trade_history.sort(key=lambda t: t.closed_at)
-        self._save_trade_history()
-        gmx_count = len(self.trade_history) - len(bitunix_trades)
-        self.logger.info(
-            f"Trade rebuild: {gmx_count} GMX + {len(bitunix_trades)} Bitunix trade(s) "
-            f"from {len(on_chain)} on-chain event(s)"
+        self.trade_history = await rebuild_all_trades(
+            self.w3,
+            self._all_wallets(),
+            self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
         )
+        self.logger.info(f"Trade rebuild: {len(self.trade_history)} total trade(s)")
 
     async def cmd_performance(self, chat_id: int):
         """Send platform performance comparison to admin."""
@@ -420,11 +217,9 @@ class AnalyticsMixin:
         await self.send_message(chat_id, msg)
 
     async def calculate_win_rate_onchain(self, symbol: str = None, n: int = None) -> Dict[str, Any]:
-        """Calculate win rate from on-chain PositionDecrease events (fee-inclusive PnL).
+        """Calculate win rate from trade history (fee-inclusive PnL).
 
-        Uses _fetch_and_store_trades() which queries on-chain event logs and
-        merges with locally stored history. PnL values include borrowing fees,
-        funding fees, price impact, and position fees.
+        Uses rebuild_all_trades() for fresh data from on-chain + Bitunix API.
 
         Args:
             symbol: Filter trades by symbol (e.g., 'BTC'). None = all symbols.
@@ -433,34 +228,36 @@ class AnalyticsMixin:
         Returns:
             Dict with keys: win_rate, wins, losses, total, avg_win, avg_loss, pnl
         """
-        all_trades, _ = await self._fetch_and_store_trades()
+        from trade_rebuilder import rebuild_all_trades
 
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            market_to_sym[addr.lower()] = sym
+        all_trades = await rebuild_all_trades(
+            self.w3, self._all_wallets(), self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
+        )
+        self.trade_history = all_trades
 
-        # Group by position (market + direction) so TPs count as one trade
-        trades = self._group_onchain_trades(all_trades, market_to_sym)
-
+        # Filter: exclude dust, apply symbol/n filters
+        trades = [t for t in all_trades if abs(t.pnl_usd) >= 1]
         if symbol:
-            trades = [t for t in trades if t["sym"] == symbol.upper()]
+            trades = [t for t in trades if t.symbol == symbol.upper()]
         if n and n > 0:
             trades = trades[-n:]
 
         if not trades:
             return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0, "avg_win": 0, "avg_loss": 0, "pnl": 0}
 
-        wins = [t for t in trades if t["pnl"] > 0]
-        losses = [t for t in trades if t["pnl"] < 0]
-        total_pnl = sum(t["pnl"] for t in trades)
+        wins = [t for t in trades if t.pnl_usd > 0]
+        losses = [t for t in trades if t.pnl_usd < 0]
+        total_pnl = sum(t.pnl_usd for t in trades)
 
         return {
             "win_rate": len(wins) / len(trades) * 100,
             "wins": len(wins),
             "losses": len(losses),
             "total": len(trades),
-            "avg_win": sum(t["pnl"] for t in wins) / len(wins) if wins else 0,
-            "avg_loss": sum(t["pnl"] for t in losses) / len(losses) if losses else 0,
+            "avg_win": sum(t.pnl_usd for t in wins) / len(wins) if wins else 0,
+            "avg_loss": sum(t.pnl_usd for t in losses) / len(losses) if losses else 0,
             "pnl": total_pnl,
         }
 
@@ -706,18 +503,20 @@ class AnalyticsMixin:
             /winrate BTC — BTC only
             /winrate BTC 20 — last 20 BTC trades
         """
-        PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            if sym in PNL_SYMBOLS:
-                market_to_sym[addr.lower()] = sym
+        from trade_rebuilder import rebuild_all_trades
+        try:
+            self.trade_history = await rebuild_all_trades(
+                self.w3, self._all_wallets(), self.cfg.markets,
+                bitunix_client=getattr(self, 'bitunix_client', None),
+                open_positions=self.positions,
+            )
+        except Exception as e:
+            self.logger.warning(f"Winrate rebuild failed: {e}")
 
-        # Fetch on-chain trades and group by position (market + direction)
-        all_trades, _ = await self._fetch_and_store_trades()
-        trades = self._group_onchain_trades(all_trades, market_to_sym)
+        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
 
         if symbol:
-            trades = [t for t in trades if t["sym"] == symbol.upper()]
+            trades = [t for t in trades if t.symbol == symbol.upper()]
 
         if n and n > 0:
             trades = trades[-n:]
@@ -727,12 +526,12 @@ class AnalyticsMixin:
             await self.send_message(chat_id, f"No closed trades{label} yet.")
             return
 
-        wins = [t for t in trades if t["pnl"] > 0]
-        losses = [t for t in trades if t["pnl"] < 0]
-        total_pnl = sum(t["pnl"] for t in trades)
+        wins = [t for t in trades if t.pnl_usd > 0]
+        losses = [t for t in trades if t.pnl_usd <= 0]
+        total_pnl = sum(t.pnl_usd for t in trades)
         win_rate = len(wins) / len(trades) * 100
-        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
+        avg_win = sum(t.pnl_usd for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.pnl_usd for t in losses) / len(losses) if losses else 0
 
         title = "Win Rate"
         if symbol:
@@ -810,245 +609,7 @@ class AnalyticsMixin:
         except Exception as e:
             logger.warning(f"Failed to save onchain trades: {e}")
 
-    async def _fetch_bitunix_trade_history(self) -> List['TradeRecord']:
-        """Fetch closed positions from Bitunix API and convert to TradeRecords.
-
-        Called during rebuild when no Bitunix trades exist in memory/disk.
-        Uses get_history_positions() + get_history_tpsl_orders() to reconstruct
-        full trade data including TP details, SL details, and unfilled targets.
-        """
-        try:
-            positions = await asyncio.to_thread(
-                self.bitunix_client.get_history_positions, None, 50
-            )
-            tpsl = await asyncio.to_thread(
-                self.bitunix_client.get_history_tpsl_orders, None, 100
-            )
-            self.logger.info(f"Bitunix API: {len(positions)} closed positions, {len(tpsl)} TP/SL orders")
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch Bitunix trade history: {e}")
-            return []
-
-        # Parse TRADE_START_DATE for filtering
-        from datetime import datetime as _dt
-        try:
-            fmt = "%Y-%m-%dT%H:%M" if "T" in TRADE_START_DATE else "%Y-%m-%d"
-            start_ts = int(_dt.strptime(TRADE_START_DATE, fmt).timestamp())
-        except Exception:
-            start_ts = 0
-
-        trades = []
-        for p in positions:
-            try:
-                symbol_raw = p.get("symbol", "")
-                symbol = symbol_raw.replace("USDT", "").replace("-", "")
-
-                side = p.get("side", "").upper()
-                if side in ("BUY", "LONG"):
-                    side = "LONG"
-                elif side in ("SELL", "SHORT"):
-                    side = "SHORT"
-
-                entry_price = float(p.get("avgOpenPrice", 0) or p.get("entryPrice", 0) or p.get("openPrice", 0) or 0)
-                exit_price = float(p.get("avgClosePrice", 0) or p.get("closePrice", 0) or 0)
-                leverage = float(p.get("leverage", 0) or 0)
-                qty = float(p.get("qty", 0) or p.get("volume", 0) or 0)
-                size_usd = entry_price * qty if entry_price > 0 and qty > 0 else 0
-
-                pnl_usd = float(p.get("realizedPNL", 0) or p.get("realizedPnl", 0) or p.get("profit", 0) or 0)
-
-                close_ts = int(p.get("mtime", 0) or p.get("closeTime", 0) or 0)
-                open_ts = int(p.get("ctime", 0) or p.get("openTime", 0) or 0)
-                if close_ts > 1e12:
-                    close_ts = close_ts // 1000
-                if open_ts > 1e12:
-                    open_ts = open_ts // 1000
-
-                if close_ts < start_ts:
-                    continue
-
-                collateral = size_usd / leverage if leverage > 0 else size_usd
-                pnl_pct = (pnl_usd / collateral * 100) if collateral > 0 else 0
-
-                # Gather TP/SL orders for this position
-                pos_id = p.get("positionId", "")
-                all_tp_orders = []
-                sl_price_val = None
-                for order in tpsl:
-                    if order.get("positionId") != pos_id:
-                        continue
-                    if order.get("tpPrice") is not None:
-                        all_tp_orders.append((float(order["tpPrice"]), order.get("status", "").upper()))
-                    elif order.get("slPrice") is not None and sl_price_val is None:
-                        if order.get("status", "").upper() in ("TRIGGERED", "FILLED", "EXECUTED"):
-                            sl_price_val = float(order["slPrice"])
-
-                if side == "LONG":
-                    all_tp_orders.sort(key=lambda x: x[0])
-                else:
-                    all_tp_orders.sort(key=lambda x: x[0], reverse=True)
-
-                # TP allocation percentages from env
-                total_tps = len(all_tp_orders)
-                tp_allocs = []
-                if total_tps >= 3:
-                    for tp_idx in range(1, total_tps + 1):
-                        env_key = f"BX_TP_{total_tps}_{tp_idx}"
-                        alloc = float(os.getenv(env_key, 0))
-                        if alloc == 0:
-                            env_key = f"TP_{total_tps}_{tp_idx}"
-                            alloc = float(os.getenv(env_key, 0))
-                        tp_allocs.append(alloc)
-                if not tp_allocs or sum(tp_allocs) == 0:
-                    n_fills = total_tps + (1 if sl_price_val is not None else 0)
-                    if n_fills == 0:
-                        n_fills = 1
-                    tp_allocs = [100 / n_fills] * total_tps
-
-                # Build tp_details for filled TPs
-                tp_hits = 0
-                tp_details = []
-                for idx, (tp_p, tp_status) in enumerate(all_tp_orders):
-                    if tp_status not in ("TRIGGERED", "FILLED", "EXECUTED"):
-                        continue
-                    tp_hits += 1
-                    pct = tp_allocs[idx] if idx < len(tp_allocs) else 0
-                    tp_size = size_usd * pct / 100
-                    if side == "LONG":
-                        tp_pnl = (tp_p - entry_price) / entry_price * tp_size if entry_price > 0 else 0
-                    else:
-                        tp_pnl = (entry_price - tp_p) / entry_price * tp_size if entry_price > 0 else 0
-                    tp_details.append({"price": tp_p, "pct": pct, "pnl": tp_pnl})
-
-                # SL details
-                sl_details = None
-                if sl_price_val is not None:
-                    sl_pct = 100 - sum(tp.get("pct", 0) for tp in tp_details)
-                    sl_size = size_usd * sl_pct / 100
-                    if side == "LONG":
-                        sl_pnl = (sl_price_val - entry_price) / entry_price * sl_size if entry_price > 0 else 0
-                    else:
-                        sl_pnl = (entry_price - sl_price_val) / entry_price * sl_size if entry_price > 0 else 0
-                    sl_details = {"price": sl_price_val, "pct": sl_pct, "pnl": sl_pnl}
-                elif not tp_details:
-                    if side == "LONG":
-                        sl_pnl = (exit_price - entry_price) / entry_price * size_usd if entry_price > 0 else 0
-                    else:
-                        sl_pnl = (entry_price - exit_price) / entry_price * size_usd if entry_price > 0 else 0
-                    sl_details = {"price": exit_price, "pct": 100, "pnl": sl_pnl}
-
-                # Scale PnLs to match actual realized PnL (accounts for fees)
-                raw_sum = sum(tp.get("pnl", 0) for tp in tp_details) + (sl_details.get("pnl", 0) if sl_details else 0)
-                if abs(raw_sum) > 0.01 and abs(pnl_usd) > 0.01:
-                    scale = pnl_usd / raw_sum
-                    for tp in tp_details:
-                        tp["pnl"] = tp["pnl"] * scale
-                    if sl_details:
-                        sl_details["pnl"] = sl_details["pnl"] * scale
-
-                duration_hours = (close_ts - open_ts) / 3600 if close_ts > open_ts else 0
-
-                # Collect unfilled (cancelled) TP orders
-                unfilled_targets = []
-                for tp_p, tp_status in all_tp_orders:
-                    if tp_status in ("SYSTEM_CANCELED", "CANCELED", "CANCELLED"):
-                        unfilled_targets.append({"price": tp_p})
-
-                # Determine exit reason
-                if tp_hits > 0:
-                    exit_reason = f"tp_hit_x{tp_hits}"
-                elif sl_price_val is not None:
-                    exit_reason = "sl_triggered"
-                else:
-                    exit_reason = "exchange_closed"
-
-                trades.append(TradeRecord(
-                    id=f"bx_{pos_id}",
-                    symbol=symbol,
-                    side=side,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    size_usd=size_usd,
-                    leverage=leverage,
-                    duration_hours=duration_hours,
-                    pnl_usd=pnl_usd,
-                    pnl_percentage=pnl_pct,
-                    exit_reason=exit_reason,
-                    opened_at=open_ts,
-                    closed_at=close_ts,
-                    exchange="bitunix",
-                    tp_hits=tp_hits,
-                    tp_details=tp_details,
-                    sl_details=sl_details,
-                    unfilled_targets=unfilled_targets if unfilled_targets else None,
-                ))
-            except Exception as e:
-                self.logger.warning(f"Skipping Bitunix position: {e}")
-                continue
-
-        self.logger.info(f"Parsed {len(trades)} Bitunix trade(s) from API (after date filter)")
-        return trades
-
-    async def _fetch_and_store_trades(self) -> List[Dict[str, Any]]:
-        """Fetch on-chain trades, merge with local store, save, and return all.
-
-        Fresh RPC data covers the last 30 days. Local store keeps everything
-        older than that so trades are never lost.
-        """
-        from history import fetch_trade_history
-
-        # Fetch fresh on-chain trades across all wallets
-        fresh = []
-        all_created_orders = []
-        try:
-            for wid, acct in self._all_wallets():
-                trades, created_orders = await asyncio.to_thread(
-                    fetch_trade_history, self.w3, acct.address
-                )
-                fresh.extend(trades)
-                all_created_orders.extend(created_orders)
-        except Exception as e:
-            self.logger.warning(f"On-chain trade fetch failed: {e}")
-
-        # Load existing local store
-        stored = self._load_onchain_trades()
-
-        # Merge: use tx_hash:log_index as unique key.
-        # Fresh data (with log_index) replaces old stored data (without log_index).
-        by_key = {}
-        stored_tx_only = set()  # track old-format entries to remove when fresh arrives
-        for t in stored:
-            tx = t.get("tx_hash", "")
-            li = t.get("log_index")
-            if tx and li is not None:
-                by_key[f"{tx}:{li}"] = t
-            elif tx:
-                by_key[tx] = t
-                stored_tx_only.add(tx)
-        for t in fresh:
-            tx = t.get("tx_hash", "")
-            li = t.get("log_index", 0)
-            if tx:
-                # Remove old-format entry if fresh has log_index
-                if tx in stored_tx_only and tx in by_key:
-                    del by_key[tx]
-                    stored_tx_only.discard(tx)
-                by_key[f"{tx}:{li}"] = t
-
-        merged = sorted(by_key.values(), key=lambda x: x.get("timestamp", 0))
-
-        # Filter out trades before TRADE_START_DATE
-        from datetime import datetime as _dt
-        try:
-            fmt = "%Y-%m-%dT%H:%M" if "T" in TRADE_START_DATE else "%Y-%m-%d"
-            start_ts = int(_dt.strptime(TRADE_START_DATE, fmt).timestamp())
-            merged = [t for t in merged if t.get("timestamp", 0) >= start_ts]
-        except Exception:
-            pass
-
-        self._save_onchain_trades(merged)
-        self.logger.info(f"On-chain trades: {len(fresh)} fetched, {len(merged)} total stored")
-        return merged, all_created_orders
+    # _fetch_bitunix_trade_history and _fetch_and_store_trades moved to trade_rebuilder.py
 
     async def cmd_pnl(self, chat_id: int):
         """Telegram /pnl command handler.
@@ -1072,9 +633,21 @@ class AnalyticsMixin:
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        # ── Fetch on-chain trades, grouped by position (market + direction) ──
-        all_trades, _ = await self._fetch_and_store_trades()
-        grouped = self._group_onchain_trades(all_trades, market_to_sym)
+        # ── Fetch all trades via centralized rebuilder ──
+        from trade_rebuilder import rebuild_all_trades
+        all_trades = await rebuild_all_trades(
+            self.w3, self._all_wallets(), self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
+        )
+        self.trade_history = all_trades
+
+        # Convert to simple dicts for bucketing
+        grouped = []
+        for t in all_trades:
+            if abs(t.pnl_usd) < 1:
+                continue
+            grouped.append({"sym": t.symbol, "pnl": t.pnl_usd, "timestamp": t.closed_at})
 
         def bucket_stats(trades_list):
             if not trades_list:
@@ -1220,36 +793,25 @@ class AnalyticsMixin:
     async def cmd_pdf(self, chat_id: int):
         """Generate and send a PDF with PnL summary + full trade history.
 
-        Queries GMX on-chain + Bitunix API directly — no dependency on trade_history.json.
+        Uses centralized trade_rebuilder for fresh data from on-chain + Bitunix API.
         """
         await self.send_message(chat_id, "Fetching trades from chain & exchange API...")
 
-        # Build market_address → symbol map
-        PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            if sym in PNL_SYMBOLS:
-                market_to_sym[addr.lower()] = sym
+        from trade_rebuilder import rebuild_all_trades
+        trades = await rebuild_all_trades(
+            self.w3, self._all_wallets(), self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
+        )
+        self.trade_history = trades
 
-        # Fetch on-chain trades (merged with local store)
-        on_chain, _created_orders = await self._fetch_and_store_trades()
-
-        # Fetch Bitunix closed trades from API
-        bx_trades = []
-        if self.bitunix_client:
-            try:
-                bx_trades = await self._fetch_bitunix_trade_history()
-                self.logger.info(f"/trades: {len(bx_trades)} Bitunix trade(s) from API")
-            except Exception as e:
-                self.logger.warning(f"/trades: Bitunix fetch failed: {e}")
-
-        if not on_chain and not bx_trades:
+        if not trades:
             await self.send_message(chat_id, "No trades to export.")
             return
 
         try:
             pdf_path = await asyncio.to_thread(
-                self._generate_trade_pdf, on_chain, market_to_sym, bx_trades
+                self._generate_trade_pdf, trades
             )
             bot_api_chats = getattr(self, '_bot_api_chats', set())
             if chat_id in bot_api_chats:
@@ -1265,13 +827,11 @@ class AnalyticsMixin:
             self.logger.error(f"PDF generation failed: {e}")
             await self.send_message(chat_id, f"PDF generation failed: {e}")
 
-    def _generate_trade_pdf(self, on_chain_trades: list, market_to_sym: dict, bx_api_trades: list = None) -> str:
+    def _generate_trade_pdf(self, trades: list) -> str:
         """Build the PDF file with 3-column PnL summary + 3-column trade grid.
 
-        Builds unified trade list from:
-          - GMX: on-chain PositionDecrease events grouped into closed positions
-          - Bitunix: closed positions fetched from exchange API (bx_api_trades)
-        No dependency on trade_history.json.
+        Args:
+            trades: list of TradeRecord objects (from rebuild_all_trades)
         """
         ET = ZoneInfo("America/New_York")
         LMARGIN = 10
@@ -1281,62 +841,9 @@ class AnalyticsMixin:
         COL_W = USABLE_W / 3  # ~63.3mm per column
         LINE_H = 5
 
-        # ── Build unified trade list from API sources ──
+        # ── Build unified trade list from TradeRecords ──
         unified = []
-
-        # GMX: group on-chain decreases into closed positions
-        from collections import defaultdict
-        groups = defaultdict(list)
-        for t in on_chain_trades:
-            key = (t.get("market_address", "").lower(), t.get("is_long", True))
-            groups[key].append(t)
-
-        # Exclude currently-open positions
-        open_keys = set()
-        for pos in self.positions.values():
-            if pos.is_open and pos.market_addr:
-                is_long = pos.side == "LONG"
-                open_keys.add((pos.market_addr.lower(), is_long))
-
-        for (market, is_long), events in groups.items():
-            if (market, is_long) in open_keys:
-                continue
-            sym = market_to_sym.get(market)
-            if not sym:
-                continue
-            total_pnl = sum(e.get("pnl_usd", 0) for e in events)
-            if abs(total_pnl) < 1:
-                continue
-            total_size = sum(e.get("size_delta_usd", 0) for e in events)
-            last_ts = max(e.get("timestamp", 0) for e in events)
-            first_ts = min(e.get("timestamp", 0) for e in events)
-            # Try to get entry price from first event
-            entry_p = events[0].get("execution_price", 0) if events else 0
-            exit_p = events[-1].get("execution_price", 0) if events else 0
-            side = "LONG" if is_long else "SHORT"
-            duration_h = (last_ts - first_ts) / 3600 if last_ts > first_ts else 0
-
-            unified.append({
-                "symbol": sym,
-                "side": side,
-                "size_usd": total_size,
-                "pnl_usd": total_pnl,
-                "timestamp": last_ts,
-                "entry_price": entry_p,
-                "exit_price": exit_p,
-                "leverage": 0,
-                "pnl_percentage": 0,
-                "exchange": "gmx",
-                "tp_hits": 0,
-                "tp_details": [],
-                "sl_details": None,
-                "unfilled_targets": [],
-                "duration_hours": duration_h,
-                "opened_at": first_ts,
-            })
-
-        # Bitunix: from API-fetched TradeRecords
-        for t in (bx_api_trades or []):
+        for t in trades:
             unified.append({
                 "symbol": t.symbol,
                 "side": t.side,
@@ -1347,7 +854,7 @@ class AnalyticsMixin:
                 "exit_price": t.exit_price,
                 "leverage": t.leverage,
                 "pnl_percentage": t.pnl_percentage,
-                "exchange": getattr(t, "exchange", "bitunix"),
+                "exchange": getattr(t, "exchange", "gmx"),
                 "tp_hits": getattr(t, "tp_hits", 0),
                 "tp_details": getattr(t, "tp_details", None) or [],
                 "sl_details": getattr(t, "sl_details", None),

@@ -29,11 +29,17 @@ def _env(key: str, default: str = "") -> str:
 
 
 def _env_int(key: str, default: int = 0) -> int:
-    return int(_env(key, str(default)))
+    try:
+        return int(_env(key, str(default)))
+    except (ValueError, TypeError):
+        return default
 
 
 def _env_float(key: str, default: float = 0.0) -> float:
-    return float(_env(key, str(default)))
+    try:
+        return float(_env(key, str(default)))
+    except (ValueError, TypeError):
+        return default
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -244,7 +250,7 @@ def load_config() -> Config:
 
     rpc_url = _env("ARBITRUM_RPC_URL") or _env("RPC_URL", "https://arb1.arbitrum.io/rpc")
 
-    return Config(
+    cfg = Config(
         # Telegram
         telegram_api_id=_env_int("TELEGRAM_API_ID", 0),
         telegram_api_hash=_env("TELEGRAM_API_HASH", ""),
@@ -315,3 +321,27 @@ def load_config() -> Config:
         log_level=_env("LOG_LEVEL", "INFO").upper(),
 
     )
+
+    # ── Post-load validation ──
+    import logging as _logging
+    _log = _logging.getLogger("GMXBot.config")
+
+    missing_addrs = []
+    if not cfg.exchange_router:
+        missing_addrs.append("GMX_V2_EXCHANGE_ROUTER")
+    if not cfg.order_vault:
+        missing_addrs.append("GMX_V2_ORDER_VAULT")
+    if not cfg.collateral_token:
+        missing_addrs.append("GMX_V2_COLLATERAL_TOKEN")
+    if missing_addrs:
+        _log.error(f"Missing required GMX addresses: {', '.join(missing_addrs)}. Set them in .env")
+
+    if cfg.min_leverage > cfg.max_leverage:
+        _log.warning(f"min_leverage ({cfg.min_leverage}) > max_leverage ({cfg.max_leverage}) — swapping")
+        cfg.min_leverage, cfg.max_leverage = cfg.max_leverage, cfg.min_leverage
+
+    if cfg.min_position_usd > cfg.max_position_usd:
+        _log.warning(f"min_position_usd > max_position_usd — swapping")
+        cfg.min_position_usd, cfg.max_position_usd = cfg.max_position_usd, cfg.min_position_usd
+
+    return cfg

@@ -310,10 +310,12 @@ Copy `.env.example` to `.env` and fill in your values:
 cp .env.example .env
 ```
 
-Required environment variables:
+See [setup.md](setup.md) for a step-by-step guide on finding each Telegram credential.
+
+#### Required Environment Variables
 
 ```env
-# Telegram (get from https://my.telegram.org)
+# Telegram User API
 TELEGRAM_API_ID=your_api_id
 TELEGRAM_API_HASH=your_api_hash
 TELEGRAM_SESSION=tgsession

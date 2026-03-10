@@ -32,12 +32,17 @@ import time
 import json
 import logging
 import functools
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 
 from web3 import Web3
 from eth_account import Account
+
+# ── Nonce serialization ──────────────────────────────────────────────────────
+_nonce_lock = threading.Lock()
+_nonce_cache: dict = {}  # address -> last_used_nonce
 
 try:
     from dotenv import load_dotenv
@@ -788,7 +793,14 @@ def get_fees(w3: Web3) -> dict:
 
 def build_tx(w3: Web3, from_addr: str, to_addr: str, data, value=0) -> dict:
     fees = get_fees(w3)
-    nonce = w3.eth.get_transaction_count(from_addr, "pending")
+    with _nonce_lock:
+        rpc_nonce = w3.eth.get_transaction_count(from_addr, "pending")
+        cached = _nonce_cache.get(from_addr)
+        if cached is not None and cached + 1 > rpc_nonce:
+            nonce = cached + 1
+        else:
+            nonce = rpc_nonce
+        _nonce_cache[from_addr] = nonce
     tx = {
         "from": from_addr,
         "to": to_addr,
@@ -2230,6 +2242,36 @@ def execute_signal(
         wait_time = 10 if not use_limit else 2
         log.info(f"Waiting {wait_time}s for keeper to execute open order...")
         time.sleep(wait_time)
+
+        # Verify position actually exists on-chain before placing TP/SL
+        from close import fetch_positions as chain_fetch_positions
+        position_confirmed = False
+        market_lower = market.lower()
+        for attempt in range(2):
+            try:
+                positions = chain_fetch_positions(w3, wallet)
+                for pos in positions:
+                    pos_market = getattr(pos, "market", "").lower() if hasattr(pos, "market") else ""
+                    pos_long = getattr(pos, "is_long", None)
+                    if pos_market == market_lower and pos_long == signal.is_long:
+                        position_confirmed = True
+                        break
+            except Exception as e:
+                log.warning(f"Position verification query failed: {e}")
+            if position_confirmed:
+                break
+            if attempt == 0:
+                log.warning("Position not found on-chain after open. Retrying in 5s...")
+                time.sleep(5)
+        if not position_confirmed:
+            log.error(
+                f"Position NOT found on-chain for {signal.symbol} "
+                f"{'LONG' if signal.is_long else 'SHORT'} after open. "
+                f"Skipping TP/SL placement — admin should investigate."
+            )
+            results["tp"] = []
+            results["sl"] = None
+            return results
 
     # ── Step 2: Place Take Profit orders (LimitDecrease) ──
     if signal.take_profits:

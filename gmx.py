@@ -341,7 +341,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             handlers=[
                 logging.StreamHandler(),
                 RotatingFileHandler(
-                    "gmx_bot.log", maxBytes=10 * 1024 * 1024, backupCount=3
+                    "logs/gmx_bot.log", maxBytes=10 * 1024 * 1024, backupCount=3
                 ),
             ],
         )
@@ -374,7 +374,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # ──────────────────────────────────────────────────────────────────────
     # Position state persistence (realized PnL survives restarts)
     # ──────────────────────────────────────────────────────────────────────
-    POSITION_STATE_FILE = "position_state.json"
+    POSITION_STATE_FILE = "json/position_state.json"
 
     def _save_position_state(self):
         """Persist realized PnL and TP hit state for all open positions."""
@@ -474,7 +474,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # ──────────────────────────────────────────────────────────────────────
     # Signal dedup persistence (survives restart to prevent duplicate trades)
     # ──────────────────────────────────────────────────────────────────────
-    SIGNAL_DEDUP_FILE = "signal_dedup.json"
+    SIGNAL_DEDUP_FILE = "json/signal_dedup.json"
 
     def _save_signal_dedup(self):
         """Persist signal dedup hashes so they survive restart."""
@@ -492,7 +492,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # ──────────────────────────────────────────────────────────────────────
     # Failed order queue persistence
     # ──────────────────────────────────────────────────────────────────────
-    FAILED_ORDERS_FILE = "failed_orders.json"
+    FAILED_ORDERS_FILE = "json/failed_orders.json"
 
     def _save_failed_orders(self):
         """Persist the failed order queue to disk (atomic write)."""
@@ -565,18 +565,16 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # skip_sl_check=False: verify and correct SL after TP hits detected during sync
         await self._sync_on_chain_positions(skip_sl_check=False)
 
-        # Load persisted trade history first so Bitunix trades can be preserved
-        self._load_trade_history()
-        bx_loaded = sum(1 for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix')
-        self.logger.info(f"Post-load: {len(self.trade_history)} trades ({bx_loaded} Bitunix)")
-
-        # Rebuild trade history from on-chain data (clear + re-fetch + group)
-        # This ensures a clean state every restart, grouping all position
-        # decreases for the same trade into a single aggregated record.
+        # Rebuild trade history from on-chain + Bitunix API (centralized rebuilder)
         try:
-            await self._rebuild_trade_history_from_chain()
-            bx_after = sum(1 for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix')
-            self.logger.info(f"Post-rebuild: {len(self.trade_history)} trades ({bx_after} Bitunix)")
+            from trade_rebuilder import rebuild_all_trades, rebuild_open_positions
+            self.trade_history = await rebuild_all_trades(
+                self.w3, self._all_wallets(), self.cfg.markets,
+                bitunix_client=getattr(self, 'bitunix_client', None),
+                open_positions=self.positions,
+            )
+            bx_count = sum(1 for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix')
+            self.logger.info(f"Post-rebuild: {len(self.trade_history)} trades ({bx_count} Bitunix)")
         except Exception as e:
             self.logger.warning(f"Trade history rebuild failed: {e}")
             self._load_trade_history()  # fallback to persisted data
@@ -592,6 +590,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.logger.info("Startup TP catch-up check completed")
         except Exception as e:
             self.logger.warning(f"Startup TP catch-up failed: {e}")
+
+        # Startup: verify open positions have correct verified_decreases from on-chain
+        try:
+            corrections = await rebuild_open_positions(
+                self.w3, self._all_wallets(), self.positions, self.cfg.markets,
+                bitunix_client=getattr(self, 'bitunix_client', None),
+            )
+            if corrections:
+                self._save_position_state()
+                self.logger.info(f"Startup position rebuild: {len(corrections)} position(s) corrected")
+        except Exception as e:
+            self.logger.warning(f"Startup position rebuild failed: {e}")
 
         # Verify SL orders exist for all synced positions (GMX only — Bitunix SLs are on their exchange)
         for pos in list(self.positions.values()):
@@ -628,6 +638,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.order_retry_task = asyncio.create_task(self.order_retry_loop())
         self.gas_check_task = asyncio.create_task(self.gas_check_loop())
         self.pnl_alert_task = asyncio.create_task(self.pnl_alert_loop())
+        self.trade_rebuild_task = asyncio.create_task(self.trade_rebuild_loop())
         # self.vip_promo_task = asyncio.create_task(self.vip_promo_loop())  # uncomment when ready to launch
 
         # Bitunix position monitor (TP tracking, SL trailing, reconciliation)
@@ -1854,6 +1865,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 if now - t < self._signal_dedup_window
             }
 
+            if len(self._recent_signal_hashes) > 5000:
+                # Keep only newest 2500
+                sorted_hashes = sorted(self._recent_signal_hashes.items(), key=lambda x: x[1])
+                self._recent_signal_hashes = dict(sorted_hashes[-2500:])
+
             if sig_hash in self._recent_signal_hashes:
                 elapsed = now - self._recent_signal_hashes[sig_hash]
                 self.logger.info(f"Exact duplicate signal ignored (same leverage+TPs {elapsed:.0f}s ago, window={self._signal_dedup_window:.0f}s)")
@@ -1994,9 +2010,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             position, order_type = await self.execute_open(signal, size_usd, acct, collateral_usd=collateral_usd, wallet_id=wallet_id)
             if position:
                 position.signal_id = signal_id
-                self.signal_store.mark_executed(signal_id, position.id, wallet_id)
                 self.positions[position.id] = position
-                self._save_position_state()
+                self._save_position_state()  # Atomic save immediately after state update
+                self.signal_store.mark_executed(signal_id, position.id, wallet_id)
                 self.health_stats["trades_executed"] += 1
                 await self.notify_position_opened(position, order_type)
                 # Top up ETH for gas if balance is low
@@ -2770,6 +2786,34 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         except Exception as e:
             self.logger.error(f"Failed to send TX: {e}")
             raise
+
+    async def trade_rebuild_loop(self):
+        """Every 10 min: rebuild trades + verify open position TP fills from on-chain.
+
+        Fallback behind tp_monitor_loop (which checks every ~60s with short lookback).
+        This does a full on-chain + API query to catch anything the fast monitor missed.
+        """
+        from trade_rebuilder import rebuild_all_trades, rebuild_open_positions
+        INTERVAL = 600  # 10 minutes
+        while True:
+            try:
+                await asyncio.sleep(INTERVAL)
+                self.trade_history = await rebuild_all_trades(
+                    self.w3, self._all_wallets(), self.cfg.markets,
+                    bitunix_client=getattr(self, 'bitunix_client', None),
+                    open_positions=self.positions,
+                )
+                corrections = await rebuild_open_positions(
+                    self.w3, self._all_wallets(), self.positions, self.cfg.markets,
+                    bitunix_client=getattr(self, 'bitunix_client', None),
+                )
+                if corrections:
+                    self._save_position_state()
+                    self.logger.info(f"Rebuild loop: {len(corrections)} position(s) corrected")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.warning(f"Trade rebuild loop error: {e}")
 
     async def heartbeat_loop(self):
         """Periodic health check & status logging."""

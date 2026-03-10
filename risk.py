@@ -19,6 +19,8 @@ logger = logging.getLogger("GMXBot.risk")
 
 def cap_leverage(leverage: float, max_leverage: float, min_leverage: float = 5.0) -> float:
     """Clamp leverage between min and max allowed."""
+    if min_leverage > max_leverage:
+        min_leverage, max_leverage = max_leverage, min_leverage
     return max(min_leverage, min(leverage, max_leverage))
 
 
@@ -284,6 +286,8 @@ def verify_tp_hit_by_price(
     triggering false TP-hit notifications.  The previous 3% default was
     far too loose (BTC TP at $100k would trigger at $97k).
     """
+    if tp_price <= 0 or current_price <= 0:
+        return False
     tol = tp_price * tolerance_pct
     if is_long:
         return current_price >= tp_price - tol

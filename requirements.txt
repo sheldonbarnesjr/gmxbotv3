@@ -1,0 +1,8 @@
+python-dotenv
+telethon
+web3
+eth-account
+fpdf2
+requests
+python-telegram-bot>=20.0
+cryptography

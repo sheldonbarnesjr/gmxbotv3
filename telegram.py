@@ -387,8 +387,8 @@ class CoreTelegramMixin:
 
                     # Check if sender is a family member (but not the admin)
                     is_admin = (
-                        (self.cfg.admin_usernames and sender_username in self.cfg.admin_usernames)
-                        or (self.cfg.bot_admin_chat_id and sender_id == self.cfg.bot_admin_chat_id)
+                        (self.cfg.admin_usernames and sender_username in [u.lower() for u in self.cfg.admin_usernames])
+                        or (self.cfg.bot_admin_chat_id and str(sender_id) == str(self.cfg.bot_admin_chat_id))
                         or str(chat_id) == str(self.cfg.admin_chat)
                     )
                     family_member = (
@@ -2110,23 +2110,18 @@ class CoreTelegramMixin:
             if sym in PNL_SYMBOLS:
                 market_to_sym[addr.lower()] = sym
 
-        # ── Today's realized trades from on-chain (all wallets, stored locally) ──
-        all_stored, _created = await self._fetch_and_store_trades()
-        today_trades = [t for t in all_stored if t.get("timestamp", 0) >= today_cutoff]
+        # ── Today's realized trades from centralized rebuilder ──
+        from trade_rebuilder import rebuild_all_trades
+        all_trades = await rebuild_all_trades(
+            self.w3, self._all_wallets(), self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
+        )
+        self.trade_history = all_trades
+        today_trades = [t for t in all_trades if t.closed_at >= today_cutoff and abs(t.pnl_usd) >= 1]
 
-        # Filter to PNL_SYMBOLS, exclude dust (< $1), and sum.
-        # Use net_pnl_usd (includes fees + price impact) with fallback to
-        # pnl_usd for older stored trades that lack the field.
-        realized_pnl = 0.0
-        realized_count = 0
-        for t in today_trades:
-            pnl = t.get("net_pnl_usd", t.get("pnl_usd", 0))
-            if abs(pnl) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                realized_pnl += pnl
-                realized_count += 1
+        realized_pnl = sum(t.pnl_usd for t in today_trades)
+        realized_count = len(today_trades)
 
         # ── Open positions on-chain (unrealized PnL) ──
         unrealized_pnl = 0.0
@@ -2204,6 +2199,16 @@ class CoreTelegramMixin:
 
     async def send_weekly_summary(self):
         """Send weekly summary with lifetime stats + trade history PDF."""
+        from trade_rebuilder import rebuild_all_trades
+        try:
+            self.trade_history = await rebuild_all_trades(
+                self.w3, self._all_wallets(), self.cfg.markets,
+                bitunix_client=getattr(self, 'bitunix_client', None),
+                open_positions=self.positions,
+            )
+        except Exception as e:
+            self.logger.warning(f"Weekly summary rebuild failed: {e}")
+
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
 
@@ -2229,10 +2234,7 @@ class CoreTelegramMixin:
 
         # Attach trade history PDF
         try:
-            PNL_SYMBOLS = set(self.cfg.markets.keys()) if self.cfg.markets else {"BTC", "SOL", "ETH"}
-            market_to_sym = {addr.lower(): sym for sym, addr in self.cfg.markets.items() if sym in PNL_SYMBOLS}
-            on_chain, _created = await self._fetch_and_store_trades()
-            pdf_path = await asyncio.to_thread(self._generate_trade_pdf, on_chain, market_to_sym)
+            pdf_path = await asyncio.to_thread(self._generate_trade_pdf, self.trade_history)
 
             # Send via Telethon to notify_chat
             if self.cfg.notify_chat and self.client:
@@ -2287,41 +2289,30 @@ class CoreTelegramMixin:
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
 
-        # ── Build lifetime stats (same logic as send_weekly_summary) ──
-        PNL_SYMBOLS = {"BTC", "ETH", "SOL"}
-        market_to_sym = {}
-        for sym, addr in self.cfg.markets.items():
-            if sym in PNL_SYMBOLS:
-                market_to_sym[addr.lower()] = sym
+        # ── Build lifetime stats from centralized rebuilder ──
+        from trade_rebuilder import rebuild_all_trades
+        all_trades = await rebuild_all_trades(
+            self.w3, self._all_wallets(), self.cfg.markets,
+            bitunix_client=getattr(self, 'bitunix_client', None),
+            open_positions=self.positions,
+        )
+        self.trade_history = all_trades
 
-        all_trades, _created = await self._fetch_and_store_trades()
+        tagged = [t for t in all_trades if abs(t.pnl_usd) >= 1]
 
-        def _net(t):
-            return t.get("net_pnl_usd", t.get("pnl_usd", 0))
-
-        tagged = []
-        for t in all_trades:
-            if abs(_net(t)) < 1:
-                continue
-            sym = market_to_sym.get((t.get("market_address") or "").lower())
-            if sym:
-                entry = dict(t)
-                entry["_sym"] = sym
-                tagged.append(entry)
-
-        lifetime_pnl = sum(_net(t) for t in tagged)
-        lifetime_wins = sum(1 for t in tagged if _net(t) > 0)
-        lifetime_losses = sum(1 for t in tagged if _net(t) <= 0)
+        lifetime_pnl = sum(t.pnl_usd for t in tagged)
+        lifetime_wins = sum(1 for t in tagged if t.pnl_usd > 0)
+        lifetime_losses = sum(1 for t in tagged if t.pnl_usd <= 0)
         lifetime_count = len(tagged)
         lifetime_winrate = (lifetime_wins / lifetime_count * 100) if lifetime_count else 0.0
 
         symbol_lines = []
         for sym in ("BTC", "ETH", "SOL"):
-            sym_trades = [t for t in tagged if t["_sym"] == sym]
+            sym_trades = [t for t in tagged if t.symbol == sym]
             if sym_trades:
-                sym_pnl = sum(_net(t) for t in sym_trades)
+                sym_pnl = sum(t.pnl_usd for t in sym_trades)
                 sym_sign = "+" if sym_pnl >= 0 else ""
-                sym_w = sum(1 for t in sym_trades if _net(t) > 0)
+                sym_w = sum(1 for t in sym_trades if t.pnl_usd > 0)
                 symbol_lines.append(f"  {sym}: {sym_sign}${sym_pnl:,.2f} ({sym_w}W/{len(sym_trades) - sym_w}L)")
 
         l_sign = "+" if lifetime_pnl >= 0 else ""
@@ -2351,7 +2342,7 @@ class CoreTelegramMixin:
         # Generate and send trade history PDF
         try:
             pdf_path = await asyncio.to_thread(
-                self._generate_trade_pdf, all_trades, market_to_sym
+                self._generate_trade_pdf, self.trade_history
             )
             await bot_api.send_admin_pdf(token, vip_chat, pdf_path, caption="Trade History Report")
             os.remove(pdf_path)

@@ -15,7 +15,7 @@ from state_io import atomic_json_write, safe_json_read
 
 logger = logging.getLogger("GMXBot.signal_store")
 
-SIGNAL_STORE_FILE = "signal_store.json"
+SIGNAL_STORE_FILE = "json/signal_store.json"
 MAX_SIGNALS = 500  # keep last N signals in memory/disk
 
 
@@ -45,7 +45,9 @@ class SignalStore:
 
     def __init__(self):
         self.signals: Dict[str, StoredSignal] = {}
+        self._pos_index: Dict[str, str] = {}  # position_id -> signal_id
         self._load()
+        self._rebuild_pos_index()
 
     def _load(self):
         data = safe_json_read(SIGNAL_STORE_FILE, default=[])
@@ -54,7 +56,14 @@ class SignalStore:
                 sig = StoredSignal(**entry)
                 self.signals[sig.signal_id] = sig
             except Exception as e:
-                logger.warning(f"Skipping corrupt signal store entry: {e}")
+                logger.warning(f"Skipping corrupt signal store entry: {e} — data: {entry!r}")
+
+    def _rebuild_pos_index(self):
+        self._pos_index = {
+            sig.position_id: sig.signal_id
+            for sig in self.signals.values()
+            if sig.position_id
+        }
 
     def _save(self):
         all_sigs = sorted(
@@ -103,6 +112,7 @@ class SignalStore:
             sig.timestamp_executed = time.time()
             sig.position_id = position_id
             sig.wallet_id = wallet_id
+            self._pos_index[position_id] = signal_id
             self._save()
 
     def mark_rejected(self, signal_id: str, reason: str):
@@ -113,6 +123,11 @@ class SignalStore:
             self._save()
 
     def get_signal_for_position(self, position_id: str) -> Optional[StoredSignal]:
+        # Use reverse index for O(1) lookup
+        if hasattr(self, '_pos_index') and position_id in self._pos_index:
+            sig_id = self._pos_index[position_id]
+            return self.signals.get(sig_id)
+        # Fallback to linear scan
         for sig in self.signals.values():
             if sig.position_id == position_id:
                 return sig

@@ -88,10 +88,10 @@ class FamilyMirrorMixin:
     # ──────────────────────────────────────────────────────────────────────
 
     def _family_positions_file(self, member: FamilyMember) -> str:
-        return f"family_{member.id}_positions.json"
+        return f"json/family_{member.id}_positions.json"
 
     def _family_trades_file(self, member: FamilyMember) -> str:
-        return f"family_{member.id}_trades.json"
+        return f"json/family_{member.id}_trades.json"
 
     def _save_family_state(self, member: FamilyMember):
         """Persist family member positions and trade history."""
@@ -223,18 +223,19 @@ class FamilyMirrorMixin:
         if not self.family_members:
             return
 
-        tasks = []
-        for member in self.family_members:
-            tasks.append(self._execute_family_trade(member, signal))
+        async with self._family_lock:
+            tasks = []
+            for member in self.family_members:
+                tasks.append(self._execute_family_trade(member, signal))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for member, result in zip(self.family_members, results):
-            if isinstance(result, Exception):
-                logger.error(f"Family trade failed for {member.name}: {result}")
-                await self._notify_family(
-                    member,
-                    f"**Trade Failed**\n{signal.symbol} {signal.side}\nError: {result}"
-                )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for member, result in zip(self.family_members, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Family trade failed for {member.name}: {result}")
+                    await self._notify_family(
+                        member,
+                        f"**Trade Failed**\n{signal.symbol} {signal.side}\nError: {result}"
+                    )
 
     async def _execute_family_trade(self, member: FamilyMember, signal):
         """Execute a trade for a single family member."""
@@ -242,13 +243,11 @@ class FamilyMirrorMixin:
         from risk import cap_leverage
         from gmx import Position, TakeProfitLevel
 
-        # Check for duplicate under lock to prevent concurrent signals from
-        # both passing the check before either records its position
-        async with self._family_lock:
-            for pos in member.positions.values():
-                if pos.is_open and pos.symbol == signal.symbol and pos.side == signal.side:
-                    logger.info(f"Family {member.name}: {signal.symbol} {signal.side} already open, skipping")
-                    return
+        # Duplicate check — caller (_mirror_to_family) already holds _family_lock
+        for pos in member.positions.values():
+            if pos.is_open and pos.symbol == signal.symbol and pos.side == signal.side:
+                logger.info(f"Family {member.name}: {signal.symbol} {signal.side} already open, skipping")
+                return
 
         # Get member's USDC balance
         usdc_balance = await asyncio.to_thread(

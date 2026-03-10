@@ -20,7 +20,7 @@ import asyncio
 import time
 import logging
 import traceback
-from typing import Optional, List, TYPE_CHECKING
+from typing import Dict, Optional, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gmx import Position
@@ -48,6 +48,15 @@ class SLTPMixin:
 
     # Counter for stale order checks (runs every 12th cycle ≈ 60s)
     _stale_check_counter: int = 0
+
+    # Per-position asyncio locks to prevent concurrent state mutation
+    _position_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_pos_lock(self, pos_id: str) -> asyncio.Lock:
+        """Return (creating if needed) an asyncio.Lock for the given position."""
+        if pos_id not in self._position_locks:
+            self._position_locks[pos_id] = asyncio.Lock()
+        return self._position_locks[pos_id]
 
     def _get_stale_tp_misses(self):
         """Get per-instance stale TP miss tracker (lazy init to avoid mutable class var)."""
@@ -85,6 +94,8 @@ class SLTPMixin:
 
         for pos_id, pos in list(self.positions.items()):
             if not pos.is_open or not pos.take_profits:
+                # Clean up lock for closed positions
+                self._position_locks.pop(pos_id, None)
                 continue
             if not pos.market_addr:
                 continue
@@ -105,182 +116,185 @@ class SLTPMixin:
                 if not decreases:
                     continue
 
-                # Step 2: Filter out already-processed events
-                new_events = [
-                    d for d in decreases
-                    if d.get("tx_hash")
-                    and f"{d['tx_hash']}:{d.get('log_index', 0)}" not in pos.processed_tx_hashes
-                ]
-                if not new_events:
-                    continue
+                # Acquire per-position lock to prevent concurrent state mutation
+                async with self._get_pos_lock(pos_id):
 
-                # Step 3: Match events to un-verified TPs using on-chain order_type
-                # order_type: 5=TP (LimitDecrease), 6=SL (StopLossDecrease),
-                #             4=MarketDecrease (manual), None=unknown (fallback)
-                if is_long:
-                    sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price)
-                else:
-                    sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price, reverse=True)
-
-                new_hits = 0
-
-                for event in new_events:
-                    event_key = f"{event['tx_hash']}:{event.get('log_index', 0)}"
-                    exec_price = event.get("execution_price", 0)
-                    if not exec_price:
-                        pos.processed_tx_hashes.add(event_key)
+                    # Step 2: Filter out already-processed events
+                    new_events = [
+                        d for d in decreases
+                        if d.get("tx_hash")
+                        and f"{d['tx_hash']}:{d.get('log_index', 0)}" not in pos.processed_tx_hashes
+                    ]
+                    if not new_events:
                         continue
 
-                    evt_order_type = event.get("order_type")
-                    evt_trigger = event.get("trigger_price", 0)
+                    # Step 3: Match events to un-verified TPs using on-chain order_type
+                    # order_type: 5=TP (LimitDecrease), 6=SL (StopLossDecrease),
+                    #             4=MarketDecrease (manual), None=unknown (fallback)
+                    if is_long:
+                        sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price)
+                    else:
+                        sorted_tps = sorted(pos.take_profits, key=lambda tp: tp.price, reverse=True)
 
-                    # SL execution: order_type=6, or trigger_price matches SL
-                    is_sl = evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE
-                    if not is_sl and evt_trigger > 0 and pos.stop_loss:
-                        if abs(evt_trigger - pos.stop_loss) / pos.stop_loss < 0.005:
-                            is_sl = True
-                    if is_sl:
-                        self.logger.info(
-                            f"{pos.symbol}: SL hit @ ${exec_price:,.0f} "
-                            f"(order_type={evt_order_type}, trigger=${evt_trigger:,.0f}, "
-                            f"sl_level={pos.sl_move_label or 'original'}, "
-                            f"tx={event['tx_hash'][:16]}...)"
-                        )
-                        pos.processed_tx_hashes.add(event_key)
-                        continue
+                    new_hits = 0
 
-                    # Manual close (order_type=4) — not a TP
-                    if evt_order_type == 4:  # MarketDecrease
-                        self.logger.info(
-                            f"{pos.symbol}: Manual close @ ${exec_price:,.0f} "
-                            f"(order_type=4, tx={event['tx_hash'][:16]}...)"
-                        )
-                        pos.processed_tx_hashes.add(event_key)
-                        continue
-
-                    # TP execution (order_type=5) or unknown (None → fallback to price matching)
-                    # Use trigger_price (from OrderCreated) as primary match — more reliable
-                    # than execution_price which is the actual fill price and may differ
-                    trigger_price = event.get("trigger_price", 0)
-                    matched = False
-                    for i, tp in enumerate(sorted_tps):
-                        if self._tp_already_verified(pos, tp.price):
+                    for event in new_events:
+                        event_key = f"{event['tx_hash']}:{event.get('log_index', 0)}"
+                        exec_price = event.get("execution_price", 0)
+                        if not exec_price:
+                            pos.processed_tx_hashes.add(event_key)
                             continue
-                        # Try trigger_price first (exact match from OrderCreated event)
-                        trigger_match = (
-                            trigger_price > 0
-                            and verify_tp_hit_by_price(is_long, tp.price, trigger_price, tolerance_pct=0.01)
-                        )
-                        # Fallback to execution_price (actual fill price)
-                        exec_match = verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01)
-                        if trigger_match or exec_match:
-                            match_price = trigger_price if trigger_match else exec_price
-                            pos.verified_decreases.append({
-                                "execution_price": exec_price,
-                                "net_pnl_usd": event.get("net_pnl_usd", 0),
-                                "timestamp": event.get("timestamp", time.time()),
-                                "tx_hash": event.get("tx_hash", ""),
-                                "log_index": event.get("log_index", 0),
-                                "size_delta_usd": event.get("size_delta_usd", 0),
-                                "matched_tp_price": tp.price,
-                                "order_type": evt_order_type,
-                            })
-                            new_hits += 1
-                            matched = True
-                            source = "trigger" if trigger_match else ("on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match")
+
+                        evt_order_type = event.get("order_type")
+                        evt_trigger = event.get("trigger_price", 0)
+
+                        # SL execution: order_type=6, or trigger_price matches SL
+                        is_sl = evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE
+                        if not is_sl and evt_trigger > 0 and pos.stop_loss:
+                            if abs(evt_trigger - pos.stop_loss) / pos.stop_loss < 0.005:
+                                is_sl = True
+                        if is_sl:
                             self.logger.info(
-                                f"{pos.symbol} TP{i+1} HIT @ ${match_price:,.0f} "
-                                f"({source}, order_type={evt_order_type}, "
-                                f"pnl=${event.get('net_pnl_usd', 0):,.2f}, "
+                                f"{pos.symbol}: SL hit @ ${exec_price:,.0f} "
+                                f"(order_type={evt_order_type}, trigger=${evt_trigger:,.0f}, "
+                                f"sl_level={pos.sl_move_label or 'original'}, "
                                 f"tx={event['tx_hash'][:16]}...)"
                             )
-                            break
+                            pos.processed_tx_hashes.add(event_key)
+                            continue
 
-                    if not matched:
-                        if evt_order_type == ORDER_TYPE_LIMIT_DECREASE:
-                            # Confirmed TP from chain but no price match — log warning
-                            self.logger.warning(
-                                f"{pos.symbol}: TP execution (order_type=5) @ ${exec_price:,.0f} "
-                                f"did not match any unverified TP price"
+                        # Manual close (order_type=4) — not a TP
+                        if evt_order_type == 4:  # MarketDecrease
+                            self.logger.info(
+                                f"{pos.symbol}: Manual close @ ${exec_price:,.0f} "
+                                f"(order_type=4, tx={event['tx_hash'][:16]}...)"
                             )
-                        else:
-                            self.logger.debug(
-                                f"{pos.symbol}: PositionDecrease @ ${exec_price:,.0f} "
-                                f"order_type={evt_order_type} — no TP match"
+                            pos.processed_tx_hashes.add(event_key)
+                            continue
+
+                        # TP execution (order_type=5) or unknown (None → fallback to price matching)
+                        # Use trigger_price (from OrderCreated) as primary match — more reliable
+                        # than execution_price which is the actual fill price and may differ
+                        trigger_price = event.get("trigger_price", 0)
+                        matched = False
+                        for i, tp in enumerate(sorted_tps):
+                            if self._tp_already_verified(pos, tp.price):
+                                continue
+                            # Try trigger_price first (exact match from OrderCreated event)
+                            trigger_match = (
+                                trigger_price > 0
+                                and verify_tp_hit_by_price(is_long, tp.price, trigger_price, tolerance_pct=0.01)
                             )
-                    # Mark as processed regardless of match
-                    pos.processed_tx_hashes.add(event_key)
+                            # Fallback to execution_price (actual fill price)
+                            exec_match = verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01)
+                            if trigger_match or exec_match:
+                                match_price = trigger_price if trigger_match else exec_price
+                                pos.verified_decreases.append({
+                                    "execution_price": exec_price,
+                                    "net_pnl_usd": event.get("net_pnl_usd", 0),
+                                    "timestamp": event.get("timestamp", time.time()),
+                                    "tx_hash": event.get("tx_hash", ""),
+                                    "log_index": event.get("log_index", 0),
+                                    "size_delta_usd": event.get("size_delta_usd", 0),
+                                    "matched_tp_price": tp.price,
+                                    "order_type": evt_order_type,
+                                })
+                                new_hits += 1
+                                matched = True
+                                source = "trigger" if trigger_match else ("on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match")
+                                self.logger.info(
+                                    f"{pos.symbol} TP{i+1} HIT @ ${match_price:,.0f} "
+                                    f"({source}, order_type={evt_order_type}, "
+                                    f"pnl=${event.get('net_pnl_usd', 0):,.2f}, "
+                                    f"tx={event['tx_hash'][:16]}...)"
+                                )
+                                break
 
-                # Step 4: Process hits — PnL, notify, move SL
-                if new_hits > 0:
-                    # tp_hits_count is now a @property = len(verified_decreases)
-                    self.logger.info(
-                        f"{pos.symbol} {pos.side}: {new_hits} new TP hits, "
-                        f"total={pos.tp_hits_count}"
-                    )
+                        if not matched:
+                            if evt_order_type == ORDER_TYPE_LIMIT_DECREASE:
+                                # Confirmed TP from chain but no price match — log warning
+                                self.logger.warning(
+                                    f"{pos.symbol}: TP execution (order_type=5) @ ${exec_price:,.0f} "
+                                    f"did not match any unverified TP price"
+                                )
+                            else:
+                                self.logger.debug(
+                                    f"{pos.symbol}: PositionDecrease @ ${exec_price:,.0f} "
+                                    f"order_type={evt_order_type} — no TP match"
+                                )
+                        # Mark as processed regardless of match
+                        pos.processed_tx_hashes.add(event_key)
 
-                    # Calculate realized PnL from verified_decreases (on-chain source of truth)
-                    realized_pnl = sum(d.get("net_pnl_usd", 0) for d in pos.verified_decreases)
-                    pos.realized_pnl = realized_pnl
-                    self._save_position_state()
-
-                    # Calculate unrealized PnL on remaining position
-                    current_price = await self.get_current_price(pos.symbol)
-                    if current_price:
-                        pos.current_price = current_price
-                    total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
-                    base_size = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
-                    remaining_size = max(base_size - total_decreased, 0.0)
-                    unrealized_pnl = calculate_unrealized_pnl(
-                        pos.side, pos.entry_price, pos.current_price, remaining_size
-                    )
-
-                    # Try fee-inclusive PnL from Reader contract (includes
-                    # borrowing, funding, and closing fees)
-                    try:
-                        collateral_token = getattr(pos, 'collateral_token', None) or self.cfg.collateral_token
-                        pnl_data = await asyncio.to_thread(
-                            fetch_position_pnl,
-                            self.w3, acct.address, pos.market_addr,
-                            collateral_token, is_long, pos.current_price,
+                    # Step 4: Process hits — PnL, notify, move SL
+                    if new_hits > 0:
+                        # tp_hits_count is now a @property = len(verified_decreases)
+                        self.logger.info(
+                            f"{pos.symbol} {pos.side}: {new_hits} new TP hits, "
+                            f"total={pos.tp_hits_count}"
                         )
-                        if pnl_data.get("success") and pnl_data.get("net_pnl_usd") is not None:
-                            unrealized_pnl = pnl_data["net_pnl_usd"]
-                    except Exception as e:
-                        self.logger.debug(f"Reader PnL unavailable, using price-delta: {e}")
-                    total_pnl = realized_pnl + unrealized_pnl
-                    r_sign = "+" if realized_pnl >= 0 else ""
-                    u_sign = "+" if unrealized_pnl >= 0 else ""
-                    t_sign = "+" if total_pnl >= 0 else ""
 
-                    col = pos.collateral_usd
-                    pnl_pct_str = f" ({total_pnl / col * 100:+.1f}%)" if col > 0 else ""
-                    # Get execution price from the latest verified decrease
-                    latest_vd = pos.verified_decreases[-1] if pos.verified_decreases else {}
-                    exec_price = latest_vd.get("execution_price", pos.current_price or 0)
-                    try:
-                        await self.notify(
-                            f"GMX {pos.symbol} {pos.side} {pos.leverage:.1f}x: Target {pos.tp_hits_count} Hit ✅\n"
-                            f"Realized: {r_sign}${realized_pnl:,.2f} @ ${exec_price:,.2f}\n"
-                            f"Unrealized: {u_sign}${unrealized_pnl:,.2f}\n"
-                            f"Total PnL: {t_sign}${total_pnl:,.2f}{pnl_pct_str}"
-                        )
-                    except Exception:
-                        pass
-
-                    # Fetch orders (needed by move_sl for SL cancellation) and move SL
-                    try:
-                        orders = await asyncio.to_thread(
-                            fetch_open_orders, self.w3, acct.address
-                        )
-                        await self.move_sl(pos, orders)
+                        # Calculate realized PnL from verified_decreases (on-chain source of truth)
+                        realized_pnl = sum(d.get("net_pnl_usd", 0) for d in pos.verified_decreases)
+                        pos.realized_pnl = realized_pnl
                         self._save_position_state()
-                    except Exception as e:
-                        self.logger.warning(f"Failed to move SL after TP hit: {e}")
-                        await self.notify(
-                            f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                            f"TP hit but failed to move SL: {e}"
+
+                        # Calculate unrealized PnL on remaining position
+                        current_price = await self.get_current_price(pos.symbol)
+                        if current_price:
+                            pos.current_price = current_price
+                        total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
+                        base_size = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
+                        remaining_size = max(base_size - total_decreased, 0.0)
+                        unrealized_pnl = calculate_unrealized_pnl(
+                            pos.side, pos.entry_price, pos.current_price, remaining_size
                         )
+
+                        # Try fee-inclusive PnL from Reader contract (includes
+                        # borrowing, funding, and closing fees)
+                        try:
+                            collateral_token = getattr(pos, 'collateral_token', None) or self.cfg.collateral_token
+                            pnl_data = await asyncio.to_thread(
+                                fetch_position_pnl,
+                                self.w3, acct.address, pos.market_addr,
+                                collateral_token, is_long, pos.current_price,
+                            )
+                            if pnl_data.get("success") and pnl_data.get("net_pnl_usd") is not None:
+                                unrealized_pnl = pnl_data["net_pnl_usd"]
+                        except Exception as e:
+                            self.logger.debug(f"Reader PnL unavailable, using price-delta: {e}")
+                        total_pnl = realized_pnl + unrealized_pnl
+                        r_sign = "+" if realized_pnl >= 0 else ""
+                        u_sign = "+" if unrealized_pnl >= 0 else ""
+                        t_sign = "+" if total_pnl >= 0 else ""
+
+                        col = pos.collateral_usd
+                        pnl_pct_str = f" ({total_pnl / col * 100:+.1f}%)" if col > 0 else ""
+                        # Get execution price from the latest verified decrease
+                        latest_vd = pos.verified_decreases[-1] if pos.verified_decreases else {}
+                        exec_price = latest_vd.get("execution_price", pos.current_price or 0)
+                        try:
+                            await self.notify(
+                                f"GMX {pos.symbol} {pos.side} {pos.leverage:.1f}x: Target {pos.tp_hits_count} Hit ✅\n"
+                                f"Realized: {r_sign}${realized_pnl:,.2f} @ ${exec_price:,.2f}\n"
+                                f"Unrealized: {u_sign}${unrealized_pnl:,.2f}\n"
+                                f"Total PnL: {t_sign}${total_pnl:,.2f}{pnl_pct_str}"
+                            )
+                        except Exception:
+                            pass
+
+                        # Fetch orders (needed by move_sl for SL cancellation) and move SL
+                        try:
+                            orders = await asyncio.to_thread(
+                                fetch_open_orders, self.w3, acct.address
+                            )
+                            await self.move_sl(pos, orders, _lock_held=True)
+                            self._save_position_state()
+                        except Exception as e:
+                            self.logger.warning(f"Failed to move SL after TP hit: {e}")
+                            await self.notify(
+                                f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                                f"TP hit but failed to move SL: {e}"
+                            )
 
             except Exception as e:
                 self.logger.debug(f"Error checking TPs for {pos.symbol}: {e}")
@@ -487,7 +501,7 @@ class SLTPMixin:
     # Move SL after TP hits or manual command
     # ──────────────────────────────────────────────────────────────────────
 
-    async def move_sl(self, pos: "Position", orders: list, new_sl_price: Optional[float] = None, sl_label: Optional[str] = None, *, manual: bool = False):
+    async def move_sl(self, pos: "Position", orders: list, new_sl_price: Optional[float] = None, sl_label: Optional[str] = None, *, manual: bool = False, _lock_held: bool = False):
         """Move SL to entry (breakeven) or previous TP after TP hit(s).
 
         Called in two ways:
@@ -508,7 +522,10 @@ class SLTPMixin:
             new_sl_price: (Optional) Manual SL price (from cmd_sl). If None, auto-compute.
             sl_label: (Optional) Label for manual SL (e.g., "Entry", "TP1", "TP2")
             manual: If True, suppress the notification (caller handles its own).
+            _lock_held: If True, skip acquiring the position lock (caller already holds it).
         """
+        if not _lock_held:
+            await self._get_pos_lock(pos.id).acquire()
         try:
             if pos.tp_hits_count == 0 and new_sl_price is None:
                 return
@@ -579,6 +596,12 @@ class SLTPMixin:
                         f"{pos.symbol}: {len(keyless)} SL order(s) missing key_hex — "
                         f"cannot cancel. May leave orphaned SL on-chain."
                     )
+                    await self.notify(
+                        f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
+                        f"{len(keyless)} SL order(s) missing key_hex — "
+                        f"cannot cancel old SL. Skipping new SL placement to prevent double SL execution."
+                    )
+                    return
                 sl_orders = [o for o in all_sl_orders if o.get("key_hex")]
                 if not sl_orders:
                     break
@@ -615,6 +638,8 @@ class SLTPMixin:
                     f"{pos.symbol} {pos.side}: remaining size ${remaining_size:.2f} below "
                     f"min ${cfg.min_position_usd:.0f} — skipping SL placement"
                 )
+                # Position effectively closed — clean up lock
+                self._position_locks.pop(pos.id, None)
                 return
 
             # 2. Create new SL order at new price (with retry)
@@ -772,6 +797,9 @@ class SLTPMixin:
                 )
             except Exception:
                 pass
+        finally:
+            if not _lock_held:
+                self._get_pos_lock(pos.id).release()
 
     # ──────────────────────────────────────────────────────────────────────
     # Telegram command: /sl <#> <target>

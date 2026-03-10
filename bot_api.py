@@ -30,6 +30,7 @@ async def send_admin_message(token: str, chat_id: str, text: str) -> bool:
     Returns True on success, False on failure or if token/chat_id are empty.
     """
     if not token or not chat_id:
+        logger.warning("Bot API: missing token or chat_id — notification dropped")
         return False
     try:
         return await asyncio.to_thread(_send_message, token, chat_id, text)
@@ -104,6 +105,8 @@ def _send_message(token: str, chat_id: str, text: str) -> bool:
         "text": text,
         "parse_mode": "Markdown",
     }, timeout=15)
+    if resp.status_code != 200:
+        logger.error(f"Bot API HTTP {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
     if not data.get("ok"):
         # Retry without parse_mode if Markdown formatting caused the failure
@@ -124,6 +127,9 @@ def _get_updates(token: str, offset: int, timeout: int) -> tuple:
         "offset": offset,
         "timeout": timeout,
     }, timeout=timeout + 10)
+    if resp.status_code != 200:
+        logger.error(f"Bot API getUpdates HTTP {resp.status_code}: {resp.text[:200]}")
+        return [], offset
     data = resp.json()
     if not data.get("ok"):
         logger.error(f"Bot API getUpdates error: {data}")
