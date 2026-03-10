@@ -208,7 +208,14 @@ class AnalyticsMixin:
         # Preserve Bitunix trades (not on-chain, would be lost otherwise)
         bitunix_trades = [t for t in self.trade_history
                           if getattr(t, 'exchange', 'gmx') == 'bitunix']
-        self.logger.info(f"Rebuild: preserving {len(bitunix_trades)} Bitunix trade(s)")
+        self.logger.info(f"Rebuild: preserving {len(bitunix_trades)} Bitunix trade(s) from memory")
+
+        # If no Bitunix trades in memory, fetch from Bitunix API
+        if not bitunix_trades and getattr(self, 'bitunix_client', None):
+            fetched = await self._fetch_bitunix_trade_history()
+            if fetched:
+                bitunix_trades = fetched
+                self.logger.info(f"Rebuild: fetched {len(fetched)} Bitunix trade(s) from API")
 
         # Clear GMX trades (Bitunix trades are kept in the list)
         self.trade_history = list(bitunix_trades)
@@ -802,6 +809,185 @@ class AnalyticsMixin:
             atomic_json_write(ONCHAIN_TRADES_FILE, trades)
         except Exception as e:
             logger.warning(f"Failed to save onchain trades: {e}")
+
+    async def _fetch_bitunix_trade_history(self) -> List['TradeRecord']:
+        """Fetch closed positions from Bitunix API and convert to TradeRecords.
+
+        Called during rebuild when no Bitunix trades exist in memory/disk.
+        Uses get_history_positions() + get_history_tpsl_orders() to reconstruct
+        full trade data including TP details, SL details, and unfilled targets.
+        """
+        try:
+            positions = await asyncio.to_thread(
+                self.bitunix_client.get_history_positions, None, 50
+            )
+            tpsl = await asyncio.to_thread(
+                self.bitunix_client.get_history_tpsl_orders, None, 100
+            )
+            self.logger.info(f"Bitunix API: {len(positions)} closed positions, {len(tpsl)} TP/SL orders")
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch Bitunix trade history: {e}")
+            return []
+
+        # Parse TRADE_START_DATE for filtering
+        from datetime import datetime as _dt
+        try:
+            fmt = "%Y-%m-%dT%H:%M" if "T" in TRADE_START_DATE else "%Y-%m-%d"
+            start_ts = int(_dt.strptime(TRADE_START_DATE, fmt).timestamp())
+        except Exception:
+            start_ts = 0
+
+        trades = []
+        for p in positions:
+            try:
+                symbol_raw = p.get("symbol", "")
+                symbol = symbol_raw.replace("USDT", "").replace("-", "")
+
+                side = p.get("side", "").upper()
+                if side in ("BUY", "LONG"):
+                    side = "LONG"
+                elif side in ("SELL", "SHORT"):
+                    side = "SHORT"
+
+                entry_price = float(p.get("avgOpenPrice", 0) or p.get("entryPrice", 0) or p.get("openPrice", 0) or 0)
+                exit_price = float(p.get("avgClosePrice", 0) or p.get("closePrice", 0) or 0)
+                leverage = float(p.get("leverage", 0) or 0)
+                qty = float(p.get("qty", 0) or p.get("volume", 0) or 0)
+                size_usd = entry_price * qty if entry_price > 0 and qty > 0 else 0
+
+                pnl_usd = float(p.get("realizedPNL", 0) or p.get("realizedPnl", 0) or p.get("profit", 0) or 0)
+
+                close_ts = int(p.get("mtime", 0) or p.get("closeTime", 0) or 0)
+                open_ts = int(p.get("ctime", 0) or p.get("openTime", 0) or 0)
+                if close_ts > 1e12:
+                    close_ts = close_ts // 1000
+                if open_ts > 1e12:
+                    open_ts = open_ts // 1000
+
+                if close_ts < start_ts:
+                    continue
+
+                collateral = size_usd / leverage if leverage > 0 else size_usd
+                pnl_pct = (pnl_usd / collateral * 100) if collateral > 0 else 0
+
+                # Gather TP/SL orders for this position
+                pos_id = p.get("positionId", "")
+                all_tp_orders = []
+                sl_price_val = None
+                for order in tpsl:
+                    if order.get("positionId") != pos_id:
+                        continue
+                    if order.get("tpPrice") is not None:
+                        all_tp_orders.append((float(order["tpPrice"]), order.get("status", "").upper()))
+                    elif order.get("slPrice") is not None and sl_price_val is None:
+                        if order.get("status", "").upper() in ("TRIGGERED", "FILLED", "EXECUTED"):
+                            sl_price_val = float(order["slPrice"])
+
+                if side == "LONG":
+                    all_tp_orders.sort(key=lambda x: x[0])
+                else:
+                    all_tp_orders.sort(key=lambda x: x[0], reverse=True)
+
+                # TP allocation percentages from env
+                total_tps = len(all_tp_orders)
+                tp_allocs = []
+                if total_tps >= 3:
+                    for tp_idx in range(1, total_tps + 1):
+                        env_key = f"BX_TP_{total_tps}_{tp_idx}"
+                        alloc = float(os.getenv(env_key, 0))
+                        if alloc == 0:
+                            env_key = f"TP_{total_tps}_{tp_idx}"
+                            alloc = float(os.getenv(env_key, 0))
+                        tp_allocs.append(alloc)
+                if not tp_allocs or sum(tp_allocs) == 0:
+                    n_fills = total_tps + (1 if sl_price_val is not None else 0)
+                    if n_fills == 0:
+                        n_fills = 1
+                    tp_allocs = [100 / n_fills] * total_tps
+
+                # Build tp_details for filled TPs
+                tp_hits = 0
+                tp_details = []
+                for idx, (tp_p, tp_status) in enumerate(all_tp_orders):
+                    if tp_status not in ("TRIGGERED", "FILLED", "EXECUTED"):
+                        continue
+                    tp_hits += 1
+                    pct = tp_allocs[idx] if idx < len(tp_allocs) else 0
+                    tp_size = size_usd * pct / 100
+                    if side == "LONG":
+                        tp_pnl = (tp_p - entry_price) / entry_price * tp_size if entry_price > 0 else 0
+                    else:
+                        tp_pnl = (entry_price - tp_p) / entry_price * tp_size if entry_price > 0 else 0
+                    tp_details.append({"price": tp_p, "pct": pct, "pnl": tp_pnl})
+
+                # SL details
+                sl_details = None
+                if sl_price_val is not None:
+                    sl_pct = 100 - sum(tp.get("pct", 0) for tp in tp_details)
+                    sl_size = size_usd * sl_pct / 100
+                    if side == "LONG":
+                        sl_pnl = (sl_price_val - entry_price) / entry_price * sl_size if entry_price > 0 else 0
+                    else:
+                        sl_pnl = (entry_price - sl_price_val) / entry_price * sl_size if entry_price > 0 else 0
+                    sl_details = {"price": sl_price_val, "pct": sl_pct, "pnl": sl_pnl}
+                elif not tp_details:
+                    if side == "LONG":
+                        sl_pnl = (exit_price - entry_price) / entry_price * size_usd if entry_price > 0 else 0
+                    else:
+                        sl_pnl = (entry_price - exit_price) / entry_price * size_usd if entry_price > 0 else 0
+                    sl_details = {"price": exit_price, "pct": 100, "pnl": sl_pnl}
+
+                # Scale PnLs to match actual realized PnL (accounts for fees)
+                raw_sum = sum(tp.get("pnl", 0) for tp in tp_details) + (sl_details.get("pnl", 0) if sl_details else 0)
+                if abs(raw_sum) > 0.01 and abs(pnl_usd) > 0.01:
+                    scale = pnl_usd / raw_sum
+                    for tp in tp_details:
+                        tp["pnl"] = tp["pnl"] * scale
+                    if sl_details:
+                        sl_details["pnl"] = sl_details["pnl"] * scale
+
+                duration_hours = (close_ts - open_ts) / 3600 if close_ts > open_ts else 0
+
+                # Collect unfilled (cancelled) TP orders
+                unfilled_targets = []
+                for tp_p, tp_status in all_tp_orders:
+                    if tp_status in ("SYSTEM_CANCELED", "CANCELED", "CANCELLED"):
+                        unfilled_targets.append({"price": tp_p})
+
+                # Determine exit reason
+                if tp_hits > 0:
+                    exit_reason = f"tp_hit_x{tp_hits}"
+                elif sl_price_val is not None:
+                    exit_reason = "sl_triggered"
+                else:
+                    exit_reason = "exchange_closed"
+
+                trades.append(TradeRecord(
+                    id=f"bx_{pos_id}",
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    size_usd=size_usd,
+                    leverage=leverage,
+                    duration_hours=duration_hours,
+                    pnl_usd=pnl_usd,
+                    pnl_percentage=pnl_pct,
+                    exit_reason=exit_reason,
+                    opened_at=open_ts,
+                    closed_at=close_ts,
+                    exchange="bitunix",
+                    tp_hits=tp_hits,
+                    tp_details=tp_details,
+                    sl_details=sl_details,
+                    unfilled_targets=unfilled_targets if unfilled_targets else None,
+                ))
+            except Exception as e:
+                self.logger.warning(f"Skipping Bitunix position: {e}")
+                continue
+
+        self.logger.info(f"Parsed {len(trades)} Bitunix trade(s) from API (after date filter)")
+        return trades
 
     async def _fetch_and_store_trades(self) -> List[Dict[str, Any]]:
         """Fetch on-chain trades, merge with local store, save, and return all.
