@@ -334,6 +334,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.setup_logging()
 
     def setup_logging(self):
+        import os
+        for d in ("logs", "json", "txt"):
+            os.makedirs(d, exist_ok=True)
         from logging.handlers import RotatingFileHandler
         logging.basicConfig(
             level=getattr(logging, self.cfg.log_level, logging.INFO),
