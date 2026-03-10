@@ -564,6 +564,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         self.logger.info(f"Exchange mode: {self.exchange_mode.upper()}")
 
+        # Send startup notification early, before heavy rebuild work
+        await self.send_startup_notification()
+
         # Sync on-chain positions into internal tracking (survives reboots)
         # skip_sl_check=False: verify and correct SL after TP hits detected during sync
         await self._sync_on_chain_positions(skip_sl_check=False)
@@ -667,9 +670,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             self.logger.debug(f"Initial balance snapshot failed: {e}")
 
         self.logger.info("GMX Bot started successfully")
-
-        # Send startup notification to admin
-        await self.send_startup_notification()
 
         # Register signal handlers so systemd SIGTERM triggers graceful shutdown
         loop = asyncio.get_running_loop()
