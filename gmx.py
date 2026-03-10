@@ -1292,6 +1292,141 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 f"(will be verified by monitor loop)"
             )
 
+        # ── Discover Bitunix positions from exchange API (fallback when no saved state) ──
+        if self.bitunix_client and self.exchange_mode in ("bitunix", "mirror"):
+            try:
+                exchange_positions = await asyncio.to_thread(
+                    self.bitunix_client.get_pending_positions
+                )
+                bx_discovered = 0
+                for ep in exchange_positions:
+                    position_id = ep.get("positionId", "")
+                    symbol_raw = ep.get("symbol", "")
+                    symbol = symbol_raw.replace("USDT", "")
+                    if symbol.startswith("1000"):
+                        symbol = symbol[4:]
+                    raw_side = (ep.get("side") or "").upper()
+                    side = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
+
+                    # Check if already tracked
+                    already_tracked = any(
+                        p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix'
+                        and (
+                            (p.bitunix_position_id and p.bitunix_position_id == position_id)
+                            or (p.symbol == symbol and p.side == side)
+                        )
+                        for p in self.positions.values()
+                    )
+                    if already_tracked:
+                        continue
+
+                    entry = float(ep.get("avgOpenPrice", 0))
+                    leverage = float(ep.get("leverage", 1))
+                    margin = float(ep.get("margin", 0))
+                    qty = float(ep.get("qty", 0))
+                    size_usd = margin * leverage if margin > 0 else (qty * entry if entry > 0 else 0)
+
+                    market_addr = f"bitunix:{position_id}"
+                    pos = Position(
+                        id=str(uuid.uuid4()),
+                        symbol=symbol,
+                        side=side,
+                        size_usd=size_usd,
+                        leverage=leverage,
+                        entry_price=entry,
+                        stop_loss=None,
+                        take_profits=[],
+                        market_addr=market_addr,
+                        opened_at=time.time(),
+                        wallet_id=1,
+                        original_size_usd=size_usd,
+                        exchange="bitunix",
+                        bitunix_position_id=position_id,
+                    )
+
+                    # Try to discover SL and TPs from exchange
+                    try:
+                        pending_tpsl = await asyncio.to_thread(
+                            self.bitunix_client.get_pending_tpsl_orders, symbol_raw
+                        )
+                        my_orders = [o for o in pending_tpsl if o.get("positionId") == position_id]
+                        for o in my_orders:
+                            sl_price = float(o.get("slPrice") or 0)
+                            tp_price = float(o.get("tpPrice") or o.get("triggerPrice") or 0)
+                            tp_qty = float(o.get("tpQty") or 0)
+                            if sl_price > 0 and pos.stop_loss is None:
+                                pos.stop_loss = sl_price
+                                if entry > 0 and abs(sl_price - entry) / entry < 0.003:
+                                    pos.sl_moved_to_entry = True
+                                    pos.sl_move_label = "Entry"
+                            if tp_price > 0 and tp_qty > 0:
+                                pct = tp_qty / qty if qty > 0 else 0
+                                pos.take_profits.append(TakeProfitLevel(
+                                    price=tp_price, percentage=pct,
+                                ))
+
+                        # Check history for already-triggered TPs
+                        history_tpsl = await asyncio.to_thread(
+                            self.bitunix_client.get_history_tpsl_orders, symbol_raw, 200
+                        )
+                        my_history = [o for o in history_tpsl if o.get("positionId") == position_id]
+                        for o in my_history:
+                            status = (o.get("status") or "").upper()
+                            if status in ("SYSTEM_CANCELED", "CANCELED"):
+                                continue
+                            tp_price = float(o.get("tpPrice") or 0)
+                            tp_qty = float(o.get("tpQty") or 0)
+                            if tp_price > 0 and tp_qty > 0:
+                                pct = tp_qty / (qty + tp_qty) if (qty + tp_qty) > 0 else 0
+                                pos.take_profits.append(TakeProfitLevel(
+                                    price=tp_price, percentage=pct,
+                                ))
+                                # Record as verified decrease
+                                tp_notional = tp_qty * entry if entry > 0 else 0
+                                if entry > 0:
+                                    if side == "LONG":
+                                        tp_pnl = (tp_price - entry) / entry * tp_notional
+                                    else:
+                                        tp_pnl = (entry - tp_price) / entry * tp_notional
+                                else:
+                                    tp_pnl = 0
+                                pos.verified_decreases.append({
+                                    "execution_price": tp_price,
+                                    "matched_tp_price": tp_price,
+                                    "size_delta_usd": tp_notional,
+                                    "pnl_usd": tp_pnl,
+                                    "net_pnl_usd": tp_pnl,
+                                    "order_type": 5,
+                                    "timestamp": time.time(),
+                                    "source": "bitunix_discovery",
+                                })
+                                pos.realized_pnl = (pos.realized_pnl or 0) + tp_pnl
+                                pos.original_size_usd = (qty + tp_qty) * entry if entry > 0 else size_usd
+
+                        # Sort TPs
+                        pos.take_profits.sort(
+                            key=lambda t: t.price,
+                            reverse=(side == "SHORT"),
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Bitunix TP/SL discovery failed for {symbol}: {e}")
+
+                    self.positions[pos.id] = pos
+                    bx_discovered += 1
+                    tp_count = len(pos.take_profits)
+                    hit_count = len(pos.verified_decreases)
+                    sl_str = f"SL=${pos.stop_loss:,.2f}" if pos.stop_loss else "no SL"
+                    self.logger.info(
+                        f"Sync: discovered Bitunix {symbol} {side} from exchange API "
+                        f"({tp_count} TPs, {hit_count} hit, {sl_str})"
+                    )
+
+                if bx_discovered:
+                    self.logger.info(f"Discovered {bx_discovered} Bitunix position(s) from exchange API")
+                    self._save_position_state()
+            except Exception as e:
+                self.logger.warning(f"Bitunix position discovery failed: {e}")
+
         # ── Post-sync: verify SL is at the correct level for inferred TP hits ──
         # Only on startup — skip when user runs /sync (SL is already on-chain)
         if skip_sl_check:
