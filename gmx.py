@@ -1787,10 +1787,6 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     f"W{wallet_id} has ${wallet_usdc:.2f} USDC but needs "
                     f"${required_collateral:.2f} collateral — auto-funding ${shortfall:.2f}"
                 )
-                await self.notify(
-                    f"⚠️ W{wallet_id} low: ${wallet_usdc:.2f} USDC "
-                    f"(need ${required_collateral:.2f}) — pulling from other wallets..."
-                )
                 await self._fund_wallet(wallet_id, shortfall)
 
                 # Re-check after funding
@@ -2078,7 +2074,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bx_pos.signal_id = getattr(signal, 'signal_id', None) or signal.symbol
                     self.positions[bx_pos.id] = bx_pos
                     self._save_position_state()
-                    await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} opened successfully")
+                    self.logger.info(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} opened successfully")
                 else:
                     await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} FAILED")
 

@@ -316,13 +316,12 @@ class WalletMixin:
                     self.logger.error(f"Fund transfer reverted: W{donor_wid} → W{target_wid}")
 
             if transferred > 0:
-                await self.notify(f"💰 Auto-funded W{target_wid} with ${transferred:.2f} USDC from other wallets")
+                self.logger.info(f"Auto-funded W{target_wid} with ${transferred:.2f} USDC from other wallets")
             else:
-                await self.notify(f"⚠️ Could not fund W{target_wid} — no wallets have enough spare USDC")
+                self.logger.warning(f"Could not fund W{target_wid} — no wallets have enough spare USDC")
 
         except Exception as e:
             self.logger.error(f"_fund_wallet error: {e}")
-            await self.notify(f"⚠️ Auto-fund failed for W{target_wid}: {e}")
 
     async def _consolidate_to_wallet(self, target_wid: int = 1):
         """Move ALL free USDC from all other wallets into the target wallet."""
@@ -499,11 +498,6 @@ class WalletMixin:
             new_str = " | ".join(f"W{wid}: ${bal:.2f}" for wid, bal in new_bals.items())
 
             self.logger.info(f"Rebalance complete: {new_str}")
-            await self.notify(
-                f"🔄 Wallets rebalanced ({len(transfers)} transfer(s))\n"
-                + "\n".join(transfer_log) + "\n"
-                + new_str
-            )
 
         except Exception as e:
             self.logger.error(f"Wallet rebalance error: {e}")

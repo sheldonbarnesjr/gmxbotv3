@@ -26,6 +26,9 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import tempfile
+from PIL import Image, ImageDraw, ImageFont
+
 from telethon import TelegramClient, events
 from web3 import Web3
 
@@ -77,6 +80,152 @@ HELP_TEXT = """**Trading Bot Commands**
 /wallet — Deposit (d) or withdraw (w) USDC
 
 """
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Position card image renderer
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Load a system font, falling back to default if unavailable."""
+    names = (
+        ["Arial Bold", "Helvetica-Bold", "DejaVu Sans Bold"] if bold
+        else ["Arial", "Helvetica", "DejaVu Sans"]
+    )
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+# Render at 5x for maximum resolution crisp output on Telegram
+_SCALE = 5
+
+# Shared fonts (loaded once)
+_FONT_HEADER = _load_font(30 * _SCALE, bold=True)
+_FONT_LABEL = _load_font(24 * _SCALE, bold=True)
+_FONT_BODY = _load_font(22 * _SCALE)
+_FONT_SMALL = _load_font(20 * _SCALE)
+
+# Colors
+_CLR_BG = (30, 30, 30)
+_CLR_CARD_BG = (45, 45, 48)
+_CLR_TEXT = (230, 230, 230)
+_CLR_DIM = (160, 160, 160)
+_CLR_GREEN = (0, 200, 80)
+_CLR_RED = (230, 60, 60)
+_CLR_BORDER = (70, 70, 75)
+
+
+def _fmt_sign_img(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.2f}"
+
+
+def render_position_card(card_data: dict) -> str:
+    """Render a single position card as a PNG image.
+
+    card_data keys:
+        num, symbol, side, exchange, size_usd, leverage, collateral,
+        entry_price, current_price, price_chg_pct, pnl, pnl_pct,
+        realized_pnl, tp_hits,
+        targets: list of {num, price, close_pct_str, hit, hit_pnl,
+                          proj_pnl_pct, proj_pnl_usd}
+        stop_loss: {price, proj_pnl_pct, proj_pnl_usd, label} or None
+        duration_str: str or None
+
+    Returns path to a temp PNG file.
+    """
+    S = _SCALE
+    W = 750 * S
+    PAD = 30 * S
+    LINE_H = 35 * S
+    BAR_W = 10 * S
+
+    # Pre-calculate height (header is outside card, below it)
+    lines = 2  # entry/current + realized/unrealized
+    targets = card_data.get("targets", [])
+    lines += len(targets)
+    if card_data.get("stop_loss"):
+        lines += 1
+    H = PAD * 2 + LINE_H * lines + 12 * S  # extra spacing
+
+    img = Image.new("RGB", (W, H), _CLR_BG)
+    draw = ImageDraw.Draw(img)
+
+    # Card background
+    draw.rounded_rectangle(
+        [PAD - 4, PAD - 4, W - PAD + 4, H - PAD + 4],
+        radius=10, fill=_CLR_CARD_BG, outline=_CLR_BORDER, width=1,
+    )
+
+    # Color bar on left
+    pnl = card_data.get("pnl", 0)
+    bar_color = _CLR_GREEN if pnl >= 0 else _CLR_RED
+    draw.rounded_rectangle(
+        [PAD - 4, PAD - 4, PAD - 4 + BAR_W, H - PAD + 4],
+        radius=5, fill=bar_color,
+    )
+
+    x = PAD + BAR_W + 10
+    y = PAD
+    content_w = W - x - PAD
+
+    # Entry / Current as card header (white, bold, full width)
+    entry_str = f"${card_data['entry_price']:,.2f}" if card_data.get("entry_price") else "N/A"
+    current_str = f"${card_data['current_price']:,.2f}" if card_data.get("current_price") else "N/A"
+    price_chg = card_data.get("price_chg_pct")
+    chg_str = f" ({price_chg:+.1f}%)" if price_chg is not None else ""
+    price_line = f"Entry: {entry_str}  -  Current: {current_str}{chg_str}"
+    draw.text((x, y), price_line, fill=_CLR_TEXT, font=_FONT_HEADER)
+    y += LINE_H + 4 * S
+
+    # PnL
+    pnl_pct = card_data.get("pnl_pct", 0)
+    pnl_color = _CLR_GREEN if pnl >= 0 else _CLR_RED
+    tp_hits = card_data.get("tp_hits", 0)
+    realized_pnl = card_data.get("realized_pnl", 0)
+
+    # Realized + unrealized on one line
+    pnl_line = f"Realized: {_fmt_sign_img(realized_pnl)}  |  Unrealized: {_fmt_sign_img(pnl)} ({pnl_pct:+.0f}%)"
+    draw.text((x, y), pnl_line, fill=pnl_color, font=_FONT_HEADER)
+    y += LINE_H + 4 * S
+
+    # Targets
+    for t in targets:
+        if t.get("hit"):
+            hit_pnl = t.get("hit_pnl", 0)
+            pnl_str = f" {_fmt_sign_img(hit_pnl)}" if hit_pnl != 0 else ""
+            line = f"  Target {t['num']}: ${t['price']:,.2f} ({t['close_pct_str']}%){pnl_str}"
+            draw.text((x, y), line, fill=_CLR_GREEN, font=_FONT_LABEL)
+        else:
+            proj_str = ""
+            if t.get("proj_pnl_usd") is not None:
+                proj_str = f" {_fmt_sign_img(t['proj_pnl_usd'])}"
+            line = f"  Target {t['num']}: ${t['price']:,.2f} ({t['close_pct_str']}%){proj_str}"
+            draw.text((x, y), line, fill=_CLR_DIM, font=_FONT_LABEL)
+        y += LINE_H
+
+    # Stop Loss
+    sl = card_data.get("stop_loss")
+    if sl:
+        proj_str = ""
+        if sl.get("proj_pnl_usd") is not None:
+            proj_str = f" ({_fmt_sign_img(sl['proj_pnl_usd'])})"
+        sl_line = f"  Stop Loss: ${sl['price']:,.2f}{proj_str}"
+        draw.text((x, y), sl_line, fill=_CLR_RED, font=_FONT_LABEL)
+        y += LINE_H
+
+    # Crop to content height
+    final_h = y + PAD
+    if final_h < H:
+        img = img.crop((0, 0, W, final_h))
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix="pos_card_")
+    img.save(tmp.name, "PNG")
+    return tmp.name
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -569,15 +718,15 @@ class CoreTelegramMixin:
         if bx_count:
             header_parts.append(f"{bx_count} BITUNIX")
         total_count = gmx_count + bx_count
-        if total_count:
-            msg += f"**Open Positions [{total_count}]**\n"
-
         need_separator = False
+        pos_num = 0
 
         if positions:
-            for i, pos in enumerate(positions, 1):
+            for pos in positions:
+                pos_num += 1
+                i = pos_num
                 if need_separator:
-                    msg += SEPARATOR
+                    msg += "\n"
                 need_separator = True
 
                 side = "LONG" if pos.is_long else "SHORT"
@@ -639,23 +788,17 @@ class CoreTelegramMixin:
                 price_chg_str = ""
                 if display_price and pos.entry_price and pos.entry_price > 0:
                     price_chg = ((display_price - pos.entry_price) / pos.entry_price) * 100
-                    price_chg_str = f" ({price_chg:+.0f}%)"
+                    price_chg_str = f" ({price_chg:+.1f}%)"
 
                 msg += (
-                    f"\n**#{i} {pos.symbol} {side}{wid_label}**\n"
-                    f"${pos.size_usd:,.2f} @ {pos.leverage:.1f}x - Collateral: ${pos.collateral_amount:,.2f}\n"
+                    f"**#{i} {pos.symbol} {side} GMX | ${pos.collateral_amount:,.2f} @{pos.leverage:.1f}x**\n\n"
                     f"Entry: {entry_str} - Current: {current_str}{price_chg_str}\n"
                 )
 
-                if tp_hits > 0:
-                    total_pnl_combined = realized_pnl + pnl
-                    msg += (
-                        f"Realized: {_fmt_sign(realized_pnl)} - "
-                        f"Unrealized: {_fmt_sign(pnl)} ({pnl:+.0f}%)\n"
-                        f"  Total PnL: {_fmt_sign(total_pnl_combined)}\n"
-                    )
-                else:
-                    msg += f"PnL: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+                msg += (
+                    f"Realized: {_fmt_sign(realized_pnl)} - "
+                    f"Unrealized: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+                )
 
                 # Hit targets first
                 hit_tp_num = 0
@@ -667,16 +810,12 @@ class CoreTelegramMixin:
                             hit_data.append({
                                 "price": hp,
                                 "pnl": d.get("net_pnl_usd", 0),
-                                "size": d.get("size_delta_usd", 0),
                             })
                     hit_data.sort(key=lambda x: x["price"], reverse=(not pos.is_long))
                     for hd in hit_data:
                         hit_tp_num += 1
-                        # Calculate close % for this hit
-                        close_pct = (hd["size"] / pos.original_size_usd * 100) if pos.original_size_usd > 0 else 0
-                        fmt_pct = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
                         pnl_str = f" {_fmt_sign(hd['pnl'])}" if hd["pnl"] != 0 else ""
-                        msg += f"Target {hit_tp_num} ✅ ${hd['price']:,.2f} (closed {fmt_pct}%{pnl_str})\n"
+                        msg += f"  Target {hit_tp_num}: ${hd['price']:,.2f}{pnl_str} ✅\n"
 
                 # Remaining on-chain TPs
                 sorted_tps = sorted(
@@ -685,24 +824,10 @@ class CoreTelegramMixin:
                     reverse=not pos.is_long,
                 )
                 tp_num_offset = hit_tp_num
-                total_tp_size = sum(o.get("size_usd", 0) or 0 for o in sorted_tps)
                 for j, o in enumerate(sorted_tps, 1):
                     tp_num = tp_num_offset + j
                     tp_price = o.get("trigger_price", 0) or 0
                     tp_size = o.get("size_usd", 0) or 0
-
-                    # Close %
-                    close_pct_str = ""
-                    if tp_size > 0 and total_tp_size > 0:
-                        close_pct = (tp_size / total_tp_size) * 100
-                        fmt = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
-                        close_pct_str = f"closes {fmt}% @ "
-                    elif internal:
-                        hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
-                        remaining_tps = [t for t in internal.take_profits if t.price not in hit_tp_prices]
-                        remaining_tps_sorted = sorted(remaining_tps, key=lambda t: t.price, reverse=(not pos.is_long))
-                        if j - 1 < len(remaining_tps_sorted):
-                            close_pct_str = f"closes {remaining_tps_sorted[j-1].percentage:.0%} @ "
 
                     if tp_price and pos.entry_price and pos.entry_price > 0:
                         if pos.is_long:
@@ -713,22 +838,13 @@ class CoreTelegramMixin:
                         tp_close_size = tp_size if tp_size > 0 else pos.size_usd
                         proj = pnl_per_dollar * tp_close_size
 
-                        collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
-                        tp_collateral = collateral * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else collateral
-                        proj_pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
-
-                        msg += (
-                            f"Target {tp_num} ({close_pct_str}${tp_price:,.2f})\n"
-                            f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
-                        )
+                        msg += f"  Target {tp_num}: ${tp_price:,.2f} {_fmt_sign(proj)}\n"
                     elif tp_price:
-                        msg += f"Target {tp_num} ({close_pct_str}${tp_price:,.2f})\n"
+                        msg += f"  Target {tp_num}: ${tp_price:,.2f}\n"
                     else:
-                        msg += f"Target {tp_num} @ unknown\n"
+                        msg += f"  Target {tp_num}: unknown\n"
 
                 # Stop Loss
-                if len(sl_orders) > 1:
-                    msg += f"⚠️ {len(sl_orders)} Stop Loss orders found\n"
                 for o in sl_orders[:1]:
                     sl_price = o.get("trigger_price", 0) or 0
                     if sl_price and pos.entry_price and pos.entry_price > 0:
@@ -738,17 +854,12 @@ class CoreTelegramMixin:
                             pnl_per_dollar = (pos.entry_price - sl_price) / pos.entry_price
 
                         proj = pnl_per_dollar * pos.size_usd
-                        collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
-                        proj_pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
 
-                        msg += (
-                            f"Stop Loss @ ${sl_price:,.2f}\n"
-                            f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
-                        )
+                        msg += f"  Stop Loss: ${sl_price:,.2f} ({_fmt_sign(proj)})\n"
                     elif sl_price:
-                        msg += f"Stop Loss @ ${sl_price:,.2f}\n"
+                        msg += f"  Stop Loss: ${sl_price:,.2f}\n"
                     else:
-                        msg += f"Stop Loss @ unknown\n"
+                        msg += f"  Stop Loss: unknown\n"
 
                 if limit_orders:
                     for o in limit_orders:
@@ -765,7 +876,7 @@ class CoreTelegramMixin:
         ]
         if pending_entries:
             if need_separator:
-                msg += SEPARATOR
+                msg += "\n"
             msg += f"**Limit Orders ({len(pending_entries)})** _(pending entry)_\n"
             for o in pending_entries:
                 side = "LONG" if o.get("is_long") else "SHORT"
@@ -775,9 +886,11 @@ class CoreTelegramMixin:
 
         # ── Bitunix Positions (from internal tracking) ──
         if bx_positions:
-            for i, pos in enumerate(bx_positions, 1):
+            for pos in bx_positions:
+                pos_num += 1
+                i = pos_num
                 if need_separator:
-                    msg += SEPARATOR
+                    msg += "\n"
                 need_separator = True
 
                 pnl = pos.unrealized_pnl or 0.0
@@ -789,7 +902,7 @@ class CoreTelegramMixin:
                 price_chg_str = ""
                 if pos.current_price and pos.entry_price and pos.entry_price > 0:
                     price_chg = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100
-                    price_chg_str = f" ({price_chg:+.0f}%)"
+                    price_chg_str = f" ({price_chg:+.1f}%)"
 
                 # Realized PnL from verified_decreases
                 realized_pnl = sum(
@@ -800,20 +913,14 @@ class CoreTelegramMixin:
                 sl_label = getattr(pos, 'sl_move_label', None)
 
                 msg += (
-                    f"\n**#{i} {pos.symbol} {pos.side} BITUNIX**\n"
-                    f"${pos.size_usd:,.2f} @ {pos.leverage:.1f}x - Collateral: ${collateral:,.2f}\n"
+                    f"**#{i} {pos.symbol} {pos.side} BITUNIX | ${collateral:,.2f} @{pos.leverage:.1f}x**\n\n"
                     f"Entry: ${pos.entry_price:,.2f} - Current: {current_str}{price_chg_str}\n"
                 )
 
-                if tp_hits > 0:
-                    total_pnl_combined = realized_pnl + pnl
-                    msg += (
-                        f"Realized: {_fmt_sign(realized_pnl)} - "
-                        f"Unrealized: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
-                        f"  Total PnL: {_fmt_sign(total_pnl_combined)}\n"
-                    )
-                else:
-                    msg += f"PnL: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+                msg += (
+                    f"Realized: {_fmt_sign(realized_pnl)} - "
+                    f"Unrealized: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
+                )
 
                 # Targets from _bx_tp_tracking
                 tracked = self._bx_tp_tracking.get(pos.id, [])
@@ -835,17 +942,14 @@ class CoreTelegramMixin:
                     for j, tp in enumerate(sorted_tracked, 1):
                         tp_price = tp.get("price", 0) or 0
                         tp_pct = tp.get("pct", 0) or 0
-                        pct_str = f"{tp_pct * 100:.0f}" if tp_pct >= 0.01 else f"{tp_pct * 100:.1f}"
 
                         if tp.get("hit"):
-                            # Find realized PnL for this specific target
                             vd = vd_by_price.get(tp_price, {})
                             hit_pnl = vd.get("net_pnl_usd", 0)
                             pnl_str = f" {_fmt_sign(hit_pnl)}" if hit_pnl != 0 else ""
-                            msg += f"Target {j} ✅ ${tp_price:,.2f} (closed {pct_str}%{pnl_str})\n"
+                            msg += f"  Target {j}: ${tp_price:,.2f}{pnl_str} ✅\n"
                         else:
-                            msg += f"Target {j} (closes {pct_str}% @ ${tp_price:,.2f})\n"
-                            # Projected PnL for pending targets
+                            proj_str = ""
                             if tp_price and pos.entry_price and pos.entry_price > 0:
                                 if is_long:
                                     pnl_per_dollar = (tp_price - pos.entry_price) / pos.entry_price
@@ -853,53 +957,292 @@ class CoreTelegramMixin:
                                     pnl_per_dollar = (pos.entry_price - tp_price) / pos.entry_price
                                 tp_close_size = pos.size_usd * tp_pct if tp_pct > 0 else pos.size_usd
                                 proj = pnl_per_dollar * tp_close_size
-                                tp_collateral = collateral * tp_pct if tp_pct > 0 else collateral
-                                proj_pnl_pct = (proj / tp_collateral * 100) if tp_collateral > 0 else 0
-                                msg += f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
+                                proj_str = f" {_fmt_sign(proj)}"
+                            msg += f"  Target {j}: ${tp_price:,.2f}{proj_str}\n"
 
                 if pos.stop_loss and pos.stop_loss > 0:
                     sl_move = f" ({pos.sl_move_label})" if sl_label else ""
-                    msg += f"Stop Loss @ ${pos.stop_loss:,.2f}{sl_move}\n"
+                    sl_proj_str = ""
                     if pos.entry_price and pos.entry_price > 0:
                         if pos.side == "LONG":
                             pnl_per_dollar = (pos.stop_loss - pos.entry_price) / pos.entry_price
                         else:
                             pnl_per_dollar = (pos.entry_price - pos.stop_loss) / pos.entry_price
                         proj = pnl_per_dollar * pos.size_usd
-                        proj_pnl_pct = (proj / collateral * 100) if collateral > 0 else 0
-                        msg += f"   ({proj_pnl_pct:+.1f}% PnL, {_fmt_sign(proj)} projected)\n"
-
-                if pos.opened_at:
-                    dur_h = (time.time() - pos.opened_at) / 3600
-                    msg += f"Duration: {dur_h:.1f}h\n"
-
-        # Summary footer
-        if positions or bx_positions:
-            msg += SEPARATOR
-
-        if positions:
-            total_pnl = sum(p.unrealized_pnl for p in positions)
-            total_size = sum(p.size_usd for p in positions)
-            total_collateral = sum(p.collateral_amount for p in positions)
-            pnl_pct_str = f" ({total_pnl / total_collateral * 100:+.1f}%)" if total_collateral > 0 else ""
-            msg += f"GMX: ${total_size:,.0f} size | PnL: {_fmt_sign(total_pnl)}{pnl_pct_str}\n"
-
-        if bx_positions:
-            bx_total_pnl = sum(p.unrealized_pnl or 0 for p in bx_positions)
-            bx_total_size = sum(p.size_usd for p in bx_positions)
-            bx_total_collateral = sum(
-                p.size_usd / p.leverage if p.leverage else p.size_usd
-                for p in bx_positions
-            )
-            bx_pnl_pct = f" ({bx_total_pnl / bx_total_collateral * 100:+.1f}%)" if bx_total_collateral > 0 else ""
-            msg += f"BITUNIX: ${bx_total_size:,.0f} size | PnL: {_fmt_sign(bx_total_pnl)}{bx_pnl_pct}\n"
-
-        if positions and bx_positions:
-            combined_pnl = sum(p.unrealized_pnl for p in positions) + sum(p.unrealized_pnl or 0 for p in bx_positions)
-            combined_size = sum(p.size_usd for p in positions) + sum(p.size_usd for p in bx_positions)
-            msg += f"Combined: ${combined_size:,.0f} size | PnL: {_fmt_sign(combined_pnl)}\n"
+                        sl_proj_str = f" ({_fmt_sign(proj)})"
+                    msg += f"  Stop Loss: ${pos.stop_loss:,.2f}{sl_move}{sl_proj_str}\n"
 
         await self.send_message(chat_id, msg)
+
+    async def _send_position_cards(self, positions, orders, bx_positions):
+        """Build card_data for each position and send as PNG to admin channel."""
+        import os
+
+        def _fmt_s(v):
+            sign = "+" if v >= 0 else "-"
+            return f"{sign}${abs(v):,.2f}"
+
+        if not self.cfg.telegram_bot_token or not self.cfg.bot_admin_chat_id:
+            self.logger.debug("Skipping position cards — no bot token or admin chat ID")
+            return
+
+        pos_num = 0
+        cards = []
+
+        # GMX positions
+        for pos in (positions or []):
+            pos_num += 1
+            side = "LONG" if pos.is_long else "SHORT"
+            display_price = pos.current_price
+
+            if getattr(pos, 'pnl_source', 'local') == "onchain":
+                pnl = pos.unrealized_pnl
+                pnl_pct = pos.pnl_percentage
+            elif display_price and pos.entry_price and pos.entry_price > 0:
+                if pos.is_long:
+                    price_diff = display_price - pos.entry_price
+                else:
+                    price_diff = pos.entry_price - display_price
+                pnl = (price_diff / pos.entry_price) * pos.size_usd
+                pnl_pct = (pnl / pos.collateral_amount) * 100 if pos.collateral_amount else 0
+            else:
+                pnl = pos.unrealized_pnl if pos.unrealized_pnl else 0.0
+                pnl_pct = pos.pnl_percentage if pos.pnl_percentage else 0.0
+
+            wid = getattr(pos, '_wallet_id', 1)
+
+            # Price change
+            price_chg = None
+            if display_price and pos.entry_price and pos.entry_price > 0:
+                price_chg = ((display_price - pos.entry_price) / pos.entry_price) * 100
+
+            # Internal position for TP data
+            internal = None
+            for ip in self.positions.values():
+                if (ip.is_open and ip.market_addr
+                        and ip.market_addr.lower() == pos.market.lower()
+                        and ip.side == side and ip.wallet_id == wid):
+                    internal = ip
+                    break
+
+            tp_hits = 0
+            realized_pnl = 0.0
+            if internal:
+                tp_hits = internal.tp_hits_count
+                total_tps = len([tp for tp in internal.take_profits if tp.price > 0])
+                tp_hits = min(tp_hits, total_tps)
+                realized_pnl = internal.realized_pnl if tp_hits > 0 else 0.0
+
+            # Build targets list
+            targets = []
+
+            # Hit targets
+            hit_tp_num = 0
+            if internal and internal.verified_decreases:
+                hit_data = []
+                for d in internal.verified_decreases:
+                    hp = d.get("matched_tp_price", 0)
+                    if hp > 0:
+                        hit_data.append({
+                            "price": hp,
+                            "pnl": d.get("net_pnl_usd", 0),
+                            "size": d.get("size_delta_usd", 0),
+                        })
+                hit_data.sort(key=lambda x: x["price"], reverse=(not pos.is_long))
+                for hd in hit_data:
+                    hit_tp_num += 1
+                    close_pct = (hd["size"] / pos.original_size_usd * 100) if pos.original_size_usd > 0 else 0
+                    fmt_pct = f"{close_pct:.0f}" if close_pct >= 1 else f"{close_pct:.1f}"
+                    targets.append({
+                        "num": hit_tp_num, "price": hd["price"],
+                        "close_pct_str": fmt_pct, "hit": True,
+                        "hit_pnl": hd["pnl"],
+                    })
+
+            # On-chain TP orders
+            pos_orders = [o for o in orders
+                          if o["market"].lower() == pos.market.lower()
+                          and o.get("_wallet_id", 1) == wid]
+            tp_orders = sorted([o for o in pos_orders if o["order_type"] == 5],
+                               key=lambda o: o["trigger_price"])
+            sl_orders = [o for o in pos_orders if o["order_type"] == 6]
+            sorted_tps = sorted(tp_orders, key=lambda x: x.get("trigger_price", 0) or 0,
+                                reverse=not pos.is_long)
+            total_tp_size = sum(o.get("size_usd", 0) or 0 for o in sorted_tps)
+
+            for j, o in enumerate(sorted_tps, 1):
+                tp_num = hit_tp_num + j
+                tp_price = o.get("trigger_price", 0) or 0
+                tp_size = o.get("size_usd", 0) or 0
+
+                close_pct_str = ""
+                if tp_size > 0 and total_tp_size > 0:
+                    close_pct = (tp_size / total_tp_size) * 100
+                    close_pct_str = f"closes {close_pct:.0f}" if close_pct >= 1 else f"closes {close_pct:.1f}"
+                elif internal:
+                    hit_tp_prices = {d.get("matched_tp_price", 0) for d in internal.verified_decreases}
+                    remaining = [t for t in internal.take_profits if t.price not in hit_tp_prices]
+                    remaining.sort(key=lambda t: t.price, reverse=(not pos.is_long))
+                    if j - 1 < len(remaining):
+                        close_pct_str = f"closes {remaining[j-1].percentage * 100:.0f}"
+
+                proj_pnl_pct = None
+                proj_pnl_usd = None
+                if tp_price and pos.entry_price and pos.entry_price > 0:
+                    if pos.is_long:
+                        ppd = (tp_price - pos.entry_price) / pos.entry_price
+                    else:
+                        ppd = (pos.entry_price - tp_price) / pos.entry_price
+                    tp_close = tp_size if tp_size > 0 else pos.size_usd
+                    proj_pnl_usd = ppd * tp_close
+                    coll = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                    tp_coll = coll * (tp_size / pos.size_usd) if tp_size > 0 and pos.size_usd > 0 else coll
+                    proj_pnl_pct = (proj_pnl_usd / tp_coll * 100) if tp_coll > 0 else 0
+
+                targets.append({
+                    "num": tp_num, "price": tp_price,
+                    "close_pct_str": close_pct_str, "hit": False,
+                    "proj_pnl_pct": proj_pnl_pct, "proj_pnl_usd": proj_pnl_usd,
+                })
+
+            # Stop loss
+            sl_data = None
+            for o in sl_orders[:1]:
+                sl_price = o.get("trigger_price", 0) or 0
+                if sl_price and pos.entry_price and pos.entry_price > 0:
+                    if pos.is_long:
+                        ppd = (sl_price - pos.entry_price) / pos.entry_price
+                    else:
+                        ppd = (pos.entry_price - sl_price) / pos.entry_price
+                    proj = ppd * pos.size_usd
+                    coll = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                    sl_data = {
+                        "price": sl_price,
+                        "proj_pnl_pct": (proj / coll * 100) if coll > 0 else 0,
+                        "proj_pnl_usd": proj,
+                    }
+                elif sl_price:
+                    sl_data = {"price": sl_price}
+
+            cards.append({
+                "num": pos_num, "symbol": pos.symbol, "side": side,
+                "exchange": "GMX", "size_usd": pos.size_usd,
+                "leverage": pos.leverage, "collateral": pos.collateral_amount,
+                "entry_price": pos.entry_price, "current_price": display_price,
+                "price_chg_pct": price_chg, "pnl": pnl, "pnl_pct": pnl_pct,
+                "realized_pnl": realized_pnl, "tp_hits": tp_hits,
+                "targets": targets, "stop_loss": sl_data,
+            })
+
+        # Bitunix positions
+        for pos in (bx_positions or []):
+            pos_num += 1
+            pnl = pos.unrealized_pnl or 0.0
+            collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+            pnl_pct = (pnl / collateral * 100) if collateral > 0 else 0.0
+
+            price_chg = None
+            if pos.current_price and pos.entry_price and pos.entry_price > 0:
+                price_chg = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100
+
+            realized_pnl = sum(d.get("net_pnl_usd", 0) for d in (pos.verified_decreases or []))
+            tp_hits = len(pos.verified_decreases or [])
+
+            targets = []
+            tracked = self._bx_tp_tracking.get(pos.id, [])
+            if tracked:
+                is_long = pos.side == "LONG"
+                sorted_tracked = sorted(tracked, key=lambda t: t.get("price", 0), reverse=not is_long)
+                vd_by_price = {}
+                for d in (pos.verified_decreases or []):
+                    mp = d.get("matched_tp_price", 0)
+                    if mp > 0:
+                        vd_by_price[mp] = d
+
+                for j, tp in enumerate(sorted_tracked, 1):
+                    tp_price = tp.get("price", 0) or 0
+                    tp_pct = tp.get("pct", 0) or 0
+                    pct_str = f"{tp_pct * 100:.0f}" if tp_pct >= 0.01 else f"{tp_pct * 100:.1f}"
+
+                    if tp.get("hit"):
+                        vd = vd_by_price.get(tp_price, {})
+                        targets.append({
+                            "num": j, "price": tp_price,
+                            "close_pct_str": pct_str, "hit": True,
+                            "hit_pnl": vd.get("net_pnl_usd", 0),
+                        })
+                    else:
+                        proj_pnl_pct = None
+                        proj_pnl_usd = None
+                        if tp_price and pos.entry_price and pos.entry_price > 0:
+                            if is_long:
+                                ppd = (tp_price - pos.entry_price) / pos.entry_price
+                            else:
+                                ppd = (pos.entry_price - tp_price) / pos.entry_price
+                            tp_close = pos.size_usd * tp_pct if tp_pct > 0 else pos.size_usd
+                            proj_pnl_usd = ppd * tp_close
+                            tp_coll = collateral * tp_pct if tp_pct > 0 else collateral
+                            proj_pnl_pct = (proj_pnl_usd / tp_coll * 100) if tp_coll > 0 else 0
+
+                        targets.append({
+                            "num": j, "price": tp_price,
+                            "close_pct_str": f"closes {pct_str}", "hit": False,
+                            "proj_pnl_pct": proj_pnl_pct, "proj_pnl_usd": proj_pnl_usd,
+                        })
+
+            sl_data = None
+            if pos.stop_loss and pos.stop_loss > 0:
+                sl_label = getattr(pos, 'sl_move_label', None)
+                if pos.entry_price and pos.entry_price > 0:
+                    if pos.side == "LONG":
+                        ppd = (pos.stop_loss - pos.entry_price) / pos.entry_price
+                    else:
+                        ppd = (pos.entry_price - pos.stop_loss) / pos.entry_price
+                    proj = ppd * pos.size_usd
+                    sl_data = {
+                        "price": pos.stop_loss,
+                        "proj_pnl_pct": (proj / collateral * 100) if collateral > 0 else 0,
+                        "proj_pnl_usd": proj,
+                        "label": sl_label,
+                    }
+                else:
+                    sl_data = {"price": pos.stop_loss, "label": sl_label}
+
+            dur_str = None
+            if pos.opened_at:
+                dur_h = (time.time() - pos.opened_at) / 3600
+                dur_str = f"{dur_h:.1f}h"
+
+            cards.append({
+                "num": pos_num, "symbol": pos.symbol, "side": pos.side,
+                "exchange": "BITUNIX", "size_usd": pos.size_usd,
+                "leverage": pos.leverage, "collateral": collateral,
+                "entry_price": pos.entry_price, "current_price": pos.current_price,
+                "price_chg_pct": price_chg, "pnl": pnl, "pnl_pct": pnl_pct,
+                "realized_pnl": realized_pnl, "tp_hits": tp_hits,
+                "targets": targets, "stop_loss": sl_data,
+                "duration_str": dur_str,
+            })
+
+        # Render and send each card
+        self.logger.info(f"Sending {len(cards)} position card(s) to admin channel")
+        for card in cards:
+            try:
+                png_path = await asyncio.to_thread(render_position_card, card)
+                lev = card.get('leverage', 0)
+                coll = card.get('collateral', 0)
+                caption = f"#{card['num']} {card['symbol']} {card['side']} {card['exchange']} | ${coll:,.2f} @ {lev:.1f}x"
+                ok = await bot_api.send_admin_photo(
+                    self.cfg.telegram_bot_token,
+                    self.cfg.bot_admin_chat_id,
+                    png_path,
+                    caption,
+                )
+                if not ok:
+                    self.logger.warning(f"Position card send returned False for #{card['num']}")
+                os.unlink(png_path)
+            except Exception as e:
+                self.logger.error(f"Position card render/send failed: {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # /close + confirmation handler

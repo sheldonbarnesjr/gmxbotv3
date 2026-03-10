@@ -52,6 +52,20 @@ async def send_admin_pdf(token: str, chat_id: str, file_path: str, caption: str 
         return False
 
 
+async def send_admin_photo(token: str, chat_id: str, file_path: str, caption: str = "") -> bool:
+    """Send a photo to ADMIN_CHAT_ID via Bot API.
+
+    Returns True on success, False on failure or if token/chat_id are empty.
+    """
+    if not token or not chat_id:
+        return False
+    try:
+        return await asyncio.to_thread(_send_photo, token, chat_id, file_path, caption)
+    except Exception as e:
+        logger.error(f"Bot API send_admin_photo failed: {e}")
+        return False
+
+
 async def get_updates(token: str, offset: int = 0, timeout: int = 1) -> tuple:
     """Poll Bot API for new messages.
 
@@ -119,6 +133,22 @@ def _get_updates(token: str, offset: int, timeout: int) -> tuple:
     if updates:
         new_offset = updates[-1]["update_id"] + 1
     return updates, new_offset
+
+
+def _send_photo(token: str, chat_id: str, file_path: str, caption: str) -> bool:
+    url = f"{API_BASE.format(token=token)}/sendPhoto"
+    with open(file_path, "rb") as f:
+        files = {"photo": f}
+        payload = {"chat_id": chat_id}
+        if caption:
+            payload["caption"] = caption
+            payload["parse_mode"] = "Markdown"
+        resp = requests.post(url, data=payload, files=files, timeout=30)
+    data = resp.json()
+    if not data.get("ok"):
+        logger.error(f"Bot API sendPhoto error: {data}")
+        return False
+    return True
 
 
 def _send_document(token: str, chat_id: str, file_path: str, caption: str) -> bool:

@@ -117,14 +117,12 @@ class NotificationsMixin:
         total_orders = tp_count + sl_placed
         collateral = position.size_usd / position.leverage if position.leverage else position.size_usd
         msg = (
-            f"Position Opened (GMX) ✅\n\n"
+            f"Position Opened (GMX)\n\n"
             f"{position.symbol} {position.side} {position.leverage:.0f}x\n"
             f"Entry: ${position.entry_price:,.2f}\n"
             f"Size: ${position.size_usd:,.2f} (${collateral:,.2f} collateral)\n"
             f"{total_orders} open orders placed successfully ✅"
         )
-        if order_type == "limit":
-            msg += "\n\nLimit order placed — waiting for price to reach entry."
         await self.notify(msg)
 
     async def send_startup_notification(self):
