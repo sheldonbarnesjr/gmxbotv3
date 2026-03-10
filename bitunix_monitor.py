@@ -201,17 +201,28 @@ class BitunixMonitorMixin:
                     total_hits = sum(1 for t in tracked if t["hit"])
                     # Normalize to same format as GMX verified_decreases so
                     # downstream code (PnL calc, TP display) works correctly
-                    pos.verified_decreases = [
-                        {
+                    pos.verified_decreases = []
+                    for t in tracked:
+                        if not t["hit"]:
+                            continue
+                        tp_size = pos.original_size_usd * t.get("pct", 0)
+                        if pos.entry_price and pos.entry_price > 0:
+                            if pos.side == "LONG":
+                                tp_pnl = (t["price"] - pos.entry_price) / pos.entry_price * tp_size
+                            else:
+                                tp_pnl = (pos.entry_price - t["price"]) / pos.entry_price * tp_size
+                        else:
+                            tp_pnl = 0
+                        pos.verified_decreases.append({
                             "execution_price": t["price"],
                             "matched_tp_price": t["price"],
-                            "size_delta_usd": pos.original_size_usd * t.get("pct", 0),
-                            "net_pnl_usd": 0,  # Not available from Bitunix TP tracking
+                            "size_delta_usd": tp_size,
+                            "pnl_usd": tp_pnl,
+                            "net_pnl_usd": tp_pnl,
+                            "order_type": 5,  # TP (matches GMX convention)
                             "timestamp": time.time(),
                             "source": "bitunix",
-                        }
-                        for t in tracked if t["hit"]
-                    ]
+                        })
 
                     # Calculate PnL for notification
                     realized_pnl = sum(d.get("net_pnl_usd", 0) for d in pos.verified_decreases)
@@ -397,8 +408,33 @@ class BitunixMonitorMixin:
                     pos.exit_reason = "exchange_closed"
                     self._bx_missing_count.pop(pos.id, None)
 
-                    # Determine exit reason BEFORE removing tracking data
-                    tp_hits = sum(1 for t in self._bx_tp_tracking.get(pos.id, []) if t.get("hit"))
+                    # Rebuild verified_decreases from tracking data BEFORE removing it
+                    # (ensures unfilled target detection works even after bot restart)
+                    tracked = self._bx_tp_tracking.get(pos.id, [])
+                    tp_hits = sum(1 for t in tracked if t.get("hit"))
+                    if tracked and not getattr(pos, 'verified_decreases', None):
+                        pos.verified_decreases = []
+                        for t in tracked:
+                            if not t["hit"]:
+                                continue
+                            tp_size = pos.original_size_usd * t.get("pct", 0)
+                            if pos.entry_price and pos.entry_price > 0:
+                                if pos.side == "LONG":
+                                    tp_pnl = (t["price"] - pos.entry_price) / pos.entry_price * tp_size
+                                else:
+                                    tp_pnl = (pos.entry_price - t["price"]) / pos.entry_price * tp_size
+                            else:
+                                tp_pnl = 0
+                            pos.verified_decreases.append({
+                                "execution_price": t["price"],
+                                "matched_tp_price": t["price"],
+                                "size_delta_usd": tp_size,
+                                "pnl_usd": tp_pnl,
+                                "net_pnl_usd": tp_pnl,
+                                "order_type": 5,
+                                "timestamp": time.time(),
+                                "source": "bitunix",
+                            })
                     self._bx_tp_tracking.pop(pos.id, None)
                     self._save_bx_tp_tracking()
                     if tp_hits > 0:

@@ -27,6 +27,15 @@ _EVENT_LOG1_TOPIC = "0x137a44067c8961cd7e1d876f4754a5a3a75989b4552f1843fc69c3b37
 # GMX V2 USD precision
 _P30 = 10 ** 30
 
+# GMX V2 market address → index token decimals (for price conversion)
+# sizeDeltaInTokens is in index token's smallest unit
+_MARKET_INDEX_DECIMALS = {
+    "0x47c031236e19d024b42f8ae6780e44a573170703": 8,   # BTC/USD
+    "0x70d95587d40a2caf56bd97485ab3eec10bee6336": 18,  # ETH/USD
+    "0x09400d9db990d5ed3f35d7be61dfaeb900af03c9": 9,   # SOL/USD
+    "0x7f1fa204bb700853d36994da19f830b6ad18455c": 18,  # LINK/USD
+}
+
 # Arbitrum ~4 blocks/sec
 _BLOCKS_PER_SECOND = 4
 
@@ -78,19 +87,13 @@ def _get_event_log2_abi():
 
 
 def _build_order_type_map(receipt, emitter_addr_lower, el2_contract, order_executed_topic_hex):
-    """Build orderKey → orderType map from OrderExecuted EventLog2 events in a receipt.
+    """Build orderKey → order info map from OrderExecuted EventLog2 events in a receipt.
 
     Scans all logs in a transaction receipt for OrderExecuted events and
-    extracts the orderType from each one's eventData uintItems.
-
-    Args:
-        receipt: Transaction receipt with logs.
-        emitter_addr_lower: Lowercase EventEmitter address.
-        el2_contract: Web3 contract with EventLog2 ABI for decoding.
-        order_executed_topic_hex: Hex string of keccak256("OrderExecuted") without 0x.
+    extracts the orderType and triggerPrice from each one's eventData uintItems.
 
     Returns:
-        Dict mapping orderKey (hex str without 0x) → orderType (int).
+        Dict mapping orderKey (hex str without 0x) → {"order_type": int, "trigger_price": float}.
     """
     order_type_map = {}
     el2_topic_hex = _EVENT_LOG2_TOPIC[2:]  # strip 0x
@@ -98,25 +101,26 @@ def _build_order_type_map(receipt, emitter_addr_lower, el2_contract, order_execu
     for rlog in receipt["logs"]:
         try:
             topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
-            # Must be EventLog2 from the EventEmitter
             if rlog["address"].lower() != emitter_addr_lower:
                 continue
             if len(topics) < 4 or topics[0] != el2_topic_hex:
                 continue
-            # topic[1] must be OrderExecuted hash
             if topics[1] != order_executed_topic_hex:
                 continue
 
-            # topic[2] = orderKey (indexed bytes32)
             order_key_hex = topics[2]
 
-            # Decode eventData to get orderType from uintItems
             decoded = el2_contract.events.EventLog2().process_log(rlog)
             ed = decoded["args"]["eventData"]
+            order_type = None
             for item in ed["uintItems"]["items"]:
                 if item["key"] == "orderType":
-                    order_type_map[order_key_hex] = int(item["value"])
+                    order_type = int(item["value"])
                     break
+            order_type_map[order_key_hex] = {
+                "order_type": order_type,
+                "trigger_price": 0,
+            }
         except Exception:
             continue
 
@@ -138,6 +142,171 @@ def _extract_order_key_from_decrease(event_data):
     except Exception:
         pass
     return None
+
+
+def _fetch_trigger_prices(w3, account, from_block, current_block):
+    """Fetch trigger prices from OrderCreated events for this wallet.
+
+    Returns:
+        Tuple of:
+        - dict mapping orderKey (hex without 0x) → trigger_price (float USD)
+        - list of all order info dicts with keys: order_key, trigger_price,
+          market, is_long, order_type, block_number
+    """
+    emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
+    wallet_topic = "0x" + "0" * 24 + account.lower().replace("0x", "")
+    order_created_topic = "0x" + Web3.keccak(text="OrderCreated").hex()
+
+    try:
+        created_logs = w3.eth.get_logs({
+            "address": emitter_addr,
+            "fromBlock": from_block,
+            "toBlock": current_block,
+            "topics": [
+                _EVENT_LOG2_TOPIC,
+                order_created_topic,
+                None,
+                wallet_topic,
+            ],
+        })
+    except Exception as e:
+        log.debug(f"_fetch_trigger_prices: get_logs failed: {e}")
+        return {}, []
+
+    if not created_logs:
+        return {}, []
+
+    el2_abi = _get_event_log2_abi()
+    emitter2 = w3.eth.contract(address=emitter_addr, abi=el2_abi)
+
+    trigger_map = {}
+    all_orders = []
+    for rlog in created_logs:
+        try:
+            topics = [t.hex() if isinstance(t, bytes) else t.replace("0x", "") for t in rlog["topics"]]
+            order_key_hex = topics[2]
+
+            decoded = emitter2.events.EventLog2().process_log(rlog)
+            ed = decoded["args"]["eventData"]
+
+            # Get market address to determine correct precision
+            market_addr = None
+            for item in ed["addressItems"]["items"]:
+                if item["key"] == "market":
+                    market_addr = item["value"].lower()
+                    break
+
+            trigger_price_raw = 0
+            order_type = None
+            for item in ed["uintItems"]["items"]:
+                k = item["key"]
+                if k == "triggerPrice":
+                    trigger_price_raw = item["value"]
+                elif k == "orderType":
+                    order_type = int(item["value"])
+
+            is_long = None
+            for item in ed["boolItems"]["items"]:
+                if item["key"] == "isLong":
+                    is_long = item["value"]
+
+            if trigger_price_raw > 0:
+                # Price precision = 10^(30 - index_token_decimals)
+                idx_dec = _MARKET_INDEX_DECIMALS.get(market_addr, 18)
+                precision = 10 ** (30 - idx_dec)
+                price = trigger_price_raw / precision
+                trigger_map[order_key_hex] = price
+                # order_type 5 = LimitDecrease (TP), 6 = StopLossDecrease (SL)
+                all_orders.append({
+                    "order_key": order_key_hex,
+                    "trigger_price": price,
+                    "market": market_addr,
+                    "is_long": is_long,
+                    "order_type": order_type,
+                    "block_number": rlog["blockNumber"],
+                })
+        except Exception:
+            continue
+
+    log.debug(f"_fetch_trigger_prices: found {len(trigger_map)} trigger prices, {len(all_orders)} orders")
+    return trigger_map, all_orders
+
+
+def _fetch_position_increase_timestamps(
+    w3: Web3,
+    account: str,
+    from_block: int,
+    current_block: int,
+) -> Dict[str, int]:
+    """Fetch PositionIncrease timestamps to find when positions were opened.
+
+    Scans EventLog1 for PositionIncrease events matching the account.
+    Uses topic1 (account padded to bytes32) to filter server-side.
+
+    Returns:
+        Dict mapping (market_address_lower, is_long) → earliest timestamp.
+    """
+    emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
+    el1_abi = _get_event_log1_abi()
+    emitter1 = w3.eth.contract(address=emitter_addr, abi=el1_abi)
+    account_lower = account.lower()
+
+    # PositionIncrease eventNameHash (indexed string → keccak)
+    increase_topic = "0x" + Web3.keccak(text="PositionIncrease").hex()
+    # topic1 = account address padded to bytes32
+    account_topic = "0x" + "0" * 24 + account_lower.replace("0x", "")
+
+    try:
+        logs = w3.eth.get_logs({
+            "address": emitter_addr,
+            "fromBlock": from_block,
+            "toBlock": current_block,
+            "topics": [
+                _EVENT_LOG1_TOPIC,
+                increase_topic,
+                account_topic,
+            ],
+        })
+    except Exception as e:
+        log.debug(f"_fetch_position_increase_timestamps failed: {e}")
+        return {}
+
+    result = {}  # (market_lower, is_long) → list of timestamps (sorted)
+    for rlog in logs:
+        try:
+            decoded = emitter1.events.EventLog1().process_log(rlog)
+            if decoded["args"].get("eventName") != "PositionIncrease":
+                continue
+            ed = decoded["args"]["eventData"]
+
+            market_addr = None
+            for item in ed["addressItems"]["items"]:
+                if item["key"] == "market":
+                    market_addr = item["value"].lower()
+
+            is_long = None
+            for item in ed["boolItems"]["items"]:
+                if item["key"] == "isLong":
+                    is_long = item["value"]
+
+            block_num = rlog["blockNumber"]
+            blk = w3.eth.get_block(block_num)
+            ts = blk["timestamp"]
+
+            key = (market_addr, is_long)
+            if key not in result:
+                result[key] = []
+            result[key].append(ts)
+
+        except Exception:
+            continue
+
+    # Sort each list of timestamps
+    for key in result:
+        result[key].sort()
+
+    log.debug(f"_fetch_position_increase_timestamps: found {sum(len(v) for v in result.values())} increases across {len(result)} positions")
+    return result
 
 
 def fetch_trade_history(
@@ -191,18 +360,30 @@ def fetch_trade_history(
         })
     except Exception as e:
         log.warning(f"fetch_trade_history: get_logs failed for {account[:10]}: {e}")
-        return []
+        return [], []
 
     if not exec_logs:
-        return []
+        return [], []
+
+    # Fetch trigger prices from OrderCreated events
+    trigger_price_map, all_created_orders = _fetch_trigger_prices(w3, account, from_block, current_block)
+
+    # Fetch position open timestamps from PositionIncrease events
+    open_ts_map = _fetch_position_increase_timestamps(w3, account, from_block, current_block)
 
     # Build EventLog1 decoder
     el1_abi = _get_event_log1_abi()
     emitter1 = w3.eth.contract(address=emitter_addr, abi=el1_abi)
 
+    # Build EventLog2 decoder for OrderExecuted (to extract order types)
+    el2_abi = _get_event_log2_abi()
+    emitter2 = w3.eth.contract(address=emitter_addr, abi=el2_abi)
+    order_executed_topic_hex = Web3.keccak(text="OrderExecuted").hex()
+
     results = []
     processed_receipts = {}  # tx_hash → receipt (avoid re-fetching batched txs)
     account_lower = account.lower()
+    emitter_lower = emitter_addr.lower()
 
     for exec_log in exec_logs:
         tx_hash = exec_log["transactionHash"].hex()
@@ -218,6 +399,11 @@ def fetch_trade_history(
             log.debug(f"Failed to fetch receipt for {tx_hash}: {e}")
             continue
         processed_receipts[tx_hash] = True
+
+        # Build orderKey → {order_type, trigger_price} map from OrderExecuted events
+        order_info_map = _build_order_type_map(
+            receipt, emitter_lower, emitter2, order_executed_topic_hex
+        )
 
         # Find PositionDecrease EventLog1 in same transaction
         for rlog in receipt["logs"]:
@@ -255,16 +441,25 @@ def fetch_trade_history(
                 borrowing_fee_raw = 0
                 position_fee_raw = 0
                 execution_price_raw = 0
+                order_type_val = None
+                size_delta_in_tokens = 0
+                collateral_delta_raw = 0
                 for item in ed["uintItems"]["items"]:
                     k = item["key"]
                     if k == "sizeDeltaUsd":
                         size_delta = item["value"] / _P30
+                    elif k == "sizeDeltaInTokens":
+                        size_delta_in_tokens = item["value"]
+                    elif k == "collateralDeltaAmount":
+                        collateral_delta_raw = item["value"]
                     elif k == "borrowingFeeAmount":
                         borrowing_fee_raw = item["value"]
                     elif k == "positionFeeAmount":
                         position_fee_raw = item["value"]
                     elif k == "executionPrice":
                         execution_price_raw = item["value"]
+                    elif k == "orderType":
+                        order_type_val = int(item["value"])
 
                 # Int items — PnL and price impact (already USD at 1e30)
                 base_pnl = 0
@@ -293,6 +488,16 @@ def fetch_trade_history(
                         # Non-stablecoin collateral (WBTC/WETH): convert via execution price
                         fees_usd = fee_tokens * (execution_price_raw / _P30)
 
+                # Convert collateral delta to USD
+                collateral_delta_usd = 0.0
+                if collateral_delta_raw and collateral_token:
+                    coll_dec = _TOKEN_DECIMALS.get(collateral_token, 6)
+                    coll_tokens = collateral_delta_raw / (10 ** coll_dec)
+                    if collateral_token in _STABLECOINS:
+                        collateral_delta_usd = coll_tokens
+                    elif execution_price_raw > 0:
+                        collateral_delta_usd = coll_tokens * (execution_price_raw / _P30)
+
                 net_pnl = base_pnl + price_impact - fees_usd
 
                 # Get block timestamp
@@ -306,17 +511,47 @@ def fetch_trade_history(
                 # Use tx_hash:logIndex as unique ID to handle multi-event txs
                 log_idx = rlog.get("logIndex", 0)
 
+                # Compute USD execution price: sizeDeltaUsd / sizeDeltaInTokens
+                idx_dec = _MARKET_INDEX_DECIMALS.get((market_addr or "").lower(), 18)
+                if size_delta > 0 and size_delta_in_tokens > 0:
+                    tokens_float = size_delta_in_tokens / (10 ** idx_dec)
+                    execution_price = size_delta / tokens_float if tokens_float > 0 else 0
+                else:
+                    execution_price = 0
+
+                # Look up order_type from OrderExecuted, trigger_price from OrderCreated
+                order_key = _extract_order_key_from_decrease(ed)
+                order_info = order_info_map.get(order_key, {}) if order_key else {}
+                if order_info.get("order_type") is not None:
+                    order_type_val = order_info["order_type"]
+                trigger_price = trigger_price_map.get(order_key, 0) if order_key else 0
+
+                # Look up position open timestamp — find the most recent
+                # PositionIncrease that occurred before this decrease event
+                opened_at = 0
+                increase_times = open_ts_map.get((market_addr, is_long), [])
+                for inc_ts in reversed(increase_times):
+                    if inc_ts <= ts:
+                        opened_at = inc_ts
+                        break
+
                 results.append({
                     "market_address": market_addr or "",
                     "is_long": is_long,
                     "size_delta_usd": size_delta,
+                    "execution_price": execution_price,
+                    "trigger_price": trigger_price,
+                    "collateral_delta_usd": collateral_delta_usd,
                     "pnl_usd": base_pnl,
                     "net_pnl_usd": net_pnl,
                     "price_impact_usd": price_impact,
                     "total_fees_usd": fees_usd,
                     "timestamp": ts,
+                    "opened_at": opened_at,
                     "tx_hash": tx_hash,
                     "log_index": log_idx,
+                    "block_number": block_num,
+                    "order_type": order_type_val,  # 5=TP, 6=SL, 4=MarketDecrease
                 })
 
             except Exception as e:
@@ -324,7 +559,7 @@ def fetch_trade_history(
                 continue
 
     log.info(f"fetch_trade_history: {len(results)} trade(s) for {account[:10]}...")
-    return results
+    return results, all_created_orders
 
 
 def fetch_recent_position_decreases(
@@ -351,6 +586,9 @@ def fetch_recent_position_decreases(
     current_block = w3.eth.block_number
     lookback_blocks = lookback_seconds * _BLOCKS_PER_SECOND
     from_block = max(0, current_block - int(lookback_blocks))
+
+    # Fetch trigger prices from OrderCreated events
+    trigger_price_map, all_created_orders = _fetch_trigger_prices(w3, account, from_block, current_block)
 
     order_executed_topic = "0x" + Web3.keccak(text="OrderExecuted").hex()
 
@@ -444,15 +682,21 @@ def fetch_recent_position_decreases(
                     continue
 
                 size_delta = 0
+                size_delta_in_tokens = 0
                 execution_price_raw = 0
                 borrowing_fee_raw = 0
                 position_fee_raw = 0
+                collateral_delta_raw = 0
                 for item in ed["uintItems"]["items"]:
                     k = item["key"]
                     if k == "sizeDeltaUsd":
                         size_delta = item["value"] / _P30
+                    elif k == "sizeDeltaInTokens":
+                        size_delta_in_tokens = item["value"]
                     elif k == "executionPrice":
                         execution_price_raw = item["value"]
+                    elif k == "collateralDeltaAmount":
+                        collateral_delta_raw = item["value"]
                     elif k == "borrowingFeeAmount":
                         borrowing_fee_raw = item["value"]
                     elif k == "positionFeeAmount":
@@ -478,12 +722,32 @@ def fetch_recent_position_decreases(
                     elif execution_price_raw > 0:
                         fees_usd = fee_tokens * (execution_price_raw / _P30)
 
-                net_pnl = base_pnl + price_impact - fees_usd
-                execution_price = execution_price_raw / _P30 if execution_price_raw else 0
+                # Convert collateral delta to USD
+                collateral_delta_usd = 0.0
+                if collateral_delta_raw and collateral_token:
+                    coll_dec = _TOKEN_DECIMALS.get(collateral_token, 6)
+                    coll_tokens = collateral_delta_raw / (10 ** coll_dec)
+                    if collateral_token in _STABLECOINS:
+                        collateral_delta_usd = coll_tokens
+                    elif execution_price_raw > 0:
+                        collateral_delta_usd = coll_tokens * (execution_price_raw / _P30)
 
-                # Look up order_type via orderKey from bytes32Items
+                net_pnl = base_pnl + price_impact - fees_usd
+
+                # Compute USD execution price: sizeDeltaUsd / sizeDeltaInTokens
+                # (This is the ENTRY price in GMX V2, not exit)
+                idx_dec = _MARKET_INDEX_DECIMALS.get((event_market or "").lower(), 18)
+                if size_delta > 0 and size_delta_in_tokens > 0:
+                    tokens_float = size_delta_in_tokens / (10 ** idx_dec)
+                    execution_price = size_delta / tokens_float if tokens_float > 0 else 0
+                else:
+                    execution_price = 0
+
+                # Look up order_type from OrderExecuted, trigger_price from OrderCreated
                 order_key = _extract_order_key_from_decrease(ed)
-                order_type = order_type_map.get(order_key) if order_key else None
+                order_info = order_type_map.get(order_key, {}) if order_key else {}
+                order_type = order_info.get("order_type") if isinstance(order_info, dict) else order_info
+                trigger_price = trigger_price_map.get(order_key, 0) if order_key else 0
 
                 blk = w3.eth.get_block(block_num)
 
@@ -492,7 +756,12 @@ def fetch_recent_position_decreases(
                     "is_long": event_is_long,
                     "size_delta_usd": size_delta,
                     "execution_price": execution_price,
+                    "trigger_price": trigger_price,
+                    "collateral_delta_usd": collateral_delta_usd,
+                    "pnl_usd": base_pnl,
                     "net_pnl_usd": net_pnl,
+                    "price_impact_usd": price_impact,
+                    "total_fees_usd": fees_usd,
                     "timestamp": blk["timestamp"],
                     "tx_hash": tx_hash,
                     "log_index": rlog.get("logIndex", 0),

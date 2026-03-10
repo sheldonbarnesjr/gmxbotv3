@@ -211,6 +211,7 @@ class Config:
     bitunix_api_key: str = ""
     bitunix_secret_key: str = ""
     bitunix_margin_mode: str = "ISOLATION"  # "ISOLATION" or "CROSS"
+    bitunix_deposit_address: str = ""  # Arbitrum USDC deposit address for Bitunix
 
     # ── Exchange Mode ──
     # "gmx" = GMX only, "bitunix" = Bitunix only, "mirror" = both execute same trades
@@ -305,6 +306,7 @@ def load_config() -> Config:
         bitunix_api_key=_env("BITUNIX_API_KEY", ""),
         bitunix_secret_key=_env("BITUNIX_SECRET_KEY", ""),
         bitunix_margin_mode=(_env("BITUNIX_MARGIN_MODE", "") or _env("MARGIN_MODE", "ISOLATION")).upper(),
+        bitunix_deposit_address=_env("BITUNIX_DEPOSIT_ADDRESS", ""),
 
         # Exchange mode
         exchange_mode=_env("EXCHANGE_MODE", "gmx").lower(),

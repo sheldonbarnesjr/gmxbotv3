@@ -425,3 +425,243 @@ class WithdrawMixin:
 
         except asyncio.CancelledError:
             self.logger.debug("Deposit watch loop cancelled")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # /fund — send USDC from Arbitrum wallets to Bitunix deposit address
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def cmd_fund_bitunix(self, chat_id: int, arg: Optional[str] = None):
+        """Start a fund transfer to Bitunix: consolidate if needed -> confirm -> send.
+
+        Usage: /fund <amount>  or  /fund all
+        """
+        if not self.cfg.bitunix_deposit_address:
+            await self.send_message(
+                chat_id,
+                "BITUNIX_DEPOSIT_ADDRESS not configured in .env\n"
+                "Set it to your Bitunix USDC deposit address (Arbitrum network)."
+            )
+            return
+
+        if not arg:
+            await self.send_message(
+                chat_id,
+                "Usage: /fund <amount>\n\n"
+                "Example: /fund 100\n"
+                "         /fund all\n\n"
+                "Sends USDC from bot wallets to your Bitunix deposit address."
+            )
+            return
+
+        if chat_id in self.pending_fund:
+            state = self.pending_fund[chat_id].get("state", "")
+            if state == "sending":
+                await self.send_message(chat_id, "A fund transfer is already in progress.")
+                return
+
+        # Parse amount
+        arg_clean = arg.strip().lower().replace("$", "").replace(",", "")
+
+        try:
+            combined = 0.0
+            for _, acct in self._all_wallets():
+                combined += await asyncio.to_thread(
+                    self._get_portfolio_value_for, acct
+                )
+        except Exception as e:
+            await self.send_message(chat_id, f"Failed to check balances: {e}")
+            return
+
+        if arg_clean == "all":
+            amount = combined
+        else:
+            try:
+                amount = float(arg_clean)
+            except ValueError:
+                await self.send_message(chat_id, "Invalid amount. Usage: /fund <amount>")
+                return
+
+        if amount <= 0:
+            await self.send_message(chat_id, "Amount must be greater than 0.")
+            return
+
+        if amount < 1:
+            await self.send_message(chat_id, "Minimum transfer is $1.")
+            return
+
+        if combined < amount:
+            await self.send_message(
+                chat_id,
+                f"Insufficient balance.\n"
+                f"Combined USDC: ${combined:,.2f}\n"
+                f"Requested: ${amount:,.2f}"
+            )
+            return
+
+        dest = self.cfg.bitunix_deposit_address
+        short_addr = f"{dest[:8]}...{dest[-6:]}"
+
+        self.pending_fund[chat_id] = {
+            "amount": amount,
+            "state": "confirm",
+            "created_at": time.time(),
+        }
+
+        await self.send_message(
+            chat_id,
+            f"**Fund Bitunix — ${amount:,.2f} USDC**\n\n"
+            f"From: Bot wallets (W1-W4)\n"
+            f"To: `{short_addr}` (Bitunix)\n"
+            f"Network: Arbitrum\n\n"
+            f"Send /confirm to proceed or /cancel to abort."
+        )
+
+    async def handle_fund_reply(self, chat_id: int, text: str):
+        """State machine for /fund confirmation."""
+        if chat_id not in self.pending_fund:
+            return
+
+        pending = self.pending_fund[chat_id]
+        text = text.strip()
+
+        # 5-minute expiry
+        if time.time() - pending["created_at"] > 300:
+            del self.pending_fund[chat_id]
+            await self.send_message(
+                chat_id, "Fund transfer expired (5 min). Use /fund again."
+            )
+            return
+
+        if pending["state"] == "confirm":
+            upper = text.upper()
+            if upper in ("YES", "Y", "CONFIRM", "/CONFIRM"):
+                await self._execute_fund(chat_id)
+            elif upper in ("NO", "N", "CANCEL", "/CANCEL"):
+                del self.pending_fund[chat_id]
+                await self.send_message(chat_id, "Fund transfer cancelled.")
+            else:
+                await self.send_message(
+                    chat_id, "Send /confirm to proceed or /cancel to abort."
+                )
+
+    async def _execute_fund(self, chat_id: int):
+        """Consolidate if needed, then send USDC to the Bitunix deposit address."""
+        pending = self.pending_fund.get(chat_id)
+        if not pending:
+            await self.send_message(chat_id, "No pending fund transfer found.")
+            return
+
+        amount = pending.get("amount")
+        destination = self.cfg.bitunix_deposit_address
+        if not amount or not destination:
+            self.pending_fund.pop(chat_id, None)
+            await self.send_message(chat_id, "Fund data incomplete. Please start over with /fund.")
+            return
+
+        try:
+            # ── Consolidate if W1 doesn't have enough ──
+            w1_balance = await asyncio.to_thread(
+                self._get_portfolio_value_for, self.account
+            )
+            if w1_balance < amount:
+                await self.send_message(chat_id, "Consolidating USDC to W1...")
+                results = await self._consolidate_to_wallet(1)
+                if results:
+                    await self.send_message(chat_id, "\n".join(results))
+
+                w1_balance = await asyncio.to_thread(
+                    self._get_portfolio_value_for, self.account
+                )
+                if w1_balance < amount:
+                    del self.pending_fund[chat_id]
+                    await self.send_message(
+                        chat_id,
+                        f"W1 balance (${w1_balance:,.2f}) still less than "
+                        f"${amount:,.2f} after consolidation. Transfer aborted."
+                    )
+                    return
+
+            # ── Send USDC ──
+            pending["state"] = "sending"
+            await self.send_message(chat_id, f"Sending ${amount:,.2f} USDC to Bitunix...")
+
+            usdc_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(self.cfg.collateral_token),
+                abi=ERC20_ABI,
+            )
+            decimals = await asyncio.to_thread(
+                lambda: usdc_contract.functions.decimals().call()
+            )
+            raw_amount = round(amount * (10 ** decimals))
+
+            transfer_data = usdc_contract.encode_abi(
+                "transfer",
+                [Web3.to_checksum_address(destination), raw_amount],
+            )
+
+            if self.cfg.dry_run:
+                del self.pending_fund[chat_id]
+                short = f"{destination[:8]}...{destination[-6:]}"
+                await self.send_message(
+                    chat_id,
+                    f"[DRY RUN] Would send ${amount:,.2f} USDC to Bitunix ({short})"
+                )
+                return
+
+            tx_hash = await asyncio.to_thread(
+                self._send_tx,
+                self.cfg.collateral_token,
+                transfer_data,
+                0,
+                self.account,
+            )
+
+            receipt = await asyncio.to_thread(open_wait_receipt, self.w3, tx_hash)
+            if receipt.get("status") != 1:
+                del self.pending_fund[chat_id]
+                await self.send_message(
+                    chat_id,
+                    f"**Transfer failed** (tx reverted).\n"
+                    f"TX: https://arbiscan.io/tx/{tx_hash}"
+                )
+                return
+
+            del self.pending_fund[chat_id]
+
+            short = f"{destination[:8]}...{destination[-6:]}"
+            await self.send_message(
+                chat_id,
+                f"**Bitunix Fund Complete**\n\n"
+                f"Sent: ${amount:,.2f} USDC\n"
+                f"To: `{short}`\n"
+                f"TX: https://arbiscan.io/tx/{tx_hash}\n\n"
+                f"Rebalancing remaining wallets..."
+            )
+
+            # ── Auto-rebalance ──
+            try:
+                await self._rebalance_wallets()
+                lines = []
+                for wid, acct in self._all_wallets():
+                    bal = await asyncio.to_thread(
+                        self._get_portfolio_value_for, acct
+                    )
+                    lines.append(f"  W{wid}: ${bal:,.2f}")
+                await self.send_message(
+                    chat_id,
+                    f"**Rebalance Complete**\n\n" + "\n".join(lines)
+                )
+            except Exception as e:
+                await self.send_message(
+                    chat_id,
+                    f"Transfer sent but rebalance failed: {e}\n"
+                    f"Run /balance-wallets manually."
+                )
+
+        except Exception as e:
+            self.logger.error(
+                f"Fund transfer failed: {e}\n{traceback.format_exc()}"
+            )
+            if chat_id in self.pending_fund:
+                del self.pending_fund[chat_id]
+            await self.send_message(chat_id, f"**Fund Transfer Failed**: {e}")

@@ -563,6 +563,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # skip_sl_check=True: SL is already correct on-chain, don't infer & move
         await self._sync_on_chain_positions(skip_sl_check=True)
 
+        # Load persisted trade history first so Bitunix trades can be preserved
+        self._load_trade_history()
+
         # Rebuild trade history from on-chain data (clear + re-fetch + group)
         # This ensures a clean state every restart, grouping all position
         # decreases for the same trade into a single aggregated record.
@@ -924,6 +927,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         decreases = []
 
                     # Match each missing TP to a PositionDecrease event
+                    # Use trigger_price (from OrderCreated) to match — execution_price
+                    # in GMX V2 is the entry price, not the fill price
                     used_events = set()
                     verified_decrease_list = []
                     for idx, stp in missing_from_chain:
@@ -931,9 +936,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         for j, evt in enumerate(decreases):
                             if j in used_events:
                                 continue
-                            exec_price = evt.get("execution_price", 0)
-                            if exec_price and stp.price > 0:
-                                if abs(exec_price - stp.price) / stp.price < 0.01:
+                            trig_price = evt.get("trigger_price", 0)
+                            if trig_price and stp.price > 0:
+                                if abs(trig_price - stp.price) / stp.price < 0.01:
                                     event_match = evt
                                     used_events.add(j)
                                     break
@@ -941,11 +946,15 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         if event_match:
                             verified_decrease_list.append({
                                 "execution_price": event_match.get("execution_price", 0),
+                                "trigger_price": event_match.get("trigger_price", 0),
+                                "pnl_usd": event_match.get("pnl_usd", 0),
                                 "net_pnl_usd": event_match.get("net_pnl_usd", 0),
+                                "collateral_delta_usd": event_match.get("collateral_delta_usd", 0),
                                 "timestamp": event_match.get("timestamp", pos.opened_at),
                                 "tx_hash": event_match.get("tx_hash", ""),
                                 "log_index": event_match.get("log_index", 0),
                                 "size_delta_usd": event_match.get("size_delta_usd", 0),
+                                "order_type": event_match.get("order_type"),
                                 "matched_tp_price": stp.price,
                             })
                             total_realized += event_match.get("net_pnl_usd", 0)
@@ -1036,20 +1045,25 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     verified_decrease_list_b = []
 
                     # Step 2: Verify missing TPs against decrease events
+                    # Match by trigger_price (not execution_price which is entry in GMX V2)
                     for idx, tp_lvl in missing_tps_b:
                         for j, evt in enumerate(decreases_b):
                             if j in used_events_b:
                                 continue
-                            exec_price = evt.get("execution_price", 0)
-                            if exec_price and tp_lvl.price > 0:
-                                if abs(exec_price - tp_lvl.price) / tp_lvl.price < 0.01:
+                            trig_price = evt.get("trigger_price", 0)
+                            if trig_price and tp_lvl.price > 0:
+                                if abs(trig_price - tp_lvl.price) / tp_lvl.price < 0.01:
                                     verified_decrease_list_b.append({
-                                        "execution_price": exec_price,
+                                        "execution_price": evt.get("execution_price", 0),
+                                        "trigger_price": trig_price,
+                                        "pnl_usd": evt.get("pnl_usd", 0),
                                         "net_pnl_usd": evt.get("net_pnl_usd", 0),
+                                        "collateral_delta_usd": evt.get("collateral_delta_usd", 0),
                                         "timestamp": evt.get("timestamp", pos.opened_at),
                                         "tx_hash": evt.get("tx_hash", ""),
                                         "log_index": evt.get("log_index", 0),
                                         "size_delta_usd": evt.get("size_delta_usd", 0),
+                                        "order_type": evt.get("order_type"),
                                         "matched_tp_price": tp_lvl.price,
                                     })
                                     total_realized_b += evt.get("net_pnl_usd", 0)
@@ -2008,60 +2022,63 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         mode = self.exchange_mode
 
-        # Calculate Bitunix-specific sizing from Bitunix balance
-        bx_size_usd = size_usd
-        bx_collateral_usd = collateral_usd
-        if mode in ("bitunix", "mirror") and self.bitunix_client:
-            try:
-                from bitunix_executor import get_bitunix_balance, get_bitunix_positions
-                bx_bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
-                bx_positions = await asyncio.to_thread(get_bitunix_positions, self.bitunix_client)
-                bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
-                bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
-                bx_total = bx_bal + bx_deployed + bx_pnl
-                bx_collateral_usd = bx_total * self.cfg.portfolio_pct
-                bx_size_usd = bx_collateral_usd * signal.leverage
-                self.logger.info(
-                    f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "
-                    f"collateral=${bx_collateral_usd:.2f}, size=${bx_size_usd:.2f}"
-                )
-            except Exception as e:
-                self.logger.warning(f"[BITUNIX] Could not fetch balance for sizing, using GMX sizing: {e}")
-
         if mode == "bitunix":
+            # Bitunix-only: compute sizing upfront (no GMX to parallelize with)
+            bx_size_usd = size_usd
+            bx_collateral_usd = collateral_usd
+            if self.bitunix_client:
+                try:
+                    bx_bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
+                    bx_positions = await asyncio.to_thread(get_bitunix_positions, self.bitunix_client)
+                    bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
+                    bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
+                    bx_total = bx_bal + bx_deployed + bx_pnl
+                    bx_collateral_usd = bx_total * self.cfg.portfolio_pct
+                    bx_size_usd = bx_collateral_usd * signal.leverage
+                    self.logger.info(
+                        f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "
+                        f"collateral=${bx_collateral_usd:.2f}, size=${bx_size_usd:.2f}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[BITUNIX] Could not fetch balance for sizing, using GMX sizing: {e}")
             return await self._execute_open_bitunix(signal, bx_size_usd, bx_collateral_usd, wallet_id)
 
         if mode == "mirror":
-            # Execute on both exchanges concurrently
-            # GMX is the "primary" — its Position object is returned for tracking
+            # Execute on both exchanges concurrently — no pre-fetch blocking
+            # Bitunix computes its own sizing inside the task (compute_sizing=True)
             gmx_task = asyncio.create_task(
                 self._execute_open_gmx(signal, size_usd, acct, collateral_usd, wallet_id)
             )
             bitunix_task = asyncio.create_task(
-                self._execute_open_bitunix(signal, bx_size_usd, bx_collateral_usd, wallet_id)
+                self._execute_open_bitunix(signal, size_usd, collateral_usd, wallet_id,
+                                           compute_sizing=True)
             )
 
-            gmx_result = await gmx_task
+            results = await asyncio.gather(gmx_task, bitunix_task, return_exceptions=True)
+            gmx_result = results[0]
+            bx_raw = results[1]
 
-            # Await bitunix but don't let it block or fail the primary
+            # Handle GMX result
+            if isinstance(gmx_result, Exception):
+                self.logger.error(f"[MIRROR] GMX execution failed: {gmx_result}")
+                gmx_result = (None, None)
+
+            # Handle Bitunix result
             bx_pos = None
-            try:
-                bx_pos, bx_type = await bitunix_task
+            if isinstance(bx_raw, Exception):
+                self.logger.error(f"[MIRROR] Bitunix execution failed: {bx_raw}")
+                await self.notify(f"[MIRROR] BITUNIX error: {bx_raw}")
+            else:
+                bx_pos, bx_type = bx_raw
                 if bx_pos:
-                    # Store Bitunix position so admin commands (/positions, /close) can see it
                     bx_pos.signal_id = getattr(signal, 'signal_id', None) or signal.symbol
                     self.positions[bx_pos.id] = bx_pos
                     self._save_position_state()
                     await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} opened successfully")
                 else:
                     await self.notify(f"[MIRROR] BITUNIX {signal.symbol} {signal.side} FAILED")
-            except Exception as e:
-                bx_pos = None
-                self.logger.error(f"[MIRROR] Bitunix execution failed: {e}")
-                await self.notify(f"[MIRROR] BITUNIX error: {e}")
 
             # Return GMX result if available; fall back to Bitunix position
-            # so the signal is still marked as executed even if GMX failed
             if gmx_result and gmx_result[0]:
                 return gmx_result
             if bx_pos:
@@ -2072,7 +2089,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         return await self._execute_open_gmx(signal, size_usd, acct, collateral_usd, wallet_id)
 
     async def _execute_open_bitunix(self, signal: Signal, size_usd: float,
-                                     collateral_usd: float = None, wallet_id: int = 1) -> tuple:
+                                     collateral_usd: float = None, wallet_id: int = 1,
+                                     compute_sizing: bool = False) -> tuple:
         """Execute a signal on Bitunix — full flow matching intl-trading-bot.
 
         Returns (Position, order_type) or (None, None)."""
@@ -2082,6 +2100,23 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             return None, None
 
         try:
+            # Compute sizing from Bitunix balance (used in mirror mode for parallelism)
+            if compute_sizing:
+                try:
+                    bx_bal = await asyncio.to_thread(get_bitunix_balance, self.bitunix_client)
+                    bx_positions = await asyncio.to_thread(get_bitunix_positions, self.bitunix_client)
+                    bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
+                    bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
+                    bx_total = bx_bal + bx_deployed + bx_pnl
+                    collateral_usd = bx_total * self.cfg.portfolio_pct
+                    size_usd = collateral_usd * signal.leverage
+                    self.logger.info(
+                        f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "
+                        f"collateral=${collateral_usd:.2f}, size=${size_usd:.2f}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[BITUNIX] Could not fetch balance for sizing, using fallback: {e}")
+
             # Apply Bitunix-specific TP distribution overrides (BX_TP_* env vars)
             bx_tps = signal.take_profits
             bx_pcts = _load_env_tp_dist(len(bx_tps), prefix="BX_TP")
@@ -2399,6 +2434,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 self.logger.info(f"Position opened: {position.symbol} {position.side} TX={tx_hash} ({order_type})")
                 self._set_orders_cooldown(30)
+
+                # Fire-and-forget: poll for actual fill price from chain
+                asyncio.create_task(
+                    self._poll_gmx_entry_price(position, market_addr, signal.is_long, acct)
+                )
+
                 return position, order_type
 
             except RuntimeError as e:
@@ -2423,6 +2464,43 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         except Exception as e:
             self.logger.error(f"Error in execute_open: {e}\n{traceback.format_exc()}")
             return None, None
+
+    async def _poll_gmx_entry_price(self, position, market_addr: str,
+                                       is_long: bool, acct=None,
+                                       timeout: int = 30, interval: int = 3):
+        """Poll on-chain to get actual fill price after keeper execution.
+
+        Updates position.entry_price in-place and saves state.
+        Runs as a fire-and-forget background task.
+        """
+        if acct is None:
+            acct = self.account
+        start = time.time()
+        while time.time() - start < timeout:
+            await asyncio.sleep(interval)
+            try:
+                chain_positions = await asyncio.to_thread(
+                    chain_fetch_positions, self.w3, acct.address
+                )
+                for cp in chain_positions:
+                    if (cp.market.lower() == market_addr.lower()
+                            and cp.is_long == is_long
+                            and cp.entry_price and cp.entry_price > 0):
+                        old_price = position.entry_price
+                        position.entry_price = cp.entry_price
+                        self._save_position_state()
+                        if abs(old_price - cp.entry_price) > 0.01:
+                            self.logger.info(
+                                f"[ENTRY SYNC] {position.symbol} {position.side}: "
+                                f"updated entry ${old_price:,.2f} → ${cp.entry_price:,.2f}"
+                            )
+                        return
+            except Exception as e:
+                self.logger.warning(f"[ENTRY SYNC] poll error: {e}")
+        self.logger.warning(
+            f"[ENTRY SYNC] {position.symbol} {position.side}: "
+            f"timed out after {timeout}s, entry remains ${position.entry_price:,.2f}"
+        )
 
     async def wait_for_position_closed(self, market: str, is_long: bool, timeout: int = 120, acct: Account = None) -> bool:
         """Poll on-chain positions until the specified position disappears.
@@ -2726,6 +2804,33 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
                 is_liquidation = exit_reason == "Liquidation"
 
+                # Fetch the final decrease event (SL/manual close) and add to
+                # verified_decreases so _record_trade has complete TP+SL data
+                try:
+                    final_decreases = await asyncio.to_thread(
+                        fetch_recent_position_decreases,
+                        self.w3, acct.address, pos.market_addr,
+                        pos.side == "LONG", 1800,  # 30 min lookback
+                    )
+                    # Find events not already in verified_decreases (by tx_hash+log_index)
+                    existing_keys = {
+                        (d.get("tx_hash", ""), d.get("log_index", 0))
+                        for d in pos.verified_decreases
+                    }
+                    for evt in final_decreases:
+                        evt_key = (evt.get("tx_hash", ""), evt.get("log_index", 0))
+                        if evt_key not in existing_keys:
+                            pos.verified_decreases.append(evt)
+                            existing_keys.add(evt_key)
+                            self.logger.info(
+                                f"{pos.symbol} {pos.side} added final decrease: "
+                                f"order_type={evt.get('order_type')} "
+                                f"size=${evt.get('size_delta_usd', 0):,.2f} "
+                                f"pnl=${evt.get('net_pnl_usd', 0):,.2f}"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch final decrease for {pos.symbol}: {e}")
+
                 # Determine exit price: SL exits use the SL trigger price
                 # (more accurate than market price at detection time)
                 # "Closed at ..." = SL triggered at a TP level or entry
@@ -2734,7 +2839,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     exit_price = pos.stop_loss
 
                 # Calculate total PnL: realized (from verified decreases) + remaining
-                realized_pnl = pos.realized_pnl or 0.0
+                realized_pnl = sum(d.get("net_pnl_usd", 0) for d in pos.verified_decreases)
                 total_decreased = sum(d.get("size_delta_usd", 0) for d in pos.verified_decreases)
                 base_size = pos.original_size_usd if pos.original_size_usd > 0 else pos.size_usd
                 remaining_size = max(base_size - total_decreased, 0.0)
@@ -2781,7 +2886,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         self.logger.warning(f"Failed to cancel orphaned orders: {e}")
 
                 # Notify admin
-                pnl_sign = "+" if total_pnl >= 0 else ""
+                pnl_sign = "+" if total_pnl >= 0 else "-"
                 pnl_pct = pos.pnl_percentage
                 duration = pos.duration_hours
 
@@ -2795,10 +2900,10 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                         f"Collateral: ${pos.collateral_usd:,.2f}\n"
                     )
                     if realized_pnl != 0:
-                        r_sign = "+" if realized_pnl >= 0 else ""
-                        msg += f"Realized (TPs): {r_sign}${realized_pnl:,.2f}\n"
+                        r_sign = "+" if realized_pnl >= 0 else "-"
+                        msg += f"Realized (TPs): {r_sign}${abs(realized_pnl):,.2f}\n"
                     msg += (
-                        f"PnL: {pnl_sign}${total_pnl:,.2f} ({pnl_sign}{pnl_pct:.1f}%)\n"
+                        f"PnL: {pnl_sign}${abs(total_pnl):,.2f} ({pnl_sign}{abs(pnl_pct):.1f}%)\n"
                         f"Duration: {duration:.1f}h\n"
                     )
                     if pos.stop_loss:

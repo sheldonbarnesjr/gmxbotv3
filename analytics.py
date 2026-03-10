@@ -45,7 +45,7 @@ ONCHAIN_TRADES_FILE = "onchain_trades.json"
 
 # Only show trades from this date forward (UTC midnight).
 # Change this date to reset your trade history starting point.
-TRADE_START_DATE = "2026-03-07"
+TRADE_START_DATE = "2026-03-09T01:00"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -69,6 +69,10 @@ class TradeRecord:
     closed_at: float
     wallet_id: int = 0  # 0 = unknown (legacy records), 1-4 = wallet
     exchange: str = "gmx"  # "gmx" or "bitunix"
+    tp_hits: int = 0  # number of TP orders hit before close
+    tp_details: list = None  # list of {"price": float, "pct": float, "pnl": float}
+    sl_details: dict = None  # {"price": float, "pct": float, "pnl": float}
+    unfilled_targets: list = None  # list of {"price": float} — TP orders that never hit
 
 
 class AnalyticsMixin:
@@ -210,7 +214,7 @@ class AnalyticsMixin:
         self._save_onchain_trades([])
 
         # Fetch fresh on-chain events across all wallets
-        on_chain = await self._fetch_and_store_trades()
+        on_chain, all_created_orders = await self._fetch_and_store_trades()
         if not on_chain:
             self._save_trade_history()
             self.logger.info("Trade rebuild: no on-chain events found (kept %d Bitunix trades)", len(bitunix_trades))
@@ -236,7 +240,7 @@ class AnalyticsMixin:
             key = (t.get("market_address", "").lower(), t.get("is_long", True))
             groups[key].append(t)
 
-        for (market, is_long), events in groups.items():
+        for (market, is_long), raw_events in groups.items():
             # Skip events belonging to still-open positions
             if (market, is_long) in open_keys:
                 continue
@@ -250,42 +254,150 @@ class AnalyticsMixin:
             def _net(e):
                 return e.get("net_pnl_usd", e.get("pnl_usd", 0))
 
-            total_pnl = sum(_net(e) for e in events)
-            total_size = sum(e.get("size_delta_usd", 0) for e in events)
+            # Split into separate trades by opened_at timestamp
+            position_groups = defaultdict(list)
+            for e in raw_events:
+                oa = e.get("opened_at", 0)
+                position_groups[oa].append(e)
 
-            if abs(total_pnl) < 1:
-                continue  # skip dust
+            if list(position_groups.keys()) == [0]:
+                all_event_lists = [raw_events]
+            else:
+                orphans = position_groups.pop(0, [])
+                all_event_lists = list(position_groups.values())
+                for orphan in orphans:
+                    ots = orphan.get("timestamp", 0)
+                    best_group = None
+                    best_diff = float("inf")
+                    for group in all_event_lists:
+                        group_ts = max(e.get("timestamp", 0) for e in group)
+                        diff = abs(ots - group_ts)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_group = group
+                    if best_group is not None:
+                        best_group.append(orphan)
+                    elif all_event_lists:
+                        all_event_lists[-1].append(orphan)
 
-            events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
-            last_event = events_sorted[-1]
-            first_event = events_sorted[0]
-            exit_price = last_event.get("execution_price", 0)
-            entry_price = first_event.get("execution_price", 0)
+            for events in all_event_lists:
+                total_pnl = sum(_net(e) for e in events)
+                total_size = sum(e.get("size_delta_usd", 0) for e in events)
 
-            duration_hours = max(
-                (last_event.get("timestamp", 0) - first_event.get("timestamp", 0)) / 3600,
-                0,
-            )
-            # PnL % as return-on-position-size (not leveraged ROI)
-            pnl_pct = (total_pnl / total_size) * 100 if total_size > 0 else 0.0
+                if abs(total_pnl) < 1:
+                    continue  # skip dust
 
-            trade = TradeRecord(
-                id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
-                symbol=sym,
-                side=side,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                size_usd=total_size,
-                leverage=0,
-                duration_hours=duration_hours,
-                pnl_usd=total_pnl,
-                pnl_percentage=pnl_pct,
-                exit_reason="on-chain",
-                opened_at=first_event.get("timestamp", 0),
-                closed_at=last_event.get("timestamp", 0),
-                exchange="gmx",
-            )
-            self.trade_history.append(trade)
+                events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
+                last_event = events_sorted[-1]
+                first_event = events_sorted[0]
+                # GMX V2: execution_price in PositionDecrease = entry price
+                entry_price = first_event.get("execution_price", 0)
+
+                def _fill_price(entry, base_pnl, size_delta, long):
+                    if entry <= 0 or size_delta <= 0:
+                        return entry
+                    ratio = base_pnl / size_delta
+                    return entry * (1 + ratio) if long else entry * (1 - ratio)
+
+                le = last_event
+                exit_price = _fill_price(
+                    entry_price, le.get("pnl_usd", 0), le.get("size_delta_usd", 0), is_long
+                )
+
+                # Use opened_at from PositionIncrease event (actual open time)
+                open_ts = first_event.get("opened_at", 0) or first_event.get("timestamp", 0)
+                close_ts = last_event.get("timestamp", 0)
+                duration_hours = max((close_ts - open_ts) / 3600, 0)
+                # Collateral from on-chain collateralDeltaAmount
+                total_collateral = sum(e.get("collateral_delta_usd", 0) for e in events)
+                leverage = total_size / total_collateral if total_collateral > 0 else 0
+                pnl_pct = (total_pnl / total_collateral * 100) if total_collateral > 0 else 0.0
+
+                # Count TP hits (order_type 5 = limit/TP order)
+                tp_hit_count = sum(1 for e in events if e.get("order_type") == 5)
+                tp_details = []
+                for e in events:
+                    if e.get("order_type") == 5:
+                        tp_size = e.get("size_delta_usd", 0)
+                        tp_base = e.get("pnl_usd", 0)
+                        tp_fill = _fill_price(entry_price, tp_base, tp_size, is_long)
+                        tp_pnl = e.get("net_pnl_usd", tp_base)
+                        pct_closed = (tp_size / total_size * 100) if total_size > 0 else 0
+                        tp_details.append({"price": tp_fill, "pct": pct_closed, "pnl": tp_pnl})
+
+                # SL details: derive actual fill price from basePnl
+                sl_events = [e for e in events if e.get("order_type") != 5 and e.get("size_delta_usd", 0) > 0]
+                sl_details = None
+                if sl_events:
+                    sl_ev = sl_events[-1]
+                    sl_fill = _fill_price(entry_price, sl_ev.get("pnl_usd", 0), sl_ev.get("size_delta_usd", 0), is_long)
+                    sl_size = sum(e.get("size_delta_usd", 0) for e in sl_events)
+                    sl_pnl = sum(e.get("net_pnl_usd", e.get("pnl_usd", 0)) for e in sl_events)
+                    sl_pct = (sl_size / total_size * 100) if total_size > 0 else 0
+                    sl_details = {"price": sl_fill, "pct": sl_pct, "pnl": sl_pnl}
+
+                # Detect unfilled targets from OrderCreated events
+                # Filter orders to this position's lifetime using block range
+                filled_trigger_prices = set()
+                for e in events:
+                    if e.get("order_type") == 5:
+                        filled_trigger_prices.add(round(e.get("trigger_price", 0), 2))
+                for tp in tp_details:
+                    filled_trigger_prices.add(round(tp["price"], 2))
+
+                # Estimate open block from opened_at timestamp using a reference event
+                ref_evt = events_sorted[0]
+                ref_block = ref_evt.get("block_number", 0)
+                ref_ts = ref_evt.get("timestamp", 0)
+                last_block = events_sorted[-1].get("block_number", 0)
+                # Arbitrum ~0.25s blocks; estimate open block from opened_at
+                if ref_block and ref_ts and open_ts and open_ts > 0:
+                    block_diff = int((ref_ts - open_ts) / 0.25)
+                    open_block_est = max(ref_block - block_diff - 100, 0)  # 100 block buffer
+                else:
+                    open_block_est = 0
+                close_block = last_block + 100 if last_block else 0  # small buffer
+
+                unfilled_targets = []
+                seen_prices = set()
+                for order in all_created_orders:
+                    if (order.get("market") == market
+                            and order.get("is_long") == is_long
+                            and order.get("order_type") == 5):
+                        ob = order.get("block_number", 0)
+                        # Only include orders created during this position's lifetime
+                        if open_block_est and close_block and not (open_block_est <= ob <= close_block):
+                            continue
+                        tp_price = round(order["trigger_price"], 2)
+                        if tp_price not in filled_trigger_prices and tp_price not in seen_prices:
+                            unfilled_targets.append({"price": order["trigger_price"]})
+                            seen_prices.add(tp_price)
+                if is_long:
+                    unfilled_targets.sort(key=lambda x: x["price"])
+                else:
+                    unfilled_targets.sort(key=lambda x: x["price"], reverse=True)
+
+                trade = TradeRecord(
+                    id=f"rebuild_{sym}_{side}_{int(first_event.get('timestamp', 0))}",
+                    symbol=sym,
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    size_usd=total_size,
+                    leverage=round(leverage, 1),
+                    duration_hours=duration_hours,
+                    pnl_usd=total_pnl,
+                    pnl_percentage=pnl_pct,
+                    exit_reason="on-chain",
+                    opened_at=open_ts,
+                    closed_at=close_ts,
+                    exchange="gmx",
+                    tp_hits=tp_hit_count,
+                    tp_details=tp_details,
+                    sl_details=sl_details,
+                    unfilled_targets=unfilled_targets if unfilled_targets else None,
+                )
+                self.trade_history.append(trade)
 
         self.trade_history.sort(key=lambda t: t.closed_at)
         self._save_trade_history()
@@ -314,7 +426,7 @@ class AnalyticsMixin:
         Returns:
             Dict with keys: win_rate, wins, losses, total, avg_win, avg_loss, pnl
         """
-        all_trades = await self._fetch_and_store_trades()
+        all_trades, _ = await self._fetch_and_store_trades()
 
         market_to_sym = {}
         for sym, addr in self.cfg.markets.items():
@@ -368,8 +480,15 @@ class AnalyticsMixin:
         if verified:
             pnl_usd = sum(d.get("net_pnl_usd", 0) for d in verified)
             last_decrease = max(verified, key=lambda d: d.get("timestamp", 0))
-            if last_decrease.get("execution_price", 0) > 0:
-                exit_price = last_decrease["execution_price"]
+            # GMX V2: execution_price = entry price; derive actual fill from basePnl
+            ld_ep = last_decrease.get("execution_price", 0)
+            ld_sd = last_decrease.get("size_delta_usd", 0)
+            ld_bp = last_decrease.get("pnl_usd", 0)
+            if ld_ep > 0 and ld_sd > 0:
+                ratio = ld_bp / ld_sd
+                exit_price = ld_ep * (1 + ratio) if pos_obj.side == "LONG" else ld_ep * (1 - ratio)
+            elif ld_ep > 0:
+                exit_price = ld_ep
             # Add remaining position PnL if not fully closed by TPs
             total_decreased = sum(d.get("size_delta_usd", 0) for d in verified)
             base_size = pos_obj.original_size_usd if pos_obj.original_size_usd > 0 else pos_obj.size_usd
@@ -399,6 +518,74 @@ class AnalyticsMixin:
         full_size = pos_obj.original_size_usd if pos_obj.original_size_usd > 0 else pos_obj.size_usd
         pnl_pct = calculate_pnl_percentage(pnl_usd, full_size, pos_obj.leverage)
 
+        # Count TP hits from verified_decreases (order_type 5 = limit/TP)
+        # For backwards compat: if order_type is None but matched_tp_price exists, treat as TP
+        def _is_tp(d):
+            ot = d.get("order_type")
+            if ot == 5:
+                return True
+            if ot is None and d.get("matched_tp_price"):
+                return True
+            return False
+        tp_hit_count = sum(1 for d in verified if _is_tp(d)) if verified else 0
+        # Derive fill prices from basePnl (GMX V2: execution_price = entry price)
+        def _fill_price_live(entry, base_pnl, size_delta, long):
+            if entry <= 0 or size_delta <= 0:
+                return entry
+            ratio = base_pnl / size_delta
+            return entry * (1 + ratio) if long else entry * (1 - ratio)
+
+        is_long = pos_obj.side == "LONG"
+        live_entry = pos_obj.entry_price
+
+        tp_details = []
+        if verified:
+            for d in verified:
+                if _is_tp(d):
+                    tp_size = d.get("size_delta_usd", 0)
+                    tp_base = d.get("pnl_usd", d.get("net_pnl_usd", 0))
+                    tp_fill = _fill_price_live(live_entry, tp_base, tp_size, is_long)
+                    tp_pnl = d.get("net_pnl_usd", tp_base)
+                    pct_closed = (tp_size / full_size * 100) if full_size > 0 else 0
+                    tp_details.append({"price": tp_fill, "pct": pct_closed, "pnl": tp_pnl})
+
+        # SL details: derive actual fill price from basePnl
+        sl_details = None
+        if verified:
+            sl_events = [d for d in verified if not _is_tp(d) and d.get("size_delta_usd", 0) > 0]
+            if sl_events:
+                sl_ev = sl_events[-1]
+                sl_fill = _fill_price_live(live_entry, sl_ev.get("pnl_usd", 0), sl_ev.get("size_delta_usd", 0), is_long)
+                sl_size = sum(d.get("size_delta_usd", 0) for d in sl_events)
+                sl_pnl = sum(d.get("net_pnl_usd", d.get("pnl_usd", 0)) for d in sl_events)
+                sl_pct = (sl_size / full_size * 100) if full_size > 0 else 0
+                sl_details = {"price": sl_fill, "pct": sl_pct, "pnl": sl_pnl}
+
+        # Detect unfilled targets: compare position's TP levels vs filled TPs
+        unfilled_targets = None
+        all_tp_levels = getattr(pos_obj, 'take_profits', None) or []
+        if all_tp_levels:
+            filled_prices = set()
+            for d in verified:
+                if _is_tp(d):
+                    tp_base = d.get("pnl_usd", d.get("net_pnl_usd", 0))
+                    tp_fill = _fill_price_live(live_entry, tp_base, d.get("size_delta_usd", 0), is_long)
+                    filled_prices.add(round(tp_fill, 2))
+                    if d.get("trigger_price"):
+                        filled_prices.add(round(d["trigger_price"], 2))
+                    if d.get("matched_tp_price"):
+                        filled_prices.add(round(d["matched_tp_price"], 2))
+            unfilled = []
+            for tp_level in all_tp_levels:
+                if round(tp_level.price, 2) not in filled_prices:
+                    unfilled.append({"price": tp_level.price})
+            if unfilled:
+                if is_long:
+                    unfilled.sort(key=lambda x: x["price"])
+                else:
+                    unfilled.sort(key=lambda x: x["price"], reverse=True)
+                unfilled_targets = unfilled
+
         trade = TradeRecord(
             id=pos_obj.id,
             symbol=pos_obj.symbol,
@@ -415,6 +602,10 @@ class AnalyticsMixin:
             closed_at=pos_obj.closed_at,
             wallet_id=getattr(pos_obj, 'wallet_id', 0),
             exchange=getattr(pos_obj, 'exchange', 'gmx'),
+            tp_hits=tp_hit_count,
+            tp_details=tp_details,
+            sl_details=sl_details,
+            unfilled_targets=unfilled_targets,
         )
         self.trade_history.append(trade)
         self._save_trade_history()
@@ -505,7 +696,7 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # Fetch on-chain trades and group by position (market + direction)
-        all_trades = await self._fetch_and_store_trades()
+        all_trades, _ = await self._fetch_and_store_trades()
         trades = self._group_onchain_trades(all_trades, market_to_sym)
 
         if symbol:
@@ -612,12 +803,14 @@ class AnalyticsMixin:
 
         # Fetch fresh on-chain trades across all wallets
         fresh = []
+        all_created_orders = []
         try:
             for wid, acct in self._all_wallets():
-                trades = await asyncio.to_thread(
+                trades, created_orders = await asyncio.to_thread(
                     fetch_trade_history, self.w3, acct.address
                 )
                 fresh.extend(trades)
+                all_created_orders.extend(created_orders)
         except Exception as e:
             self.logger.warning(f"On-chain trade fetch failed: {e}")
 
@@ -651,14 +844,15 @@ class AnalyticsMixin:
         # Filter out trades before TRADE_START_DATE
         from datetime import datetime as _dt
         try:
-            start_ts = int(_dt.strptime(TRADE_START_DATE, "%Y-%m-%d").timestamp())
+            fmt = "%Y-%m-%dT%H:%M" if "T" in TRADE_START_DATE else "%Y-%m-%d"
+            start_ts = int(_dt.strptime(TRADE_START_DATE, fmt).timestamp())
             merged = [t for t in merged if t.get("timestamp", 0) >= start_ts]
         except Exception:
             pass
 
         self._save_onchain_trades(merged)
         self.logger.info(f"On-chain trades: {len(fresh)} fetched, {len(merged)} total stored")
-        return merged
+        return merged, all_created_orders
 
     async def cmd_pnl(self, chat_id: int):
         """Telegram /pnl command handler.
@@ -683,7 +877,7 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # ── Fetch on-chain trades, grouped by position (market + direction) ──
-        all_trades = await self._fetch_and_store_trades()
+        all_trades, _ = await self._fetch_and_store_trades()
         grouped = self._group_onchain_trades(all_trades, market_to_sym)
 
         def bucket_stats(trades_list):
@@ -721,7 +915,7 @@ class AnalyticsMixin:
             total_pnl = 0.0
             total_trades = 0
             total_wins = 0
-            for sym in ("BTC", "ETH", "SOL"):
+            for sym in ("BTC", "ETH"):
                 s = symbol_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
                 wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
                 lines.append(f"  {sym}: {_sign(s['pnl'])}${s['pnl']:,.2f}  ({wr})")
@@ -742,7 +936,7 @@ class AnalyticsMixin:
         today_wr = f"{today_wins / today_trades * 100:.0f}%" if today_trades else "—"
 
         today_lines = ["**Today**"]
-        for sym in ("BTC", "ETH", "SOL"):
+        for sym in ("BTC", "ETH"):
             s = today_stats.get(sym, {"pnl": 0.0, "trades": 0, "wins": 0})
             unr = open_unrealized.get(sym, 0.0)
             wr = f"{s['wins']}/{s['trades']}" if s["trades"] else "—"
@@ -835,7 +1029,7 @@ class AnalyticsMixin:
                 market_to_sym[addr.lower()] = sym
 
         # Fetch on-chain trades (merged with local store)
-        on_chain = await self._fetch_and_store_trades()
+        on_chain, _created_orders = await self._fetch_and_store_trades()
 
         if not on_chain and not self.trade_history:
             await self.send_message(chat_id, "No trades to export.")
@@ -883,6 +1077,12 @@ class AnalyticsMixin:
                 "leverage": t.leverage,
                 "pnl_percentage": t.pnl_percentage,
                 "exchange": getattr(t, "exchange", "gmx"),
+                "tp_hits": getattr(t, "tp_hits", 0),
+                "tp_details": getattr(t, "tp_details", None) or [],
+                "sl_details": getattr(t, "sl_details", None),
+                "unfilled_targets": getattr(t, "unfilled_targets", None) or [],
+                "duration_hours": t.duration_hours,
+                "opened_at": t.opened_at,
             })
 
         # Exclude dust trades (< $1 PnL), sort newest first
@@ -904,14 +1104,14 @@ class AnalyticsMixin:
             return {"pnl": pnl, "cnt": len(trades_list), "wins": w}
 
         def _s(v):
-            return "+" if v >= 0 else ""
+            return "+" if v >= 0 else "-"
 
         buckets = []
         for label, cutoff in [("Today", today_cutoff), ("30 Days", month_cutoff), ("All Time", 0)]:
             b = [t for t in unified if t["timestamp"] >= cutoff]
             stats = _bucket(b)
             sym_stats = {}
-            for sym in ("BTC", "ETH", "SOL"):
+            for sym in ("BTC", "ETH"):
                 sym_stats[sym] = _bucket([t for t in b if t["symbol"] == sym])
             losses = stats["cnt"] - stats["wins"]
             wr = f"{stats['wins'] / stats['cnt'] * 100:.0f}%" if stats["cnt"] else "-"
@@ -933,113 +1133,222 @@ class AnalyticsMixin:
 
         # ── 3-Column Summary: Today | 30 Days | All Time ──
         top_y = pdf.get_y()
+        SUMMARY_H = 6 + LINE_H * 5 + 2  # total height of summary box
+        SGAP = 3  # gap between summary columns
+
         for col_idx, bk in enumerate(buckets):
-            x = LMARGIN + col_idx * COL_W
+            x = LMARGIN + col_idx * COL_W + (SGAP / 2)
+            box_w = COL_W - SGAP
             y = top_y
             s = bk["stats"]
             pnl_sign = _s(s["pnl"])
 
+            # Light background box
+            pdf.set_fill_color(245, 245, 248)
+            pdf.set_draw_color(220, 220, 220)
+            pdf.rect(x, y, box_w, SUMMARY_H, style="DF")
+
+            cx = x + 2  # inner padding
+
             # Column header
-            pdf.set_xy(x, y)
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(COL_W, 6, bk["label"], new_x="LMARGIN", new_y="NEXT")
-            y += 6
+            pdf.set_xy(cx, y + 1)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(30, 30, 30)
+            pdf.cell(box_w - 4, 5, bk["label"])
+            y += 7
 
             # Stats
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(50, 50, 50)
             lines = [
                 f"Trades: {s['cnt']}  ({s['wins']}W / {bk['losses']}L)",
                 f"Win Rate: {bk['wr']}",
-                f"Net PnL: {pnl_sign}${s['pnl']:,.2f}",
+                f"Net PnL: {pnl_sign}${abs(s['pnl']):,.2f}",
             ]
-            for sym in ("BTC", "ETH", "SOL"):
+            for sym in ("BTC", "ETH"):
                 ss = bk["sym"][sym]
                 wr = f"{ss['wins']}/{ss['cnt']}" if ss["cnt"] else "-"
-                lines.append(f"{sym}: {_s(ss['pnl'])}${ss['pnl']:,.2f}  ({wr})")
+                lines.append(f"{sym}: {_s(ss['pnl'])}${abs(ss['pnl']):,.2f}  ({wr})")
 
             for line in lines:
-                pdf.set_xy(x, y)
-                pdf.cell(COL_W, LINE_H, line, new_x="LMARGIN", new_y="NEXT")
+                pdf.set_xy(cx, y)
+                pdf.cell(box_w - 4, LINE_H, line)
                 y += LINE_H
 
-        # Move below the tallest column
-        pdf.set_y(top_y + 6 + LINE_H * 6 + 4)
-        pdf.set_draw_color(200, 200, 200)
-        pdf.line(LMARGIN, pdf.get_y(), LMARGIN + 3 * COL_W, pdf.get_y())
-        pdf.ln(4)
+        # Move below summary
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_y(top_y + SUMMARY_H + 5)
 
         # ── 3-Column Trade Grid (newest to oldest) ──
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 7, f"Trades ({len(unified)})", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
+        pdf.ln(3)
 
-        CARD_H = 32  # height per trade card (5 lines + padding)
+        PAD = 2  # inner padding inside each card
+        GAP = 3  # gap between cards (horizontal and vertical)
+        CARD_INNER_W = COL_W - GAP  # card width minus gap
+        TP_LINE_H = 3.5  # height per TP/SL line
         row_y = pdf.get_y()
 
-        for i, t in enumerate(unified):
-            col = i % 3
-            if col == 0 and i > 0:
-                row_y += CARD_H + 2
-                if row_y + CARD_H > pdf.h - 15:
-                    pdf.add_page()
-                    row_y = pdf.get_y()
+        def _card_h(trade):
+            """Calculate dynamic card height based on TP/SL/unfilled lines."""
+            base = PAD * 2 + 4 * 5  # header + pnl + size + entry + date
+            tp_count = len(trade.get("tp_details", []))
+            sl_count = 1 if trade.get("sl_details") else 0
+            unfilled_count = len(trade.get("unfilled_targets", []))
+            return base + TP_LINE_H * (tp_count + sl_count + unfilled_count)
 
-            x = LMARGIN + col * COL_W
-            y = row_y
+        i = 0
+        while i < len(unified):
+            # Calculate max card height for this row of up to 3 cards
+            row_cards = unified[i:i+3]
+            max_h = max(_card_h(t) for t in row_cards)
 
-            pnl = t["pnl_usd"]
-            pnl_sign = _s(pnl)
-            pct = t.get("pnl_percentage", 0)
-            lev = t.get("leverage", 0)
-            exch = t.get("exchange", "gmx").upper()
-            ts = t["timestamp"]
-            date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d, %I:%M %p") if ts else "Unknown"
+            if i > 0:
+                row_y += max_h + GAP
+            if row_y + max_h > pdf.h - 15:
+                pdf.add_page()
+                row_y = pdf.get_y()
 
-            # Header: #N SYM SIDE EXCHANGE
-            pdf.set_xy(x, y)
-            if pnl >= 0:
-                pdf.set_text_color(0, 128, 0)
-            else:
-                pdf.set_text_color(200, 0, 0)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.cell(COL_W, LINE_H, f"#{i+1} {t['symbol']} {t['side']} {exch}")
-            y += LINE_H
+            for col, t in enumerate(row_cards):
+                card_h = max_h  # use row max for uniform height
 
-            # PnL with %
-            pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 7.5)
-            pdf.set_xy(x, y)
-            if pct != 0:
-                pct_sign = "+" if pct >= 0 else ""
-                pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f} ({pct_sign}{pct:.1f}%)")
-            else:
-                pdf.cell(COL_W, LINE_H, f"PnL: {pnl_sign}${pnl:,.2f}")
-            y += LINE_H
+                x = LMARGIN + col * COL_W + (GAP / 2)
+                y = row_y
 
-            # Size + Collateral
-            pdf.set_xy(x, y)
-            if lev and lev > 0:
-                collateral = t["size_usd"] / lev
-                pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  (${collateral:,.2f})")
-            else:
-                pdf.cell(COL_W, LINE_H, f"Size: ${t['size_usd']:,.2f}")
-            y += LINE_H
+                pnl = t["pnl_usd"]
+                pnl_sign = _s(pnl)
+                pct = t.get("pnl_percentage", 0)
+                lev = t.get("leverage", 0)
+                exch = t.get("exchange", "gmx").upper()
+                ts = t["timestamp"]
+                date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d, %I:%M %p") if ts else "Unknown"
+                entry_p = t.get("entry_price", 0)
+                exit_p = t.get("exit_price", 0)
 
-            # Entry → Exit prices
-            entry_p = t.get("entry_price", 0)
-            exit_p = t.get("exit_price", 0)
-            pdf.set_xy(x, y)
-            if entry_p and exit_p:
-                pdf.cell(COL_W, LINE_H, f"Entry: ${entry_p:,.2f}  ->  Exit: ${exit_p:,.2f}")
-            elif exit_p:
-                pdf.cell(COL_W, LINE_H, f"Exit: ${exit_p:,.2f}")
-            y += LINE_H
+                # Card border
+                pdf.set_draw_color(220, 220, 220)
+                pdf.rect(x, y, CARD_INNER_W, card_h)
 
-            # Date
-            pdf.set_xy(x, y)
-            pdf.cell(COL_W, LINE_H, date_str)
+                # Color bar on left edge (green=win, red=loss)
+                if pnl >= 0:
+                    pdf.set_fill_color(0, 160, 0)
+                else:
+                    pdf.set_fill_color(210, 0, 0)
+                pdf.rect(x, y, 1.2, card_h, style="F")
 
-        pdf.ln(CARD_H + 4)
+                cx = x + PAD + 1  # content x (after color bar + padding)
+                cw = CARD_INNER_W - PAD * 2 - 1  # content width
+                cy = y + PAD  # content y
+
+                # Header: #N SYM SIDE EXCHANGE
+                pdf.set_xy(cx, cy)
+                pdf.set_text_color(30, 30, 30)
+                pdf.set_font("Helvetica", "B", 8)
+                pdf.cell(cw, 4, f"#{i+col+1} {t['symbol']} {t['side']} {exch}")
+                cy += 4
+
+                # PnL with %
+                pdf.set_xy(cx, cy)
+                if pnl >= 0:
+                    pdf.set_text_color(0, 140, 0)
+                else:
+                    pdf.set_text_color(200, 0, 0)
+                pdf.set_font("Helvetica", "B", 7.5)
+                if pct != 0:
+                    pct_sign = "+" if pct >= 0 else ""
+                    pdf.cell(cw, 4, f"PnL: {pnl_sign}${abs(pnl):,.2f} ({pct_sign}{pct:.1f}%)")
+                else:
+                    pdf.cell(cw, 4, f"PnL: {pnl_sign}${abs(pnl):,.2f}")
+                cy += 4
+
+                # Size + Collateral
+                pdf.set_text_color(60, 60, 60)
+                pdf.set_font("Helvetica", "", 7)
+                pdf.set_xy(cx, cy)
+                if lev and lev > 0:
+                    collateral = t["size_usd"] / lev
+                    pdf.cell(cw, 4, f"Size: ${t['size_usd']:,.2f} @ {lev:.0f}x  (${collateral:,.2f})")
+                else:
+                    pdf.cell(cw, 4, f"Size: ${t['size_usd']:,.2f}")
+                cy += 4
+
+                # Entry price
+                if entry_p:
+                    pdf.set_xy(cx, cy)
+                    pdf.cell(cw, 4, f"Entry: ${entry_p:,.2f}")
+                    cy += 4
+
+                # Target lines (with green checkmark)
+                tp_dets = t.get("tp_details", [])
+                for j, tp in enumerate(tp_dets, 1):
+                    pdf.set_xy(cx, cy)
+                    pdf.set_font("ZapfDingbats", "", 6)
+                    pdf.set_text_color(0, 160, 0)
+                    pdf.cell(3, TP_LINE_H, "4")
+                    pdf.set_font("Helvetica", "", 6.5)
+                    pdf.set_text_color(60, 60, 60)
+                    p_str = f"Target {j}: ${tp['price']:,.2f}"
+                    if "pct" in tp:
+                        p_str += f" (closed {tp['pct']:.0f}%)"
+                    if "pnl" in tp:
+                        tp_pnl = tp["pnl"]
+                        p_str += f" {'+' if tp_pnl >= 0 else '-'}${abs(tp_pnl):,.2f}"
+                    pdf.cell(cw - 3, TP_LINE_H, p_str)
+                    cy += TP_LINE_H
+
+                # Trailing SL line (with green checkmark)
+                sl_det = t.get("sl_details")
+                if sl_det:
+                    pdf.set_xy(cx, cy)
+                    pdf.set_font("ZapfDingbats", "", 6)
+                    pdf.set_text_color(0, 160, 0)
+                    pdf.cell(3, TP_LINE_H, "4")  # green checkmark
+                    sl_pnl = sl_det.get("pnl", 0)
+                    label = "Trailing SL"
+                    pdf.set_font("Helvetica", "", 6.5)
+                    pdf.set_text_color(60, 60, 60)
+                    s_str = f"{label}: ${sl_det['price']:,.2f}"
+                    if sl_det.get("pct") and sl_det["pct"] > 0:
+                        s_str += f" (closed {sl_det['pct']:.0f}%)"
+                    s_str += f" {'+' if sl_pnl >= 0 else '-'}${abs(sl_pnl):,.2f}"
+                    pdf.cell(cw - 3, TP_LINE_H, s_str)
+                    cy += TP_LINE_H
+
+                # Unfilled targets (red X)
+                unfilled = t.get("unfilled_targets", [])
+                tp_count = len(tp_dets)
+                for k, uf in enumerate(unfilled, tp_count + 1):
+                    pdf.set_xy(cx, cy)
+                    pdf.set_font("ZapfDingbats", "", 6)
+                    pdf.set_text_color(210, 0, 0)
+                    pdf.cell(3, TP_LINE_H, "8")  # red X
+                    pdf.set_font("Helvetica", "", 6.5)
+                    pdf.set_text_color(150, 150, 150)
+                    pdf.cell(cw - 3, TP_LINE_H, f"Target {k}: ${uf['price']:,.2f} (Never Hit)")
+                    cy += TP_LINE_H
+
+                # Date + Duration (one line)
+                open_ts = t.get("opened_at", 0)
+                open_str = datetime.fromtimestamp(open_ts, tz=ET).strftime("%m/%d %I:%M%p") if open_ts and open_ts > 1_000_000_000 else "?"
+                close_str = datetime.fromtimestamp(ts, tz=ET).strftime("%m/%d %I:%M%p") if ts and ts > 1_000_000_000 else "?"
+                dur_h = t.get("duration_hours", 0)
+                if dur_h >= 24:
+                    dur_str = f"{dur_h / 24:.1f}d"
+                elif dur_h >= 1:
+                    dur_str = f"{dur_h:.1f}h"
+                else:
+                    dur_str = f"{max(dur_h * 60, 1):.0f}m"
+                pdf.set_text_color(130, 130, 130)
+                date_line = f"{open_str} - {close_str}  ({dur_str})"
+                pdf.set_font("Helvetica", "", 5.5)
+                pdf.set_xy(cx, cy)
+                pdf.cell(cw, 4, date_line, align="C")
+
+            i += len(row_cards)
+
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(4)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
         pdf.output(tmp.name)
