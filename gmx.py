@@ -428,7 +428,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 "exchange": getattr(pos, 'exchange', 'gmx'),
                 "bitunix_position_id": getattr(pos, 'bitunix_position_id', None),
                 "symbol": pos.symbol,
-                "side": pos.side,
+                "side": pos.side.split(":")[-1].upper() if ":" in pos.side else pos.side,
                 "size_usd": pos.size_usd,
                 "collateral_usd": getattr(pos, 'collateral_usd', 0),
             }
@@ -466,7 +466,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         # Clean up Bitunix tracking dicts if present
         if hasattr(self, '_bx_missing_count'):
             self._bx_missing_count.pop(pos.id, None)
-        if hasattr(self, '_bx_tp_tracking'):
+        if hasattr(self, '_pop_tp_tracking'):
+            self._pop_tp_tracking(pos)
+        elif hasattr(self, '_bx_tp_tracking'):
             self._bx_tp_tracking.pop(pos.id, None)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -560,8 +562,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         self.logger.info(f"Exchange mode: {self.exchange_mode.upper()}")
 
         # Sync on-chain positions into internal tracking (survives reboots)
-        # skip_sl_check=True: SL is already correct on-chain, don't infer & move
-        await self._sync_on_chain_positions(skip_sl_check=True)
+        # skip_sl_check=False: verify and correct SL after TP hits detected during sync
+        await self._sync_on_chain_positions(skip_sl_check=False)
 
         # Load persisted trade history first so Bitunix trades can be preserved
         self._load_trade_history()
@@ -586,7 +588,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Startup TP catch-up: extended lookback to catch events missed while offline
         try:
-            await self.check_tp_hits(lookback_override=3600)  # 1 hour
+            await self.check_tp_hits(lookback_override=7200)  # 2 hours
             self.logger.info("Startup TP catch-up check completed")
         except Exception as e:
             self.logger.warning(f"Startup TP catch-up failed: {e}")
@@ -1210,11 +1212,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         for state_key, saved in saved_state.items():
             if saved.get("exchange") != "bitunix":
                 continue
-            # Check if already tracked
+            # Check if already tracked (sanitize side for comparison)
+            saved_side_clean = saved.get("side", "")
+            if ":" in saved_side_clean:
+                saved_side_clean = saved_side_clean.rsplit(":", 1)[-1].upper()
             already_tracked = any(
                 p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix'
                 and p.symbol == saved.get("symbol", "")
-                and p.side == saved.get("side", "")
+                and (p.side.split(":")[-1].upper() if ":" in p.side else p.side) == saved_side_clean
                 for p in self.positions.values()
             )
             if already_tracked:
@@ -1233,9 +1238,14 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             market_addr = saved.get("bitunix_position_id") or parts[1].rsplit(":", 1)[0]
             market_addr = f"bitunix:{market_addr}" if not market_addr.startswith("bitunix:") else market_addr
             side = saved.get("side", "")
+            # Sanitize corrupted side (may contain embedded position ID like "8920800598368385089:SHORT")
+            if ":" in side:
+                side = side.rsplit(":", 1)[-1].upper()
+            if side not in ("LONG", "SHORT"):
+                continue  # Can't restore without valid side
             symbol = saved.get("symbol", "???")
-            if symbol == "???" or not side:
-                continue  # Can't restore without symbol/side
+            if symbol == "???":
+                continue  # Can't restore without symbol
 
             # Rebuild TPs from saved original_take_profits
             tps = []
@@ -1290,7 +1300,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
         for pos in self.positions.values():
             if not pos.is_open or pos.tp_hits_count == 0 or not pos.take_profits:
                 continue
-            if pos.wallet_id not in wallet_chain_data:
+            is_bitunix = getattr(pos, 'exchange', 'gmx') == 'bitunix'
+            # GMX positions need wallet chain data; Bitunix SL is handled via API
+            if not is_bitunix and pos.wallet_id not in wallet_chain_data:
                 continue
 
             sorted_tps = sorted(
@@ -1307,14 +1319,24 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             if target_sl is None:
                 continue
 
-            # Check if current SL is already correct
-            tolerance = pos.entry_price * 0.003
-            sl_correct = (
-                pos.stop_loss is not None
-                and abs(pos.stop_loss - target_sl) < tolerance
-            )
-            if sl_correct:
-                continue
+            # Check if current SL is already correct or manually set to a better level
+            tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
+            if pos.stop_loss is not None:
+                sl_diff = abs(pos.stop_loss - target_sl)
+                if sl_diff < tolerance:
+                    continue  # Already at correct level
+                # Don't downgrade SL if user manually moved it to a more protective level
+                sl_already_better = (
+                    (pos.side == "LONG" and pos.stop_loss > target_sl + tolerance)
+                    or (pos.side == "SHORT" and pos.stop_loss < target_sl - tolerance)
+                )
+                if sl_already_better:
+                    self.logger.info(
+                        f"Sync: {pos.symbol} {pos.side} [W{pos.wallet_id}] SL already at "
+                        f"better level (${pos.stop_loss:,.2f}) than trailing target "
+                        f"(${target_sl:,.2f} {target_label}) — keeping current"
+                    )
+                    continue
 
             self.logger.info(
                 f"Sync: {pos.symbol} {pos.side} [W{pos.wallet_id}] SL stale after "
@@ -1322,13 +1344,18 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 f"(${target_sl:,.2f}), currently ${pos.stop_loss or 0:,.2f}"
             )
             try:
-                acct = self._get_account(pos.wallet_id)
-                fresh_orders = await asyncio.to_thread(
-                    fetch_open_orders, self.w3, acct.address
-                )
-                await self.move_sl(pos, fresh_orders, target_sl, target_label)
+                if is_bitunix:
+                    # Bitunix: move SL via API
+                    await self._move_bitunix_sl(pos, target_sl, target_label)
+                else:
+                    # GMX: move SL on-chain
+                    acct = self._get_account(pos.wallet_id)
+                    fresh_orders = await asyncio.to_thread(
+                        fetch_open_orders, self.w3, acct.address
+                    )
+                    await self.move_sl(pos, fresh_orders, target_sl, target_label)
                 await self.notify(
-                    f"🔧 Startup SL fix: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                    f"Startup SL fix: {pos.symbol} {pos.side} [W{pos.wallet_id}] "
                     f"SL moved to {target_label} (${target_sl:,.2f}) after "
                     f"{pos.tp_hits_count} TP hit(s) detected"
                 )
@@ -2182,7 +2209,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             # Register TP orders for monitoring
             tp_results = results.get("tp", [])
             if tp_results and hasattr(self, 'register_bitunix_tp_orders'):
-                self.register_bitunix_tp_orders(pos_id, tp_results)
+                self.register_bitunix_tp_orders(pos_id, tp_results, bitunix_position_id=bitunix_position_id)
 
             # Record order history
             position.order_history.append({

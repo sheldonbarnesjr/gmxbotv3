@@ -88,6 +88,9 @@ class SLTPMixin:
                 continue
             if not pos.market_addr:
                 continue
+            # Skip Bitunix positions — they're monitored by BitunixMonitorMixin
+            if getattr(pos, 'exchange', 'gmx') == 'bitunix':
+                continue
 
             try:
                 acct = self._get_account(pos.wallet_id)
@@ -129,12 +132,18 @@ class SLTPMixin:
                         continue
 
                     evt_order_type = event.get("order_type")
+                    evt_trigger = event.get("trigger_price", 0)
 
-                    # SL execution (order_type=6) — never match as TP
-                    if evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE:
+                    # SL execution: order_type=6, or trigger_price matches SL
+                    is_sl = evt_order_type == ORDER_TYPE_STOP_LOSS_DECREASE
+                    if not is_sl and evt_trigger > 0 and pos.stop_loss:
+                        if abs(evt_trigger - pos.stop_loss) / pos.stop_loss < 0.005:
+                            is_sl = True
+                    if is_sl:
                         self.logger.info(
                             f"{pos.symbol}: SL hit @ ${exec_price:,.0f} "
-                            f"(order_type=6, sl_level={pos.sl_move_label or 'original'}, "
+                            f"(order_type={evt_order_type}, trigger=${evt_trigger:,.0f}, "
+                            f"sl_level={pos.sl_move_label or 'original'}, "
                             f"tx={event['tx_hash'][:16]}...)"
                         )
                         pos.processed_tx_hashes.add(event_key)
@@ -150,13 +159,22 @@ class SLTPMixin:
                         continue
 
                     # TP execution (order_type=5) or unknown (None → fallback to price matching)
+                    # Use trigger_price (from OrderCreated) as primary match — more reliable
+                    # than execution_price which is the actual fill price and may differ
+                    trigger_price = event.get("trigger_price", 0)
                     matched = False
                     for i, tp in enumerate(sorted_tps):
                         if self._tp_already_verified(pos, tp.price):
                             continue
-                        # For confirmed TPs (order_type=5), use price to determine WHICH TP
-                        # For unknown order_type, use price matching as fallback
-                        if verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01):
+                        # Try trigger_price first (exact match from OrderCreated event)
+                        trigger_match = (
+                            trigger_price > 0
+                            and verify_tp_hit_by_price(is_long, tp.price, trigger_price, tolerance_pct=0.01)
+                        )
+                        # Fallback to execution_price (actual fill price)
+                        exec_match = verify_tp_hit_by_price(is_long, tp.price, exec_price, tolerance_pct=0.01)
+                        if trigger_match or exec_match:
+                            match_price = trigger_price if trigger_match else exec_price
                             pos.verified_decreases.append({
                                 "execution_price": exec_price,
                                 "net_pnl_usd": event.get("net_pnl_usd", 0),
@@ -169,9 +187,9 @@ class SLTPMixin:
                             })
                             new_hits += 1
                             matched = True
-                            source = "on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match"
+                            source = "trigger" if trigger_match else ("on-chain" if evt_order_type == ORDER_TYPE_LIMIT_DECREASE else "price-match")
                             self.logger.info(
-                                f"{pos.symbol} TP{i+1} HIT @ ${exec_price:,.0f} "
+                                f"{pos.symbol} TP{i+1} HIT @ ${match_price:,.0f} "
                                 f"({source}, order_type={evt_order_type}, "
                                 f"pnl=${event.get('net_pnl_usd', 0):,.2f}, "
                                 f"tx={event['tx_hash'][:16]}...)"
@@ -285,6 +303,8 @@ class SLTPMixin:
         """
         for pos_id, pos in list(self.positions.items()):
             if not pos.is_open or not pos.take_profits or not pos.market_addr:
+                continue
+            if getattr(pos, 'exchange', 'gmx') == 'bitunix':
                 continue
 
             try:
@@ -509,6 +529,28 @@ class SLTPMixin:
             if new_sl_price is None:
                 self.logger.info(f"{pos.symbol} {pos.side}: TP{pos.tp_hits_count} hit — no SL move (trailing strategy)")
                 return
+
+            # Don't downgrade SL if already at a better (more protective) level
+            if not manual and pos.stop_loss is not None:
+                tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
+                sl_diff = abs(pos.stop_loss - new_sl_price)
+                if sl_diff < tolerance:
+                    self.logger.info(
+                        f"{pos.symbol} {pos.side}: SL already at target "
+                        f"(${pos.stop_loss:,.2f} ≈ ${new_sl_price:,.2f}) — skip"
+                    )
+                    return
+                sl_already_better = (
+                    (pos.side == "LONG" and pos.stop_loss > new_sl_price + tolerance)
+                    or (pos.side == "SHORT" and pos.stop_loss < new_sl_price - tolerance)
+                )
+                if sl_already_better:
+                    self.logger.info(
+                        f"{pos.symbol} {pos.side}: SL already at better level "
+                        f"(${pos.stop_loss:,.2f}) than trailing target "
+                        f"(${new_sl_price:,.2f} {sl_label}) — keeping current"
+                    )
+                    return
 
             self.logger.info(f"{pos.symbol} {pos.side}: Moving SL to {sl_label} (${new_sl_price:,.0f})")
 

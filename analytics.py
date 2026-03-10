@@ -1157,6 +1157,8 @@ class AnalyticsMixin:
             bx_today = [t for t in bx_trades if t.closed_at >= today_cutoff]
             bx_month = [t for t in bx_trades if t.closed_at >= month_cutoff]
             bx_upnl = sum(p.unrealized_pnl or 0 for p in bx_open)
+            # Include realized PnL from partial TP hits on still-open positions
+            bx_open_realized = sum(p.realized_pnl or 0 for p in bx_open if p.realized_pnl)
 
             def _bx_bucket(trades_list):
                 if not trades_list:
@@ -1180,6 +1182,8 @@ class AnalyticsMixin:
             msg += _bx_line("Today", _bx_bucket(bx_today), bx_upnl) + "\n"
             msg += _bx_line("30 Days", _bx_bucket(bx_month)) + "\n"
             msg += _bx_line("All Time", _bx_bucket(bx_trades))
+            if bx_open_realized:
+                msg += f"\n  Open TP realized: {_sign(bx_open_realized)}${bx_open_realized:,.2f}"
 
         await self.send_message(chat_id, msg)
 

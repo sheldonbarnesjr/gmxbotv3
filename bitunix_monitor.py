@@ -34,12 +34,15 @@ class BitunixMonitorMixin:
 
     def _init_bitunix_monitor(self):
         """Call from GMXBot.__init__ to initialize Bitunix monitor state."""
-        # TP order tracking: pos_id -> [{orderId, price, pct, hit}, ...]
+        # TP order tracking: keyed by bitunix_position_id (stable across restarts)
+        # Format: {bitunix_position_id -> [{orderId, price, pct, hit}, ...]}
         self._bx_tp_tracking: Dict[str, List[Dict[str, Any]]] = self._load_bx_tp_tracking()
         # Missing position counter for reconciliation
         self._bx_missing_count: Dict[str, int] = {}
         # Reconciliation cycle counter
         self._bx_reconcile_counter: int = 0
+        # Flag: startup catch-up done
+        self._bx_startup_done: bool = False
 
     def _save_bx_tp_tracking(self):
         """Persist Bitunix TP tracking to disk so it survives restart."""
@@ -54,14 +57,46 @@ class BitunixMonitorMixin:
         from state_io import safe_json_read
         return safe_json_read(self.BX_TP_TRACKING_FILE, default={})
 
+    def _get_tp_tracking(self, pos) -> list:
+        """Look up TP tracking — try bitunix_position_id first, then UUID."""
+        bpid = getattr(pos, 'bitunix_position_id', None)
+        if bpid and bpid in self._bx_tp_tracking:
+            return self._bx_tp_tracking[bpid]
+        return self._bx_tp_tracking.get(pos.id, [])
+
+    def _pop_tp_tracking(self, pos):
+        """Remove TP tracking for a position."""
+        bpid = getattr(pos, 'bitunix_position_id', None)
+        if bpid and bpid in self._bx_tp_tracking:
+            return self._bx_tp_tracking.pop(bpid, None)
+        return self._bx_tp_tracking.pop(pos.id, None)
+
+    def _migrate_tp_tracking_keys(self):
+        """One-time migration: re-key any UUID-keyed entries to bitunix_position_id."""
+        migrated = 0
+        for pos in self.positions.values():
+            if not pos.is_open or getattr(pos, 'exchange', 'gmx') != 'bitunix':
+                continue
+            bpid = getattr(pos, 'bitunix_position_id', None)
+            if not bpid:
+                continue
+            # If tracking exists under UUID but not under bitunix_position_id
+            if pos.id in self._bx_tp_tracking and bpid not in self._bx_tp_tracking:
+                self._bx_tp_tracking[bpid] = self._bx_tp_tracking.pop(pos.id)
+                migrated += 1
+        if migrated:
+            self._save_bx_tp_tracking()
+            logger.info(f"Migrated {migrated} TP tracking key(s) from UUID to bitunix_position_id")
+
     # ──────────────────────────────────────────────────────────────────────
     # TP Order Registration
     # ──────────────────────────────────────────────────────────────────────
 
-    def register_bitunix_tp_orders(self, pos_id: str, tp_results: list):
+    def register_bitunix_tp_orders(self, pos_id: str, tp_results: list, bitunix_position_id: str = None):
         """Register TP order IDs for tracking after position open.
 
         tp_results: [{orderId, price, pct}, ...]
+        Uses bitunix_position_id as key (stable across restarts), falls back to UUID.
         """
         tracked = []
         for tp in tp_results:
@@ -74,9 +109,10 @@ class BitunixMonitorMixin:
                     "hit": False,
                 })
         if tracked:
-            self._bx_tp_tracking[pos_id] = tracked
+            key = bitunix_position_id or pos_id
+            self._bx_tp_tracking[key] = tracked
             self._save_bx_tp_tracking()
-            logger.info(f"Registered {len(tracked)} TP orders for {pos_id}")
+            logger.info(f"Registered {len(tracked)} TP orders for {key}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Main Monitor Loop
@@ -98,6 +134,12 @@ class BitunixMonitorMixin:
                 if not bx_positions:
                     await asyncio.sleep(10)
                     continue
+
+                # Startup catch-up: migrate keys, re-discover TPs, detect missed hits
+                if not self._bx_startup_done:
+                    self._migrate_tp_tracking_keys()
+                    await self._startup_bitunix_catchup(bx_positions)
+                    self._bx_startup_done = True
 
                 # Update prices and PnL for Bitunix positions
                 await self._update_bitunix_prices(bx_positions)
@@ -159,7 +201,7 @@ class BitunixMonitorMixin:
         from risk import determine_new_sl_target
 
         for pos in bx_positions:
-            tracked = self._bx_tp_tracking.get(pos.id)
+            tracked = self._get_tp_tracking(pos)
             if not tracked:
                 continue
 
@@ -253,13 +295,28 @@ class BitunixMonitorMixin:
                     # Persist position state with updated verified_decreases
                     self._save_position_state()
 
-                    # Move SL after TP hit
+                    # Move SL after TP hit — but only if current SL is wrong
                     sorted_tp_prices = sorted(t["price"] for t in tracked)
                     new_sl, sl_label = determine_new_sl_target(
                         total_hits, pos.entry_price, sorted_tp_prices, pos.leverage
                     )
-                    if new_sl and new_sl != pos.stop_loss:
-                        await self._move_bitunix_sl(pos, new_sl, sl_label)
+                    if new_sl is not None and new_sl != pos.stop_loss:
+                        should_move = True
+                        if pos.stop_loss is not None:
+                            tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
+                            sl_already_better = (
+                                (pos.side == "LONG" and pos.stop_loss > new_sl + tolerance)
+                                or (pos.side == "SHORT" and pos.stop_loss < new_sl - tolerance)
+                            )
+                            if sl_already_better:
+                                logger.info(
+                                    f"{pos.symbol} SL already at better level "
+                                    f"(${pos.stop_loss:,.2f}) than trailing target "
+                                    f"(${new_sl:,.2f} {sl_label}) — keeping current"
+                                )
+                                should_move = False
+                        if should_move:
+                            await self._move_bitunix_sl(pos, new_sl, sl_label)
 
             except Exception as e:
                 logger.debug(f"TP check failed for {pos.symbol}: {e}")
@@ -378,8 +435,9 @@ class BitunixMonitorMixin:
             logger.debug(f"Bitunix reconciliation fetch failed: {e}")
             return
 
-        # Build set of (symbol, side) that exist on exchange
+        # Build set of (symbol, side) and positionIds that exist on exchange
         exchange_set = set()
+        exchange_position_ids = set()
         for ep in exchange_positions:
             sym = (ep.get("symbol") or "").replace("USDT", "")
             # Handle special names like 1000PEPE
@@ -388,9 +446,18 @@ class BitunixMonitorMixin:
             raw_side = (ep.get("side") or "").upper()
             side = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
             exchange_set.add((sym, side))
+            pid = ep.get("positionId")
+            if pid:
+                exchange_position_ids.add(pid)
 
         for pos in bx_positions:
-            key = (pos.symbol, pos.side)
+            # Primary match: by positionId (most reliable, immune to side corruption)
+            if pos.bitunix_position_id and pos.bitunix_position_id in exchange_position_ids:
+                self._bx_missing_count.pop(pos.id, None)
+                continue
+            # Fallback: by (symbol, clean_side)
+            clean_side = pos.side.split(":")[-1].upper() if ":" in pos.side else pos.side
+            key = (pos.symbol, clean_side)
             if key in exchange_set:
                 # Position exists — reset missing counter
                 self._bx_missing_count.pop(pos.id, None)
@@ -410,7 +477,7 @@ class BitunixMonitorMixin:
 
                     # Rebuild verified_decreases from tracking data BEFORE removing it
                     # (ensures unfilled target detection works even after bot restart)
-                    tracked = self._bx_tp_tracking.get(pos.id, [])
+                    tracked = self._get_tp_tracking(pos)
                     tp_hits = sum(1 for t in tracked if t.get("hit"))
                     if tracked and not getattr(pos, 'verified_decreases', None):
                         pos.verified_decreases = []
@@ -435,7 +502,7 @@ class BitunixMonitorMixin:
                                 "timestamp": time.time(),
                                 "source": "bitunix",
                             })
-                    self._bx_tp_tracking.pop(pos.id, None)
+                    self._pop_tp_tracking(pos)
                     self._save_bx_tp_tracking()
                     if tp_hits > 0:
                         pos.exit_reason = f"tp_hit_x{tp_hits}"
@@ -452,8 +519,14 @@ class BitunixMonitorMixin:
                     collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
                     pnl_pct = (total_pnl / collateral * 100) if collateral > 0 else 0.0
                     pnl_sign = "+" if total_pnl >= 0 else "-"
+                    if tp_hits > 0:
+                        close_label = f"Position Closed (TP x{tp_hits}) BITUNIX"
+                    elif pos.exit_reason == "sl_triggered":
+                        close_label = "Position Closed (SL) BITUNIX"
+                    else:
+                        close_label = "Position Closed BITUNIX"
                     await self.notify(
-                        f"Position Closed BITUNIX ✅\n\n"
+                        f"{close_label}\n\n"
                         f"{pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
                         f"Entry: ${pos.entry_price:,.2f}\n"
                         f"Exit: ${pos.current_price:,.2f}\n"
@@ -512,6 +585,244 @@ class BitunixMonitorMixin:
                                     logger.info(f"[MIRROR] GMX {pos.symbol} already closed on-chain")
                         except Exception as me:
                             logger.warning(f"[MIRROR] Failed to auto-close GMX: {me}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Startup Catch-up (runs once after restart)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _startup_bitunix_catchup(self, bx_positions: list):
+        """After restart: re-discover TP orders, detect missed hits, correct SL.
+
+        For each Bitunix position:
+          1. If no TP tracking exists: re-discover pending TP orders from exchange
+          2. If TP tracking exists: check history for TPs that fired while offline
+          3. Correct SL level based on detected TP hits
+        """
+        from bitunix_executor import to_bitunix_symbol
+        from risk import determine_new_sl_target
+
+        logger.info(f"Startup catch-up: checking {len(bx_positions)} Bitunix position(s)")
+
+        for pos in bx_positions:
+            bitunix_sym = to_bitunix_symbol(pos.symbol)
+            tracked = self._get_tp_tracking(pos)
+
+            # ── Step 1: Rebuild complete TP state from exchange ──
+            # Query BOTH pending and history to build a full picture of all TPs
+            # (handles: all pending, all fired, or mix of both)
+            if not tracked and pos.bitunix_position_id:
+                try:
+                    # Fetch pending TP orders (still active on exchange)
+                    pending = await asyncio.to_thread(
+                        self.bitunix_client.get_pending_tpsl_orders, bitunix_sym
+                    )
+                    # Fetch historical TP orders (already triggered/cancelled)
+                    history = await asyncio.to_thread(
+                        self.bitunix_client.get_history_tpsl_orders, bitunix_sym, 200
+                    )
+
+                    def _match_pct(tp_price):
+                        """Match a TP price to pos.take_profits to get close percentage."""
+                        if not pos.take_profits or tp_price <= 0:
+                            return 0
+                        closest = min(pos.take_profits, key=lambda tp: abs(tp.price - tp_price), default=None)
+                        if closest and closest.price > 0 and abs(closest.price - tp_price) / closest.price < 0.01:
+                            return closest.percentage
+                        return 0
+
+                    rebuilt = []
+                    seen_prices = set()
+
+                    # Add still-pending TP orders (not yet hit)
+                    for o in pending:
+                        o_pid = o.get("positionId")
+                        if o_pid and o_pid != pos.bitunix_position_id:
+                            continue
+                        tp_price = float(o.get("tpPrice") or o.get("triggerPrice") or 0)
+                        if tp_price > 0 and round(tp_price, 2) not in seen_prices:
+                            oid = o.get("id") or o.get("orderId")
+                            rebuilt.append({
+                                "orderId": oid,
+                                "price": tp_price,
+                                "pct": _match_pct(tp_price),
+                                "hit": False,
+                            })
+                            seen_prices.add(round(tp_price, 2))
+
+                    # Add already-triggered TP orders from history
+                    for o in history:
+                        if o.get("positionId") != pos.bitunix_position_id:
+                            continue
+                        status = (o.get("status") or "").upper()
+                        if status in ("SYSTEM_CANCELED", "CANCELED"):
+                            continue
+                        tp_price = float(o.get("tpPrice") or o.get("triggerPrice") or 0)
+                        if tp_price > 0 and round(tp_price, 2) not in seen_prices:
+                            oid = o.get("id") or o.get("orderId")
+                            rebuilt.append({
+                                "orderId": oid or f"history_{tp_price}",
+                                "price": tp_price,
+                                "pct": _match_pct(tp_price),
+                                "hit": True,  # Already triggered
+                            })
+                            seen_prices.add(round(tp_price, 2))
+
+                    if rebuilt:
+                        key = pos.bitunix_position_id
+                        self._bx_tp_tracking[key] = rebuilt
+                        self._save_bx_tp_tracking()
+                        tracked = rebuilt
+                        n_pending = sum(1 for t in rebuilt if not t["hit"])
+                        n_hit = sum(1 for t in rebuilt if t["hit"])
+                        logger.info(
+                            f"Startup: rebuilt TP tracking for {pos.symbol} {pos.side} "
+                            f"from exchange ({n_pending} pending, {n_hit} already hit)"
+                        )
+                    else:
+                        logger.info(f"Startup: no TP orders found for {pos.symbol} {pos.side}")
+                except Exception as e:
+                    logger.warning(f"Startup: failed to rebuild TPs for {pos.symbol}: {e}")
+
+            # ── Step 2: For existing tracking, check if unfilled TPs fired while offline ──
+            if tracked:
+                unfilled = [t for t in tracked if not t["hit"]]
+                if unfilled:
+                    try:
+                        pending = await asyncio.to_thread(
+                            self.bitunix_client.get_pending_tpsl_orders, bitunix_sym
+                        )
+                        pending_ids = set()
+                        for o in pending:
+                            oid = o.get("id") or o.get("orderId")
+                            if oid:
+                                pending_ids.add(oid)
+
+                        new_hits = []
+                        for tp_info in unfilled:
+                            oid = tp_info["orderId"]
+                            if oid in pending_ids:
+                                continue  # Still pending — not triggered
+                            was_triggered = await self._verify_bitunix_tp_triggered(
+                                bitunix_sym, oid
+                            )
+                            if was_triggered:
+                                tp_info["hit"] = True
+                                new_hits.append(tp_info)
+                                logger.info(
+                                    f"Startup catch-up: {pos.symbol} {pos.side} "
+                                    f"TP @ ${tp_info['price']:,.2f} was hit while offline"
+                                )
+                    except Exception as e:
+                        logger.warning(f"Startup catch-up TP check failed for {pos.symbol}: {e}")
+                        new_hits = []
+                else:
+                    new_hits = []
+
+                # ── Step 3: Rebuild verified_decreases from all hits ──
+                total_hits = sum(1 for t in tracked if t["hit"])
+                if total_hits > 0:
+                    # Save tracking state if any new hits found
+                    if new_hits:
+                        self._save_bx_tp_tracking()
+
+                    # Rebuild verified_decreases from ALL hit entries
+                    pos.verified_decreases = []
+                    for t in tracked:
+                        if not t["hit"]:
+                            continue
+                        tp_size = pos.original_size_usd * t.get("pct", 0)
+                        if pos.entry_price and pos.entry_price > 0:
+                            if pos.side == "LONG":
+                                tp_pnl = (t["price"] - pos.entry_price) / pos.entry_price * tp_size
+                            else:
+                                tp_pnl = (pos.entry_price - t["price"]) / pos.entry_price * tp_size
+                        else:
+                            tp_pnl = 0
+                        pos.verified_decreases.append({
+                            "execution_price": t["price"],
+                            "matched_tp_price": t["price"],
+                            "size_delta_usd": tp_size,
+                            "pnl_usd": tp_pnl,
+                            "net_pnl_usd": tp_pnl,
+                            "order_type": 5,
+                            "timestamp": time.time(),
+                            "source": "bitunix",
+                        })
+                    pos.realized_pnl = sum(
+                        d.get("net_pnl_usd", 0) for d in pos.verified_decreases
+                    )
+                    self._save_position_state()
+
+                    # Notify if any new hits were found (skip if just restoring known state)
+                    if new_hits or not getattr(pos, '_startup_hits_notified', False):
+                        n_pending = sum(1 for t in tracked if not t["hit"])
+                        collateral = pos.size_usd / pos.leverage if pos.leverage else pos.size_usd
+                        pnl_pct_str = f" ({pos.realized_pnl / collateral * 100:+.1f}%)" if collateral > 0 else ""
+                        r_sign = "+" if pos.realized_pnl >= 0 else "-"
+                        status_parts = []
+                        if total_hits:
+                            status_parts.append(f"{total_hits} hit")
+                        if n_pending:
+                            status_parts.append(f"{n_pending} pending")
+                        await self.notify(
+                            f"STARTUP CATCH-UP: BITUNIX {pos.symbol} {pos.side} {pos.leverage:.1f}x\n"
+                            f"TPs: {' / '.join(status_parts)}\n"
+                            f"Realized: {r_sign}${abs(pos.realized_pnl):,.2f}{pnl_pct_str}"
+                        )
+                        pos._startup_hits_notified = True
+
+                    # Correct SL level based on TP hits — only if current SL is wrong
+                    sorted_tp_prices = sorted(t["price"] for t in tracked)
+                    new_sl, sl_label = determine_new_sl_target(
+                        total_hits, pos.entry_price, sorted_tp_prices, pos.leverage
+                    )
+                    if new_sl is not None and pos.stop_loss is not None:
+                        tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
+                        sl_diff = abs(pos.stop_loss - new_sl)
+                        sl_already_better = (
+                            (pos.side == "LONG" and pos.stop_loss > new_sl + tolerance)
+                            or (pos.side == "SHORT" and pos.stop_loss < new_sl - tolerance)
+                        )
+                        if sl_already_better:
+                            logger.info(
+                                f"Startup: {pos.symbol} SL already at better level "
+                                f"(${pos.stop_loss:,.2f}) than trailing target "
+                                f"(${new_sl:,.2f} {sl_label}) — keeping current"
+                            )
+                        elif sl_diff > tolerance:
+                            await self._move_bitunix_sl(pos, new_sl, sl_label)
+                    elif new_sl is not None and pos.stop_loss is None:
+                        await self._move_bitunix_sl(pos, new_sl, sl_label)
+
+            # ── Step 3 (no new hits): Still verify SL is at correct level ──
+            if pos.tp_hits_count > 0 and pos.take_profits:
+                sorted_tp_prices = sorted(tp.price for tp in pos.take_profits)
+                new_sl, sl_label = determine_new_sl_target(
+                    pos.tp_hits_count, pos.entry_price, sorted_tp_prices, pos.leverage
+                )
+                if new_sl is not None and pos.stop_loss is not None:
+                    tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
+                    sl_diff = abs(pos.stop_loss - new_sl)
+                    # Don't downgrade SL if user manually moved it to a better level
+                    # For LONG: higher SL = more protective; for SHORT: lower SL = more protective
+                    sl_already_better = (
+                        (pos.side == "LONG" and pos.stop_loss > new_sl + tolerance)
+                        or (pos.side == "SHORT" and pos.stop_loss < new_sl - tolerance)
+                    )
+                    if sl_already_better:
+                        logger.info(
+                            f"Startup: {pos.symbol} SL already at better level "
+                            f"(${pos.stop_loss:,.2f}) than trailing target "
+                            f"(${new_sl:,.2f} {sl_label}) — keeping current"
+                        )
+                    elif sl_diff > tolerance:
+                        logger.info(
+                            f"Startup: {pos.symbol} SL stale — "
+                            f"${pos.stop_loss:,.2f} should be ${new_sl:,.2f} ({sl_label})"
+                        )
+                        await self._move_bitunix_sl(pos, new_sl, sl_label)
+
+        logger.info("Startup catch-up complete")
 
     # ──────────────────────────────────────────────────────────────────────
     # Bitunix Close (manual)

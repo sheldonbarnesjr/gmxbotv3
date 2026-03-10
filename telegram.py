@@ -665,7 +665,7 @@ class CoreTelegramMixin:
                 pos.exit_reason = "manual"
                 await self._record_trade(pos, exit_reason="manual")
                 # Clean up Bitunix monitoring state
-                self._bx_tp_tracking.pop(pos.id, None)
+                self._pop_tp_tracking(pos)
                 self._bx_missing_count.pop(pos.id, None)
                 self._save_bx_tp_tracking()
                 self._save_position_state()
@@ -695,6 +695,39 @@ class CoreTelegramMixin:
             p for p in self.positions.values()
             if p.is_open and getattr(p, 'exchange', 'gmx') == "bitunix"
         ]
+
+        # Verify Bitunix positions against exchange before displaying
+        if bx_positions and hasattr(self, 'bitunix_client') and self.bitunix_client:
+            try:
+                exchange_positions = await asyncio.to_thread(
+                    self.bitunix_client.get_pending_positions
+                )
+                exchange_position_ids = set()
+                exchange_sym_side = set()
+                for ep in exchange_positions:
+                    pid = ep.get("positionId")
+                    if pid:
+                        exchange_position_ids.add(pid)
+                    sym = (ep.get("symbol") or "").replace("USDT", "")
+                    if sym.startswith("1000"):
+                        sym = sym[4:]
+                    raw_side = (ep.get("side") or "").upper()
+                    side = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
+                    exchange_sym_side.add((sym, side))
+
+                verified_bx = []
+                for pos in bx_positions:
+                    on_exchange = (
+                        (pos.bitunix_position_id and pos.bitunix_position_id in exchange_position_ids)
+                        or (pos.symbol, pos.side) in exchange_sym_side
+                    )
+                    if on_exchange:
+                        verified_bx.append(pos)
+                    # Don't close here — reconciliation handles that
+                bx_positions = verified_bx
+            except Exception as e:
+                self.logger.debug(f"Bitunix verification for /positions failed: {e}")
+                # Show positions anyway if verification fails
 
         if not positions and not orders and not bx_positions:
             await self.send_message(chat_id, "No open positions or orders.")
@@ -922,8 +955,8 @@ class CoreTelegramMixin:
                     f"Unrealized: {_fmt_sign(pnl)} ({pnl_pct:+.0f}%)\n"
                 )
 
-                # Targets from _bx_tp_tracking
-                tracked = self._bx_tp_tracking.get(pos.id, [])
+                # Targets from TP tracking (keyed by bitunix_position_id)
+                tracked = self._get_tp_tracking(pos)
                 if tracked:
                     is_long = pos.side == "LONG"
                     sorted_tracked = sorted(
@@ -1149,7 +1182,7 @@ class CoreTelegramMixin:
             tp_hits = len(pos.verified_decreases or [])
 
             targets = []
-            tracked = self._bx_tp_tracking.get(pos.id, [])
+            tracked = self._get_tp_tracking(pos)
             if tracked:
                 is_long = pos.side == "LONG"
                 sorted_tracked = sorted(tracked, key=lambda t: t.get("price", 0), reverse=not is_long)
