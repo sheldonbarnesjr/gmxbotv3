@@ -258,9 +258,13 @@ class FamilyMirrorMixin:
             await self._notify_family(member, f"Skipped {signal.symbol} {signal.side}: no USDC balance")
             return
 
-        # Same risk % as main bot
+        # Same risk % as main bot (or fixed USD if configured)
         leverage = cap_leverage(signal.leverage, self.cfg.max_leverage, self.cfg.min_leverage)
-        collateral_usd = usdc_balance * self.cfg.portfolio_pct
+        fixed = getattr(self.cfg, "portfolio_fixed_usd", 0) or 0
+        if fixed > 0:
+            collateral_usd = min(fixed, usdc_balance)
+        else:
+            collateral_usd = usdc_balance * self.cfg.portfolio_pct
         size_usd = collateral_usd * leverage
 
         if collateral_usd < self.cfg.min_position_usd:

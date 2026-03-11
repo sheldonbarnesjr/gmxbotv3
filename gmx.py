@@ -1939,7 +1939,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 sizing_base = total_portfolio
                 sizing_label = f"total portfolio (${total_portfolio:,.0f})"
 
-            collateral_usd = sizing_base * self.cfg.portfolio_pct
+            # Fixed USD mode (from app $ input) or percentage mode
+            fixed = getattr(self.cfg, "portfolio_fixed_usd", 0)
+            if fixed > 0:
+                collateral_usd = min(fixed, sizing_base)
+            else:
+                collateral_usd = sizing_base * self.cfg.portfolio_pct
             size_usd = collateral_usd * signal.leverage
 
             min_collateral_err = check_min_collateral(
@@ -2219,7 +2224,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
                     bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
                     bx_total = bx_bal + bx_deployed + bx_pnl
-                    bx_collateral_usd = bx_total * self.cfg.portfolio_pct
+                    bx_fixed = getattr(self.cfg, "bitunix_portfolio_fixed_usd", 0)
+                    if bx_fixed > 0:
+                        bx_collateral_usd = min(bx_fixed, bx_total)
+                    else:
+                        bx_collateral_usd = bx_total * getattr(self.cfg, "bitunix_portfolio_pct", self.cfg.portfolio_pct)
                     bx_size_usd = bx_collateral_usd * signal.leverage
                     self.logger.info(
                         f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "
@@ -2294,7 +2303,11 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     bx_deployed = sum(float(bp.get("margin", 0)) for bp in bx_positions)
                     bx_pnl = sum(float(bp.get("unrealizedPNL", 0)) for bp in bx_positions)
                     bx_total = bx_bal + bx_deployed + bx_pnl
-                    collateral_usd = bx_total * self.cfg.portfolio_pct
+                    bx_fixed = getattr(self.cfg, "bitunix_portfolio_fixed_usd", 0)
+                    if bx_fixed > 0:
+                        collateral_usd = min(bx_fixed, bx_total)
+                    else:
+                        collateral_usd = bx_total * getattr(self.cfg, "bitunix_portfolio_pct", self.cfg.portfolio_pct)
                     size_usd = collateral_usd * signal.leverage
                     self.logger.info(
                         f"[BITUNIX] Sizing from BITUNIX balance: total=${bx_total:.2f}, "

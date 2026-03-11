@@ -1559,7 +1559,9 @@ async def get_config(token: str = Depends(verify_api_key)):
         "max_position_usd": cfg.max_position_usd,
         "min_position_usd": cfg.min_position_usd,
         "portfolio_pct": cfg.portfolio_pct,
+        "portfolio_fixed_usd": getattr(cfg, "portfolio_fixed_usd", 0),
         "bitunix_portfolio_pct": cfg.bitunix_portfolio_pct,
+        "bitunix_portfolio_fixed_usd": getattr(cfg, "bitunix_portfolio_fixed_usd", 0),
         "require_sl": cfg.require_sl,
         "require_tp": cfg.require_tp,
         "dry_run": cfg.dry_run,
@@ -1571,23 +1573,35 @@ async def get_config(token: str = Depends(verify_api_key)):
 
 class ConfigUpdateRequest(BaseModel):
     portfolio_pct: Optional[float] = None
+    portfolio_fixed_usd: Optional[float] = None
     bitunix_portfolio_pct: Optional[float] = None
+    bitunix_portfolio_fixed_usd: Optional[float] = None
 
 
 @app.post("/api/v1/config/update")
 async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_api_key)):
-    """Update bot configuration (trade size percentages)."""
+    """Update bot configuration (trade size percentages or fixed USD amounts)."""
     updated = {}
     if req.portfolio_pct is not None:
         if not (0.01 <= req.portfolio_pct <= 1.0):
             raise HTTPException(status_code=400, detail="portfolio_pct must be 0.01-1.0")
         cfg.portfolio_pct = req.portfolio_pct
         updated["portfolio_pct"] = cfg.portfolio_pct
+    if req.portfolio_fixed_usd is not None:
+        if req.portfolio_fixed_usd < 0:
+            raise HTTPException(status_code=400, detail="portfolio_fixed_usd must be >= 0")
+        cfg.portfolio_fixed_usd = req.portfolio_fixed_usd
+        updated["portfolio_fixed_usd"] = cfg.portfolio_fixed_usd
     if req.bitunix_portfolio_pct is not None:
         if not (0.01 <= req.bitunix_portfolio_pct <= 1.0):
             raise HTTPException(status_code=400, detail="bitunix_portfolio_pct must be 0.01-1.0")
         cfg.bitunix_portfolio_pct = req.bitunix_portfolio_pct
         updated["bitunix_portfolio_pct"] = cfg.bitunix_portfolio_pct
+    if req.bitunix_portfolio_fixed_usd is not None:
+        if req.bitunix_portfolio_fixed_usd < 0:
+            raise HTTPException(status_code=400, detail="bitunix_portfolio_fixed_usd must be >= 0")
+        cfg.bitunix_portfolio_fixed_usd = req.bitunix_portfolio_fixed_usd
+        updated["bitunix_portfolio_fixed_usd"] = cfg.bitunix_portfolio_fixed_usd
     return {"success": True, "updated": updated}
 
 

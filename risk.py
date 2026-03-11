@@ -28,13 +28,20 @@ def calculate_position_size(
     total_portfolio: float,
     portfolio_pct: float,
     leverage: float,
+    fixed_usd: float = 0,
 ) -> Tuple[float, float]:
     """Calculate collateral and notional size for a new position.
+
+    If fixed_usd > 0, use that as collateral (capped at total_portfolio).
+    Otherwise use portfolio_pct of total_portfolio.
 
     Returns:
         (collateral_usd, size_usd)
     """
-    collateral_usd = total_portfolio * portfolio_pct
+    if fixed_usd > 0:
+        collateral_usd = min(fixed_usd, total_portfolio)
+    else:
+        collateral_usd = total_portfolio * portfolio_pct
     size_usd = collateral_usd * leverage
     return collateral_usd, size_usd
 
