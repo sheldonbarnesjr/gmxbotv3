@@ -155,6 +155,44 @@ ERC20_ABI = [
      "outputs": [{"name": "", "type": "uint256"}]},
     {"name": "decimals", "type": "function", "stateMutability": "view",
      "inputs": [], "outputs": [{"name": "", "type": "uint8"}]},
+    {"name": "approve", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
+     "outputs": [{"name": "", "type": "bool"}]},
+    {"name": "allowance", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+     "outputs": [{"name": "", "type": "uint256"}]},
+    {"name": "transfer", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+     "outputs": [{"name": "", "type": "bool"}]},
+]
+
+# Uniswap V3 SwapRouter on Arbitrum
+UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+USDT_ADDRESS = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"  # Arbitrum USDT
+USDC_ADDRESS = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"  # Arbitrum native USDC
+
+# Uniswap V3 SwapRouter ABI (exactInputSingle only)
+UNISWAP_V3_ABI = [
+    {
+        "name": "exactInputSingle",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [{
+            "name": "params",
+            "type": "tuple",
+            "components": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "fee", "type": "uint24"},
+                {"name": "recipient", "type": "address"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "amountOutMinimum", "type": "uint256"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+        }],
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+    },
 ]
 
 
@@ -1150,6 +1188,311 @@ async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
         status_code=501,
         detail="Withdrawals via API are disabled for safety. Use Telegram /withdraw command."
     )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SWAP (USDC ↔ USDT via Uniswap V3 on Arbitrum)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Token address mapping
+_TOKEN_MAP = {
+    "USDC": USDC_ADDRESS,
+    "USDT": USDT_ADDRESS,
+}
+
+_TOKEN_DECIMALS = {
+    "USDC": 6,
+    "USDT": 6,
+}
+
+
+def _api_send_tx(to_addr: str, data: bytes, value: int, acct) -> str:
+    """Send a raw transaction from the REST API and return tx hash hex string."""
+    from web3 import Web3
+
+    if cfg.dry_run:
+        import uuid
+        return f"dry_run_{uuid.uuid4().hex[:16]}"
+
+    nonce = w3.eth.get_transaction_count(acct.address, "pending")
+    base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0)
+    priority_fee = w3.to_wei(0.1, "gwei")
+    max_fee = base_fee * 2 + priority_fee
+
+    tx = {
+        "to": Web3.to_checksum_address(to_addr),
+        "from": acct.address,
+        "value": value,
+        "data": data,
+        "nonce": nonce,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": priority_fee,
+        "gas": 500000,
+        "chainId": w3.eth.chain_id,
+        "type": 2,
+    }
+
+    try:
+        gas_estimate = w3.eth.estimate_gas(tx)
+        tx["gas"] = int(gas_estimate * 1.2)
+    except Exception as e:
+        logger.warning(f"Gas estimation failed: {e}, using 500k default")
+        tx["gas"] = 500000
+
+    signed = acct.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    return tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+
+
+def _api_wait_receipt(tx_hash: str, timeout: int = 180) -> dict:
+    """Wait for a transaction receipt."""
+    from web3.exceptions import TransactionNotFound
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            r = w3.eth.get_transaction_receipt(tx_hash)
+            if r is not None:
+                return dict(r)
+        except TransactionNotFound:
+            pass
+        time.sleep(1.0)
+    raise TimeoutError(f"TX {tx_hash} not confirmed in {timeout}s")
+
+
+def _get_token_balance(token_address: str, account) -> tuple:
+    """Get token balance. Returns (raw_balance, human_balance, decimals)."""
+    from web3 import Web3
+    token = w3.eth.contract(
+        address=Web3.to_checksum_address(token_address),
+        abi=ERC20_ABI,
+    )
+    decimals = token.functions.decimals().call()
+    raw = token.functions.balanceOf(account.address).call()
+    return raw, raw / (10 ** decimals), decimals
+
+
+def _ensure_approval(token_address: str, spender: str, amount_raw: int, acct) -> Optional[str]:
+    """Approve spender if allowance is insufficient. Returns tx_hash if approval was needed."""
+    from web3 import Web3
+    token = w3.eth.contract(
+        address=Web3.to_checksum_address(token_address),
+        abi=ERC20_ABI,
+    )
+    current_allowance = token.functions.allowance(acct.address, Web3.to_checksum_address(spender)).call()
+    if current_allowance >= amount_raw:
+        return None
+
+    # Approve max uint256 to avoid repeated approvals
+    max_uint = 2**256 - 1
+    approve_data = token.encode_abi("approve", [Web3.to_checksum_address(spender), max_uint])
+    tx_hash = _api_send_tx(token_address, approve_data, 0, acct)
+    receipt = _api_wait_receipt(tx_hash)
+    if receipt.get("status") != 1:
+        raise Exception(f"Approval tx failed: {tx_hash}")
+    logger.info(f"Approved {spender[:10]}... to spend {token_address[:10]}... tx={tx_hash}")
+    return tx_hash
+
+
+def _execute_uniswap_swap(
+    token_in: str, token_out: str, amount_in_raw: int,
+    recipient: str, acct, slippage_bps: int = 50,
+) -> tuple:
+    """Execute a Uniswap V3 exactInputSingle swap. Returns (tx_hash, amount_out)."""
+    from web3 import Web3
+
+    router = w3.eth.contract(
+        address=Web3.to_checksum_address(UNISWAP_V3_ROUTER),
+        abi=UNISWAP_V3_ABI,
+    )
+
+    # Use 0.01% fee tier for stablecoin pairs (100), fallback 0.05% (500)
+    fee = 100
+
+    # Slippage: for stablecoin swap, expect ~1:1 minus slippage
+    min_out = int(amount_in_raw * (10000 - slippage_bps) / 10000)
+
+    params = (
+        Web3.to_checksum_address(token_in),
+        Web3.to_checksum_address(token_out),
+        fee,
+        Web3.to_checksum_address(recipient),
+        int(time.time()) + 600,  # 10 min deadline
+        amount_in_raw,
+        min_out,
+        0,  # sqrtPriceLimitX96 = 0 (no limit)
+    )
+
+    swap_data = router.encode_abi("exactInputSingle", [params])
+    tx_hash = _api_send_tx(UNISWAP_V3_ROUTER, swap_data, 0, acct)
+    receipt = _api_wait_receipt(tx_hash)
+
+    if receipt.get("status") != 1:
+        raise Exception(f"Swap tx reverted: {tx_hash}")
+
+    # Parse amount out from Transfer event logs
+    amount_out = min_out  # fallback
+    for log in receipt.get("logs", []):
+        # ERC20 Transfer event topic
+        if (
+            len(log.get("topics", [])) == 3
+            and log["address"].lower() == token_out.lower()
+        ):
+            try:
+                amount_out = int(log["data"], 16) if isinstance(log["data"], str) else int.from_bytes(log["data"], "big")
+            except Exception:
+                pass
+
+    return tx_hash, amount_out
+
+
+class SwapQuoteRequest(BaseModel):
+    from_token: str
+    to_token: str
+    amount: float
+
+
+class SwapExecuteRequest(BaseModel):
+    from_token: str
+    to_token: str
+    amount: float
+    destination_address: Optional[str] = None
+
+
+@app.post("/api/v1/wallet/swap/quote")
+async def swap_quote(req: SwapQuoteRequest, token: str = Depends(verify_api_key)):
+    """Get a swap quote for USDC ↔ USDT via Uniswap V3."""
+    from_token = req.from_token.upper()
+    to_token = req.to_token.upper()
+
+    if from_token not in _TOKEN_MAP or to_token not in _TOKEN_MAP:
+        raise HTTPException(400, f"Unsupported tokens. Supported: {list(_TOKEN_MAP.keys())}")
+    if from_token == to_token:
+        raise HTTPException(400, "from_token and to_token must be different")
+    if req.amount <= 0:
+        raise HTTPException(400, "Amount must be greater than 0")
+
+    # Check W1 balance of from_token
+    if 1 not in accounts:
+        raise HTTPException(500, "No wallet configured")
+
+    from_addr = _TOKEN_MAP[from_token]
+    from_decimals = _TOKEN_DECIMALS[from_token]
+
+    _, balance, _ = await asyncio.to_thread(_get_token_balance, from_addr, accounts[1])
+
+    if balance < req.amount:
+        raise HTTPException(400, f"Insufficient {from_token} balance. Have: {balance:.2f}, Need: {req.amount:.2f}")
+
+    # For stablecoins, quote is ~1:1 with minimal impact
+    # Actual slippage will be determined on execution
+    estimated_out = req.amount * 0.999  # ~0.1% fee estimate
+    price_impact = 0.01  # negligible for stablecoin pools
+
+    return {
+        "from_token": from_token,
+        "to_token": to_token,
+        "amount_in": req.amount,
+        "amount_out": round(estimated_out, 2),
+        "price_impact": price_impact,
+        "route": f"{from_token} → Uniswap V3 (0.01%) → {to_token}",
+    }
+
+
+@app.post("/api/v1/wallet/swap/execute")
+async def swap_execute(req: SwapExecuteRequest, token: str = Depends(verify_api_key)):
+    """Execute USDC ↔ USDT swap via Uniswap V3, optionally transfer to destination."""
+    from_token = req.from_token.upper()
+    to_token = req.to_token.upper()
+
+    if from_token not in _TOKEN_MAP or to_token not in _TOKEN_MAP:
+        raise HTTPException(400, f"Unsupported tokens. Supported: {list(_TOKEN_MAP.keys())}")
+    if from_token == to_token:
+        raise HTTPException(400, "from_token and to_token must be different")
+    if req.amount <= 0:
+        raise HTTPException(400, "Amount must be greater than 0")
+
+    if 1 not in accounts:
+        raise HTTPException(500, "No wallet configured")
+
+    acct = accounts[1]
+    from_addr = _TOKEN_MAP[from_token]
+    to_addr = _TOKEN_MAP[to_token]
+    from_decimals = _TOKEN_DECIMALS[from_token]
+    to_decimals = _TOKEN_DECIMALS[to_token]
+
+    # Validate balance
+    _, balance, _ = await asyncio.to_thread(_get_token_balance, from_addr, acct)
+    if balance < req.amount:
+        raise HTTPException(400, f"Insufficient {from_token} balance. Have: {balance:.2f}, Need: {req.amount:.2f}")
+
+    # Validate destination address if provided
+    dest_address = None
+    if req.destination_address:
+        from web3 import Web3
+        if not Web3.is_address(req.destination_address):
+            raise HTTPException(400, "Invalid destination address")
+        dest_address = Web3.to_checksum_address(req.destination_address)
+
+    amount_in_raw = int(req.amount * (10 ** from_decimals))
+
+    try:
+        # Step 1: Approve Uniswap router to spend from_token
+        logger.info(f"Swap: approving {from_token} for Uniswap router...")
+        await asyncio.to_thread(_ensure_approval, from_addr, UNISWAP_V3_ROUTER, amount_in_raw, acct)
+
+        # Step 2: Execute swap
+        # If no destination, swap directly to W1. If destination, swap to W1 first then transfer.
+        logger.info(f"Swap: executing {req.amount} {from_token} → {to_token}...")
+        swap_tx_hash, amount_out_raw = await asyncio.to_thread(
+            _execute_uniswap_swap,
+            from_addr, to_addr, amount_in_raw,
+            acct.address,  # always receive to W1 first
+            acct,
+        )
+        amount_out = amount_out_raw / (10 ** to_decimals)
+        logger.info(f"Swap complete: {req.amount} {from_token} → {amount_out:.2f} {to_token}, tx={swap_tx_hash}")
+
+        # Step 3: Transfer to destination if provided
+        transfer_tx_hash = None
+        if dest_address:
+            logger.info(f"Transferring {amount_out:.2f} {to_token} to {dest_address[:10]}...")
+            to_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(to_addr),
+                abi=ERC20_ABI,
+            )
+            transfer_data = to_contract.encode_abi(
+                "transfer",
+                [dest_address, amount_out_raw],
+            )
+            transfer_tx_hash = await asyncio.to_thread(
+                _api_send_tx, to_addr, transfer_data, 0, acct
+            )
+            receipt = await asyncio.to_thread(_api_wait_receipt, transfer_tx_hash)
+            if receipt.get("status") != 1:
+                # Swap succeeded but transfer failed
+                return {
+                    "success": False,
+                    "message": f"Swap succeeded but transfer to {dest_address[:10]}... failed",
+                    "swap_tx_hash": swap_tx_hash,
+                    "transfer_tx_hash": transfer_tx_hash,
+                    "amount_swapped": req.amount,
+                    "amount_received": round(amount_out, 2),
+                }
+            logger.info(f"Transfer complete: {amount_out:.2f} {to_token} → {dest_address[:10]}..., tx={transfer_tx_hash}")
+
+        return {
+            "success": True,
+            "message": f"Swapped {req.amount:.2f} {from_token} → {amount_out:.2f} {to_token}"
+                       + (f" and sent to {dest_address[:10]}..." if dest_address else ""),
+            "swap_tx_hash": swap_tx_hash,
+            "transfer_tx_hash": transfer_tx_hash,
+            "amount_swapped": req.amount,
+            "amount_received": round(amount_out, 2),
+        }
+
+    except Exception as e:
+        logger.error(f"Swap failed: {e}")
+        raise HTTPException(500, f"Swap failed: {str(e)}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
