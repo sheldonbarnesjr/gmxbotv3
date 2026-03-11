@@ -834,20 +834,34 @@ async def trade_stats(
     gross_loss = abs(sum(t["pnl_usd"] for t in losses)) if losses else 0
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0
 
+    # Compute percentage-based avg win/loss/pnl (PnL % of collateral)
+    def _pnl_pct(t):
+        pnl = t.get("pnl_usd", 0)
+        size = t.get("size_usd", 0)
+        lev = t.get("leverage", 1) or 1
+        collateral = size / lev if lev > 0 else size
+        return (pnl / collateral * 100) if collateral > 0 else 0
+
+    win_pcts = [_pnl_pct(t) for t in wins]
+    loss_pcts = [_pnl_pct(t) for t in losses]
+    all_pcts = [_pnl_pct(t) for t in trades]
+
     return {
         "win_rate": round(len(wins) / len(trades) * 100, 1),
         "wins": len(wins),
         "losses": len(losses),
         "total": len(trades),
-        "avg_win": round(sum(t["pnl_usd"] for t in wins) / len(wins), 2) if wins else 0,
-        "avg_loss": round(sum(t["pnl_usd"] for t in losses) / len(losses), 2) if losses else 0,
+        "avg_win": round(sum(win_pcts) / len(win_pcts), 1) if win_pcts else 0,
+        "avg_loss": round(sum(loss_pcts) / len(loss_pcts), 1) if loss_pcts else 0,
+        "avg_win_usd": round(sum(t["pnl_usd"] for t in wins) / len(wins), 2) if wins else 0,
+        "avg_loss_usd": round(sum(t["pnl_usd"] for t in losses) / len(losses), 2) if losses else 0,
         "pnl": round(total_pnl, 2),
         "best": round(max((t["pnl_usd"] for t in trades), default=0), 2),
         "worst": round(min((t["pnl_usd"] for t in trades), default=0), 2),
         "avg_tp_hits": round(avg_tp_hits, 1),
         "avg_duration_hours": round(avg_duration, 1),
         "profit_factor": profit_factor,
-        "avg_pnl": round(total_pnl / len(trades), 2),
+        "avg_pnl": round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0,
         "avg_leverage": round(avg_leverage, 1),
     }
 
