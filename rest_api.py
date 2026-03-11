@@ -376,10 +376,10 @@ async def health(token: str = Depends(verify_api_key)):
 @app.get("/api/v1/dashboard")
 async def dashboard(token: str = Depends(verify_api_key)):
     """Dashboard — matches iOS DashboardResponse."""
-    # Calculate free USDC across all wallets
-    free_usdc = 0.0
+    # Calculate free USDC across all GMX wallets
+    free_usdc_gmx = 0.0
     for wid, acct in accounts.items():
-        free_usdc += await asyncio.to_thread(_get_usdc_balance, acct)
+        free_usdc_gmx += await asyncio.to_thread(_get_usdc_balance, acct)
 
     # Calculate deployed collateral + unrealized PnL from positions.json
     # (more reliable than on-chain fetch which can fail silently)
@@ -408,12 +408,13 @@ async def dashboard(token: str = Depends(verify_api_key)):
                 unrealized_pnl += p.get("unrealized_pnl", 0)
 
     # Include Bitunix balance + positions
+    free_usdc_bitunix = 0.0
     if bx_client:
         try:
             from bitunix_executor import get_bitunix_balance, get_bitunix_positions
             bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
             bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
-            free_usdc += bx_bal
+            free_usdc_bitunix = bx_bal
             for bp in bx_positions:
                 bx_margin = float(bp.get("margin", 0))
                 bx_pnl = float(bp.get("unrealizedPNL", 0))
@@ -422,6 +423,7 @@ async def dashboard(token: str = Depends(verify_api_key)):
         except Exception as e:
             logger.warning(f"Bitunix balance fetch failed: {e}")
 
+    free_usdc = free_usdc_gmx + free_usdc_bitunix
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
     # 24h change from balance snapshots
@@ -443,6 +445,8 @@ async def dashboard(token: str = Depends(verify_api_key)):
     return {
         "total_portfolio": round(total_portfolio, 2),
         "free_usdc": round(free_usdc, 2),
+        "free_usdc_gmx": round(free_usdc_gmx, 2),
+        "free_usdc_bitunix": round(free_usdc_bitunix, 2),
         "deployed_collateral": round(deployed_collateral, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
         "change_24h_usd": round(change_24h_usd, 2),
@@ -1425,13 +1429,16 @@ async def swap_execute(req: SwapExecuteRequest, token: str = Depends(verify_api_
     if balance < req.amount:
         raise HTTPException(400, f"Insufficient {from_token} balance. Have: {balance:.2f}, Need: {req.amount:.2f}")
 
-    # Validate destination address if provided
+    # Determine destination address: client-provided, server config, or None
     dest_address = None
-    if req.destination_address:
+    raw_dest = req.destination_address or (
+        cfg.bitunix_deposit_address if to_token == "USDT" else None
+    )
+    if raw_dest:
         from web3 import Web3
-        if not Web3.is_address(req.destination_address):
+        if not Web3.is_address(raw_dest):
             raise HTTPException(400, "Invalid destination address")
-        dest_address = Web3.to_checksum_address(req.destination_address)
+        dest_address = Web3.to_checksum_address(raw_dest)
 
     amount_in_raw = int(req.amount * (10 ** from_decimals))
 
@@ -1552,6 +1559,7 @@ async def get_config(token: str = Depends(verify_api_key)):
         "max_position_usd": cfg.max_position_usd,
         "min_position_usd": cfg.min_position_usd,
         "portfolio_pct": cfg.portfolio_pct,
+        "bitunix_portfolio_pct": cfg.bitunix_portfolio_pct,
         "require_sl": cfg.require_sl,
         "require_tp": cfg.require_tp,
         "dry_run": cfg.dry_run,
@@ -1559,6 +1567,28 @@ async def get_config(token: str = Depends(verify_api_key)):
         "slippage_bps": cfg.slippage_bps,
         "allowed_symbols": list(ALLOWED_SYMBOLS),
     }
+
+
+class ConfigUpdateRequest(BaseModel):
+    portfolio_pct: Optional[float] = None
+    bitunix_portfolio_pct: Optional[float] = None
+
+
+@app.post("/api/v1/config/update")
+async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_api_key)):
+    """Update bot configuration (trade size percentages)."""
+    updated = {}
+    if req.portfolio_pct is not None:
+        if not (0.01 <= req.portfolio_pct <= 1.0):
+            raise HTTPException(status_code=400, detail="portfolio_pct must be 0.01-1.0")
+        cfg.portfolio_pct = req.portfolio_pct
+        updated["portfolio_pct"] = cfg.portfolio_pct
+    if req.bitunix_portfolio_pct is not None:
+        if not (0.01 <= req.bitunix_portfolio_pct <= 1.0):
+            raise HTTPException(status_code=400, detail="bitunix_portfolio_pct must be 0.01-1.0")
+        cfg.bitunix_portfolio_pct = req.bitunix_portfolio_pct
+        updated["bitunix_portfolio_pct"] = cfg.bitunix_portfolio_pct
+    return {"success": True, "updated": updated}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

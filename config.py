@@ -193,7 +193,8 @@ class Config:
     max_leverage: float = 10.0
     max_position_usd: float = 50000.0
     min_position_usd: float = 2.0
-    portfolio_pct: float = 0.20
+    portfolio_pct: float = 0.25
+    bitunix_portfolio_pct: float = 0.25  # Bitunix collateral = 25% of Bitunix balance
     free_balance_after: int = 2      # After N open trades, size from free USDC only
     slippage_bps: int = 30
     execution_fee_wei: int = 0
@@ -288,7 +289,8 @@ def load_config() -> Config:
         max_leverage=_env_float("MAX_LEVERAGE", 10.0),
         max_position_usd=_env_float("MAX_POSITION_USD", 50000.0),
         min_position_usd=_env_float("MIN_POSITION_USD", 2.0),
-        portfolio_pct=_env_float("PORTFOLIO_PCT", 0.20),
+        portfolio_pct=_env_float("PORTFOLIO_PCT", 0.25),
+        bitunix_portfolio_pct=_env_float("BITUNIX_PORTFOLIO_PCT", 0.25),
         free_balance_after=_env_int("FREE_BALANCE_AFTER", 2),
         slippage_bps=_env_int("SLIPPAGE_BPS", 30),
         execution_fee_wei=_env_int("GMX_V2_EXECUTION_FEE_WEI", int(Web3.to_wei(0.0002, "ether"))),

@@ -1984,14 +1984,16 @@ class CoreTelegramMixin:
         try:
             if not arg or not arg.strip():
                 total_portfolio = await self._get_total_portfolio_value()
-                collateral = total_portfolio * cfg.portfolio_pct
-                pct_display = cfg.portfolio_pct * 100
+                gmx_collateral = total_portfolio * cfg.portfolio_pct
+                bx_pct = getattr(cfg, "bitunix_portfolio_pct", cfg.portfolio_pct)
+                bx_collateral = total_portfolio * bx_pct
                 msg = (
                     "**Trade Size**\n\n"
                     f"Portfolio: ${total_portfolio:,.2f}\n"
-                    f"Trade size: {pct_display:.0f}% → ${collateral:,.2f} collateral per trade\n\n"
-                    "Usage: `/tradesize <percent>` to change\n"
-                    "Example: `/tradesize 15` → 15% per trade"
+                    f"GMX: {cfg.portfolio_pct*100:.0f}% → ${gmx_collateral:,.2f}\n"
+                    f"Bitunix: {bx_pct*100:.0f}% → ${bx_collateral:,.2f}\n\n"
+                    "Usage: `/tradesize <percent>` to change both\n"
+                    "Example: `/tradesize 25` → 25% per trade"
                 )
                 await self.send_message(chat_id, msg)
                 return
@@ -2005,13 +2007,14 @@ class CoreTelegramMixin:
 
             old_pct = cfg.portfolio_pct
             cfg.portfolio_pct = new_pct
+            cfg.bitunix_portfolio_pct = new_pct
 
             total_portfolio = await self._get_total_portfolio_value()
             new_collateral = total_portfolio * cfg.portfolio_pct
 
             await self.send_message(
                 chat_id,
-                f"✅ Trade size updated: {old_pct*100:.0f}% → {new_pct*100:.0f}%\n"
+                f"Trade size updated: {old_pct*100:.0f}% → {new_pct*100:.0f}%\n"
                 f"New collateral per trade: ${new_collateral:,.2f} "
                 f"(of ${total_portfolio:,.2f} portfolio)"
             )
