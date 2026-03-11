@@ -48,6 +48,7 @@ TRADE_HISTORY_FILE = "json/trade_history.json"
 BALANCE_SNAPSHOTS_FILE = "json/balance_snapshots.json"
 SIGNAL_STORE_FILE = "json/signal_store.json"
 API_KEYS_FILE = "json/api_keys.json"
+CHART_CONFIG_FILE = "json/chart_config.json"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Globals initialized at startup
@@ -63,11 +64,23 @@ def _api_save_balance_snapshot(total: float):
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     snapshots.append({"timestamp": time.time(), "total_portfolio": round(total, 2)})
     cutoff = time.time() - (90 * 24 * 3600)
-    snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
+    # Also respect reset_timestamp — don't keep snapshots from before reset
+    chart_cfg = safe_json_read(CHART_CONFIG_FILE, {})
+    reset_ts = chart_cfg.get("reset_timestamp", 0)
+    effective_cutoff = max(cutoff, reset_ts)
+    snapshots = [s for s in snapshots if s["timestamp"] >= effective_cutoff]
     try:
         atomic_json_write(BALANCE_SNAPSHOTS_FILE, snapshots)
     except Exception:
         pass
+
+
+def _load_reset_timestamp() -> float:
+    """Load the reset timestamp from chart config (0 if never reset)."""
+    chart_cfg = safe_json_read(CHART_CONFIG_FILE, {})
+    return chart_cfg.get("reset_timestamp", 0)
+
+
 start_time = time.time()
 
 
@@ -261,8 +274,64 @@ async def _fetch_chain_positions(account) -> list:
 # FastAPI app
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+async def _calculate_total_portfolio() -> float:
+    """Calculate total portfolio value from wallets + positions + Bitunix."""
+    total = 0.0
+    for wid, acct in accounts.items():
+        total += await asyncio.to_thread(_get_usdc_balance, acct)
+
+    positions = safe_json_read(POSITIONS_FILE, {})
+    for pid, p in positions.items():
+        if p.get("is_open", False):
+            size = p.get("size_usd", 0)
+            lev = p.get("leverage", 1)
+            total += size / lev if lev > 0 else size
+            symbol = p.get("symbol", "")
+            entry = p.get("entry_price", 0)
+            side = p.get("side", "LONG")
+            price = await asyncio.to_thread(_get_chainlink_price, symbol)
+            if price and entry > 0 and size > 0:
+                if side == "LONG":
+                    total += (price - entry) / entry * size
+                else:
+                    total += (entry - price) / entry * size
+            else:
+                total += p.get("unrealized_pnl", 0)
+
+    if bx_client:
+        try:
+            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
+            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
+            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
+            total += bx_bal
+            for bp in bx_positions:
+                total += float(bp.get("margin", 0))
+                total += float(bp.get("unrealizedPNL", 0))
+        except Exception as e:
+            logger.warning(f"Bitunix fetch in periodic snapshot failed: {e}")
+
+    return total
+
+
+async def _periodic_snapshot_task():
+    """Background task: save a balance snapshot every 5 minutes."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            total = await _calculate_total_portfolio()
+            if total > 0:
+                _api_save_balance_snapshot(total)
+                logger.info(f"Periodic snapshot saved: ${total:.2f}")
+        except Exception as e:
+            logger.warning(f"Periodic snapshot failed: {e}")
+
+
+_snapshot_bg_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _snapshot_bg_task
     _init_web3_and_accounts()
     # Generate initial API key if none exist
     keys = _load_api_keys()
@@ -274,7 +343,16 @@ async def lifespan(app: FastAPI):
         print(f"{'='*60}\n")
     # Backfill balance snapshots from trade history if sparse
     _backfill_snapshots_if_needed()
+    # Start background snapshot task
+    _snapshot_bg_task = asyncio.create_task(_periodic_snapshot_task())
     yield
+    # Cleanup
+    if _snapshot_bg_task:
+        _snapshot_bg_task.cancel()
+        try:
+            await _snapshot_bg_task
+        except asyncio.CancelledError:
+            pass
 
 
 def _backfill_snapshots_if_needed():
@@ -283,7 +361,11 @@ def _backfill_snapshots_if_needed():
     if len(snapshots) >= 20:
         return  # enough data already
 
+    reset_ts = _load_reset_timestamp()
+
     trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    # Filter out trades before reset
+    trades = [t for t in trades if t.get("closed_at", 0) >= reset_ts]
     if not trades:
         return
 
@@ -467,6 +549,50 @@ async def dashboard(token: str = Depends(verify_api_key)):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RESET
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.post("/api/v1/dashboard/reset")
+async def dashboard_reset(token: str = Depends(verify_api_key)):
+    """Reset all chart history. Archives old data and starts fresh from now."""
+    import shutil
+    now = time.time()
+
+    # Archive existing files
+    for src in [BALANCE_SNAPSHOTS_FILE, TRADE_HISTORY_FILE]:
+        if os.path.exists(src):
+            shutil.copy2(src, f"{src}.bak")
+
+    # Calculate current portfolio for the initial snapshot
+    try:
+        initial_balance = await _calculate_total_portfolio()
+    except Exception:
+        initial_balance = 0.0
+
+    # Write fresh snapshots with single current point
+    if initial_balance > 0:
+        atomic_json_write(BALANCE_SNAPSHOTS_FILE, [
+            {"timestamp": now, "total_portfolio": round(initial_balance, 2)}
+        ])
+    else:
+        atomic_json_write(BALANCE_SNAPSHOTS_FILE, [])
+
+    # Clear trade history
+    atomic_json_write(TRADE_HISTORY_FILE, [])
+
+    # Save reset timestamp
+    atomic_json_write(CHART_CONFIG_FILE, {"reset_timestamp": now})
+
+    logger.info(f"Chart history reset at {now}, initial balance: ${initial_balance:.2f}")
+
+    return {
+        "success": True,
+        "reset_at": now,
+        "initial_balance": round(initial_balance, 2),
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CHART
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -478,6 +604,9 @@ async def dashboard_chart(
 ):
     """Portfolio chart data from balance snapshots + trade history."""
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
+
+    # Apply reset_timestamp — never show data from before a reset
+    reset_ts = _load_reset_timestamp()
 
     # Filter by period
     # Calculate YTD hours
@@ -491,7 +620,7 @@ async def dashboard_chart(
         "90d": 2160, "ytd": ytd_hours, "365d": 8760, "all": 999999,
     }
     period_hours = period_map.get(period, 24)
-    cutoff = time.time() - (period_hours * 3600)
+    cutoff = max(time.time() - (period_hours * 3600), reset_ts)
     filtered = [s for s in snapshots if s["timestamp"] >= cutoff]
 
     points = [{"timestamp": s["timestamp"], "value": s["total_portfolio"]} for s in filtered]
@@ -539,8 +668,10 @@ async def dashboard_chart(
         cumulative = 0.0
         for t in trades:
             closed_at = t.get("closed_at", 0)
-            if closed_at < cutoff or closed_at <= 0:
-                cumulative += t.get("pnl_usd", 0)
+            if closed_at <= 0 or closed_at < cutoff:
+                # FIXED: Do NOT accumulate PnL from trades before the cutoff.
+                # Previously this silently inflated the starting value, causing
+                # different timeframes to show wildly different PnL totals.
                 continue
             cumulative += t.get("pnl_usd", 0)
             pnl_points.append({"timestamp": closed_at, "value": round(cumulative, 2)})
@@ -569,9 +700,14 @@ async def dashboard_chart(
 
         if len(pnl_points) == 1:
             # Need at least 2 points — add a zero-start point at cutoff
-            pnl_points.insert(0, {"timestamp": cutoff, "value": round(cumulative, 2)})
+            pnl_points.insert(0, {"timestamp": cutoff, "value": 0.0})
 
-        return {"period": period, "points": pnl_points}
+        return {
+            "period": period,
+            "points": pnl_points,
+            "point_count": len(pnl_points),
+            "oldest_point_ts": pnl_points[0]["timestamp"] if pnl_points else None,
+        }
 
     # Compute live portfolio value for the "now" endpoint
     live_total = 0.0
@@ -622,6 +758,8 @@ async def dashboard_chart(
     return {
         "period": period,
         "points": points,
+        "point_count": len(points),
+        "oldest_point_ts": points[0]["timestamp"] if points else None,
     }
 
 
