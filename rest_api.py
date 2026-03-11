@@ -426,10 +426,13 @@ async def dashboard(token: str = Depends(verify_api_key)):
     free_usdc = free_usdc_gmx + free_usdc_bitunix
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
-    # Auto-save balance snapshot (throttled: max once per 15 min)
+    # Auto-save balance snapshot — save if balance changed meaningfully or every 60s
     snapshots_all = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     last_snap_ts = snapshots_all[-1]["timestamp"] if snapshots_all else 0
-    if time.time() - last_snap_ts >= 300 and total_portfolio > 0:  # 5 min
+    last_snap_val = snapshots_all[-1]["total_portfolio"] if snapshots_all else 0
+    time_elapsed = time.time() - last_snap_ts
+    value_changed = abs(total_portfolio - last_snap_val) >= 0.50  # $0.50 threshold
+    if total_portfolio > 0 and (value_changed or time_elapsed >= 60):
         _api_save_balance_snapshot(total_portfolio)
 
     # 24h change from balance snapshots
@@ -526,7 +529,7 @@ async def dashboard_chart(
         if trade_points:
             points = trade_points
 
-    # PnL chart mode: cumulative realized PnL over time
+    # PnL chart mode: cumulative realized PnL + current unrealized PnL
     if mode == "pnl":
         trades = safe_json_read(TRADE_HISTORY_FILE, [])
         trades.sort(key=lambda t: t.get("closed_at", 0))
@@ -539,24 +542,80 @@ async def dashboard_chart(
                 continue
             cumulative += t.get("pnl_usd", 0)
             pnl_points.append({"timestamp": closed_at, "value": round(cumulative, 2)})
-        if not pnl_points:
-            pnl_points = [{"timestamp": time.time(), "value": round(cumulative, 2)}]
+
+        # Add current point including unrealized PnL from open positions
+        current_unrealized = 0.0
+        pos_data = safe_json_read(POSITIONS_FILE, {})
+        for pid, p in pos_data.items():
+            if p.get("is_open", False):
+                symbol = p.get("symbol", "")
+                entry = p.get("entry_price", 0)
+                side = p.get("side", "LONG")
+                size = p.get("size_usd", 0)
+                price = await asyncio.to_thread(_get_chainlink_price, symbol)
+                if price and entry > 0 and size > 0:
+                    if side == "LONG":
+                        current_unrealized += (price - entry) / entry * size
+                    else:
+                        current_unrealized += (entry - price) / entry * size
+                else:
+                    current_unrealized += p.get("unrealized_pnl", 0)
+
+        # Always add a "now" point so chart extends to current time
+        now_value = round(cumulative + current_unrealized, 2)
+        pnl_points.append({"timestamp": time.time(), "value": now_value})
+
+        if len(pnl_points) == 1:
+            # Need at least 2 points — add a zero-start point at cutoff
+            pnl_points.insert(0, {"timestamp": cutoff, "value": round(cumulative, 2)})
+
         return {"period": period, "points": pnl_points}
 
-    # Always return at least the current balance point so chart is never empty
-    if not points:
-        current_total = 0.0
-        for wid, acct in accounts.items():
-            current_total += await asyncio.to_thread(_get_usdc_balance, acct)
-        positions_data = safe_json_read(POSITIONS_FILE, {})
-        for pid, p in positions_data.items():
-            if p.get("is_open", False):
-                lev = p.get("leverage", 1)
-                size = p.get("size_usd", 0)
-                current_total += size / lev if lev > 0 else size
-                current_total += p.get("unrealized_pnl", 0)
-        if current_total > 0:
-            points = [{"timestamp": time.time(), "value": round(current_total, 2)}]
+    # Compute live portfolio value for the "now" endpoint
+    live_total = 0.0
+    for wid, acct in accounts.items():
+        live_total += await asyncio.to_thread(_get_usdc_balance, acct)
+    positions_data = safe_json_read(POSITIONS_FILE, {})
+    for pid, p in positions_data.items():
+        if p.get("is_open", False):
+            lev = p.get("leverage", 1)
+            size = p.get("size_usd", 0)
+            live_total += size / lev if lev > 0 else size
+            # Use live price for accuracy
+            symbol = p.get("symbol", "")
+            entry = p.get("entry_price", 0)
+            side = p.get("side", "LONG")
+            price = await asyncio.to_thread(_get_chainlink_price, symbol)
+            if price and entry > 0 and size > 0:
+                if side == "LONG":
+                    live_total += (price - entry) / entry * size
+                else:
+                    live_total += (entry - price) / entry * size
+            else:
+                live_total += p.get("unrealized_pnl", 0)
+    if bx_client:
+        try:
+            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
+            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
+            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
+            live_total += bx_bal
+            for bp in bx_positions:
+                live_total += float(bp.get("margin", 0))
+                live_total += float(bp.get("unrealizedPNL", 0))
+        except Exception:
+            pass
+
+    # Always append a live "now" point so chart reflects current state
+    if live_total > 0:
+        now_point = {"timestamp": time.time(), "value": round(live_total, 2)}
+        if points:
+            # Replace last point if it's within 30s (avoid duplicates)
+            if time.time() - points[-1]["timestamp"] < 30:
+                points[-1] = now_point
+            else:
+                points.append(now_point)
+        else:
+            points = [now_point]
 
     return {
         "period": period,
