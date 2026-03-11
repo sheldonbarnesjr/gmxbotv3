@@ -32,7 +32,7 @@ from open import (
 from state_io import atomic_json_write
 
 BALANCE_SNAPSHOTS_FILE = "json/balance_snapshots.json"
-MAX_SNAPSHOT_AGE_HOURS = 48
+MAX_SNAPSHOT_AGE_HOURS = 24 * 90  # 90 days of history
 
 
 class WalletMixin:

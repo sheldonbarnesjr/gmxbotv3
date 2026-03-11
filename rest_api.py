@@ -260,14 +260,31 @@ async def dashboard(token: str = Depends(verify_api_key)):
     for wid, acct in accounts.items():
         free_usdc += await asyncio.to_thread(_get_usdc_balance, acct)
 
-    # Calculate deployed collateral + unrealized PnL from on-chain
+    # Calculate deployed collateral + unrealized PnL from positions.json
+    # (more reliable than on-chain fetch which can fail silently)
     deployed_collateral = 0.0
     unrealized_pnl = 0.0
-    for wid, acct in accounts.items():
-        chain_positions = await _fetch_chain_positions(acct)
-        for cp in chain_positions:
-            deployed_collateral += cp.collateral_amount
-            unrealized_pnl += cp.unrealized_pnl
+    positions = safe_json_read(POSITIONS_FILE, {})
+    for pid, p in positions.items():
+        if p.get("is_open", False):
+            size = p.get("size_usd", 0)
+            lev = p.get("leverage", 1)
+            collateral = size / lev if lev > 0 else size
+            deployed_collateral += collateral
+
+            # Get live price for PnL calculation
+            symbol = p.get("symbol", "")
+            entry = p.get("entry_price", 0)
+            side = p.get("side", "LONG")
+            price = await asyncio.to_thread(_get_chainlink_price, symbol)
+            if price and entry > 0 and size > 0:
+                if side == "LONG":
+                    unrealized_pnl += (price - entry) / entry * size
+                else:
+                    unrealized_pnl += (entry - price) / entry * size
+            else:
+                # Fallback to stored PnL
+                unrealized_pnl += p.get("unrealized_pnl", 0)
 
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
@@ -307,15 +324,50 @@ async def dashboard_chart(
     period: str = Query("24h"),
     token: str = Depends(verify_api_key),
 ):
-    """Portfolio chart data from balance snapshots."""
+    """Portfolio chart data from balance snapshots + trade history."""
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
 
     # Filter by period
-    period_hours = {"1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720}.get(period, 24)
+    period_hours = {"1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720, "all": 999999}.get(period, 24)
     cutoff = time.time() - (period_hours * 3600)
     filtered = [s for s in snapshots if s["timestamp"] >= cutoff]
 
     points = [{"timestamp": s["timestamp"], "value": s["total_portfolio"]} for s in filtered]
+
+    # If we don't have enough snapshot data, build from trade history
+    if len(points) < 3 and period in ("7d", "30d", "all"):
+        trades = safe_json_read(TRADE_HISTORY_FILE, [])
+        trades.sort(key=lambda t: t.get("closed_at", 0))
+
+        # Get current portfolio value as the end point
+        current_total = 0.0
+        for wid, acct in accounts.items():
+            current_total += await asyncio.to_thread(_get_usdc_balance, acct)
+        positions = safe_json_read(POSITIONS_FILE, {})
+        for pid, p in positions.items():
+            if p.get("is_open", False):
+                size = p.get("size_usd", 0)
+                lev = p.get("leverage", 1)
+                current_total += size / lev if lev > 0 else size
+                current_total += p.get("unrealized_pnl", 0)
+
+        # Walk backwards from current total using trade PnL
+        trade_points = []
+        running_total = current_total
+        trade_points.append({"timestamp": time.time(), "value": round(running_total, 2)})
+
+        for t in reversed(trades):
+            closed_at = t.get("closed_at", 0)
+            if closed_at < cutoff:
+                break
+            pnl = t.get("pnl_usd", 0)
+            running_total -= pnl  # subtract PnL to get value before this trade
+            trade_points.append({"timestamp": closed_at, "value": round(running_total, 2)})
+
+        trade_points.reverse()
+        # Merge: use trade-derived points where snapshots are missing
+        if trade_points:
+            points = trade_points
 
     return {
         "period": period,
@@ -470,23 +522,47 @@ async def close_position(position_id: str, token: str = Depends(verify_api_key))
 
 def _format_trade(t: dict) -> dict:
     """Format a trade record for API response."""
+    # Format tp_details: list of {price, pct, pnl}
+    raw_tp = t.get("tp_details") or []
+    tp_details = []
+    for tp in raw_tp:
+        if isinstance(tp, dict):
+            tp_details.append({
+                "price": tp.get("price", 0),
+                "pct": tp.get("pct", tp.get("percentage", 0)),
+                "pnl": tp.get("pnl", 0),
+            })
+
+    # Format sl_details
+    raw_sl = t.get("sl_details")
+    sl_details = None
+    if isinstance(raw_sl, dict):
+        sl_details = {
+            "price": raw_sl.get("price", 0),
+            "pct": raw_sl.get("pct", raw_sl.get("percentage", 0)),
+            "pnl": raw_sl.get("pnl", 0),
+        }
+
     return {
         "id": t.get("id", ""),
         "symbol": t.get("symbol", ""),
         "side": t.get("side", ""),
-        "entry_price": t.get("entry_price", 0),
-        "exit_price": t.get("exit_price", 0),
-        "size_usd": t.get("size_usd", 0),
-        "leverage": t.get("leverage", 0),
-        "duration_hours": t.get("duration_hours", 0),
-        "pnl_usd": t.get("pnl_usd", 0),
-        "pnl_percentage": t.get("pnl_percentage", 0),
+        "entry_price": float(t.get("entry_price", 0)),
+        "exit_price": float(t.get("exit_price", 0)),
+        "size_usd": float(t.get("size_usd", 0)),
+        "leverage": float(t.get("leverage", 0)),
+        "duration_hours": float(t.get("duration_hours", 0)),
+        "pnl_usd": float(t.get("pnl_usd", 0)),
+        "pnl_percentage": float(t.get("pnl_percentage", 0)),
         "exit_reason": t.get("exit_reason", ""),
         "opened_at": t.get("opened_at", 0),
         "closed_at": t.get("closed_at", 0),
         "wallet_id": t.get("wallet_id", 0),
         "exchange": t.get("exchange", "gmx"),
         "tp_hits": t.get("tp_hits", 0),
+        "tp_details": tp_details if tp_details else None,
+        "sl_details": sl_details,
+        "unfilled_targets": t.get("unfilled_targets"),
     }
 
 
