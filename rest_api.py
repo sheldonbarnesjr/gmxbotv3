@@ -328,7 +328,17 @@ async def dashboard_chart(
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
 
     # Filter by period
-    period_hours = {"1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720, "all": 999999}.get(period, 24)
+    # Calculate YTD hours
+    import datetime
+    now = datetime.datetime.now()
+    jan1 = datetime.datetime(now.year, 1, 1)
+    ytd_hours = (now - jan1).total_seconds() / 3600
+
+    period_map = {
+        "1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720,
+        "90d": 2160, "ytd": ytd_hours, "365d": 8760, "all": 999999,
+    }
+    period_hours = period_map.get(period, 24)
     cutoff = time.time() - (period_hours * 3600)
     filtered = [s for s in snapshots if s["timestamp"] >= cutoff]
 
