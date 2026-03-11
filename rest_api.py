@@ -21,11 +21,15 @@ import hashlib
 import logging
 import asyncio
 import secrets
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -633,6 +637,297 @@ async def trade_stats(
         "best": max((t["pnl_usd"] for t in trades), default=0),
         "worst": min((t["pnl_usd"] for t in trades), default=0),
     }
+
+
+@app.get("/api/v1/trades/pdf")
+async def trades_pdf(token: str = Depends(verify_api_key)):
+    """Generate and return a PDF trade history report."""
+    all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
+    trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
+
+    if not trades:
+        raise HTTPException(404, "No trades to export")
+
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise HTTPException(500, "FPDF not installed on server")
+
+    pdf_path = await asyncio.to_thread(_generate_trade_pdf, trades)
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename="trade_history.pdf",
+        background=None,
+    )
+
+
+def _generate_trade_pdf(trades: list) -> str:
+    """Build PDF with 3-column PnL summary + 3-column trade grid.
+
+    Standalone version of analytics._generate_trade_pdf for REST API use.
+    """
+    from fpdf import FPDF
+
+    ET = ZoneInfo("America/New_York")
+    LMARGIN = 10
+    PAGE_W = 210
+    RMARGIN = 10
+    USABLE_W = PAGE_W - LMARGIN - RMARGIN
+    COL_W = USABLE_W / 3
+    LINE_H = 5
+
+    # ── Time buckets ──
+    now = datetime.now(ET)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_cutoff = int(today_start.timestamp())
+    now_ts = int(time.time())
+    month_cutoff = now_ts - 30 * 86400
+
+    def _bucket(tlist):
+        if not tlist:
+            return {"pnl": 0.0, "cnt": 0, "wins": 0}
+        pnl = sum(t.get("pnl_usd", 0) for t in tlist)
+        w = sum(1 for t in tlist if t.get("pnl_usd", 0) > 0)
+        return {"pnl": pnl, "cnt": len(tlist), "wins": w}
+
+    def _s(v):
+        return "+" if v >= 0 else "-"
+
+    buckets = []
+    for label, cutoff in [("Today", today_cutoff), ("30 Days", month_cutoff), ("All Time", 0)]:
+        b = [t for t in trades if t.get("closed_at", 0) >= cutoff]
+        stats = _bucket(b)
+        sym_stats = {}
+        for sym in ("BTC", "ETH"):
+            sym_stats[sym] = _bucket([t for t in b if t.get("symbol") == sym])
+        losses = stats["cnt"] - stats["wins"]
+        wr = f"{stats['wins'] / stats['cnt'] * 100:.0f}%" if stats["cnt"] else "-"
+        buckets.append({"label": label, "stats": stats, "sym": sym_stats,
+                        "wr": wr, "losses": losses})
+
+    # ── PDF setup ──
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # ── Title ──
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Trade Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, f"Generated: {now.strftime('%b %d, %Y %I:%M %p ET')}",
+             new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(4)
+
+    # ── 3-Column Summary ──
+    top_y = pdf.get_y()
+    SUMMARY_H = 6 + LINE_H * 5 + 2
+    SGAP = 3
+
+    for col_idx, bk in enumerate(buckets):
+        x = LMARGIN + col_idx * COL_W + (SGAP / 2)
+        box_w = COL_W - SGAP
+        y = top_y
+        s = bk["stats"]
+        pnl_sign = _s(s["pnl"])
+
+        pdf.set_fill_color(245, 245, 248)
+        pdf.set_draw_color(220, 220, 220)
+        pdf.rect(x, y, box_w, SUMMARY_H, style="DF")
+
+        cx = x + 2
+        pdf.set_xy(cx, y + 1)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(box_w - 4, 5, bk["label"])
+        y += 7
+
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(50, 50, 50)
+        lines = [
+            f"Trades: {s['cnt']}  ({s['wins']}W / {bk['losses']}L)",
+            f"Win Rate: {bk['wr']}",
+            f"Net PnL: {pnl_sign}${abs(s['pnl']):,.2f}",
+        ]
+        for sym in ("BTC", "ETH"):
+            ss = bk["sym"][sym]
+            wr = f"{ss['wins']}/{ss['cnt']}" if ss["cnt"] else "-"
+            lines.append(f"{sym}: {_s(ss['pnl'])}${abs(ss['pnl']):,.2f}  ({wr})")
+
+        for line in lines:
+            pdf.set_xy(cx, y)
+            pdf.cell(box_w - 4, LINE_H, line)
+            y += LINE_H
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(top_y + SUMMARY_H + 5)
+
+    # ── 3-Column Trade Grid ──
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 7, f"Trades ({len(trades)})", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    PAD = 2
+    GAP = 3
+    CARD_INNER_W = COL_W - GAP
+    TP_LINE_H = 3.5
+    row_y = pdf.get_y()
+
+    def _card_h(trade):
+        base = PAD * 2 + 4 * 5
+        tp_count = len(trade.get("tp_details", []))
+        sl_count = 1 if trade.get("sl_details") else 0
+        unfilled_count = len(trade.get("unfilled_targets", []))
+        return base + TP_LINE_H * (tp_count + sl_count + unfilled_count)
+
+    i = 0
+    while i < len(trades):
+        row_cards = trades[i:i+3]
+        max_h = max(_card_h(t) for t in row_cards)
+
+        if i > 0:
+            row_y += max_h + GAP
+        if row_y + max_h > pdf.h - 15:
+            pdf.add_page()
+            row_y = pdf.get_y()
+
+        for col, t in enumerate(row_cards):
+            card_h = max_h
+            x = LMARGIN + col * COL_W + (GAP / 2)
+            y = row_y
+
+            pnl = t.get("pnl_usd", 0)
+            pnl_sign = _s(pnl)
+            pct = t.get("pnl_percentage", 0)
+            lev = t.get("leverage", 0)
+            exch = t.get("exchange", "gmx").upper()
+            ts = t.get("closed_at", 0)
+            date_str = datetime.fromtimestamp(ts, tz=ET).strftime("%b %d, %I:%M %p") if ts else "Unknown"
+            entry_p = t.get("entry_price", 0)
+
+            pdf.set_draw_color(220, 220, 220)
+            pdf.rect(x, y, CARD_INNER_W, card_h)
+
+            if pnl >= 0:
+                pdf.set_fill_color(0, 160, 0)
+            else:
+                pdf.set_fill_color(210, 0, 0)
+            pdf.rect(x, y, 1.2, card_h, style="F")
+
+            cx = x + PAD + 1
+            cw = CARD_INNER_W - PAD * 2 - 1
+            cy = y + PAD
+
+            # Header
+            pdf.set_xy(cx, cy)
+            pdf.set_text_color(30, 30, 30)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.cell(cw, 4, f"#{i+col+1} {t.get('symbol', '?')} {t.get('side', '?')} {exch}")
+            cy += 4
+
+            # PnL
+            pdf.set_xy(cx, cy)
+            pdf.set_text_color(0, 140, 0) if pnl >= 0 else pdf.set_text_color(200, 0, 0)
+            pdf.set_font("Helvetica", "B", 7.5)
+            if pct != 0:
+                pct_sign = "+" if pct >= 0 else ""
+                pdf.cell(cw, 4, f"PnL: {pnl_sign}${abs(pnl):,.2f} ({pct_sign}{pct:.1f}%)")
+            else:
+                pdf.cell(cw, 4, f"PnL: {pnl_sign}${abs(pnl):,.2f}")
+            cy += 4
+
+            # Size
+            pdf.set_text_color(60, 60, 60)
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_xy(cx, cy)
+            size_usd = t.get("size_usd", 0)
+            if lev and lev > 0:
+                collateral = size_usd / lev
+                pdf.cell(cw, 4, f"Size: ${size_usd:,.2f} @ {lev:.0f}x  (${collateral:,.2f})")
+            else:
+                pdf.cell(cw, 4, f"Size: ${size_usd:,.2f}")
+            cy += 4
+
+            # Entry
+            if entry_p:
+                pdf.set_xy(cx, cy)
+                pdf.cell(cw, 4, f"Entry: ${entry_p:,.2f}")
+                cy += 4
+
+            # TP targets
+            tp_dets = t.get("tp_details", [])
+            for j, tp in enumerate(tp_dets, 1):
+                pdf.set_xy(cx, cy)
+                pdf.set_font("ZapfDingbats", "", 6)
+                pdf.set_text_color(0, 160, 0)
+                pdf.cell(3, TP_LINE_H, "4")
+                pdf.set_font("Helvetica", "", 6.5)
+                pdf.set_text_color(60, 60, 60)
+                p_str = f"Target {j}: ${tp.get('price', 0):,.2f}"
+                if "pct" in tp:
+                    p_str += f" (closed {tp['pct']:.0f}%)"
+                if "pnl" in tp:
+                    tp_pnl = tp["pnl"]
+                    p_str += f" {'+' if tp_pnl >= 0 else '-'}${abs(tp_pnl):,.2f}"
+                pdf.cell(cw - 3, TP_LINE_H, p_str)
+                cy += TP_LINE_H
+
+            # Trailing SL
+            sl_det = t.get("sl_details")
+            if sl_det:
+                pdf.set_xy(cx, cy)
+                pdf.set_font("ZapfDingbats", "", 6)
+                pdf.set_text_color(0, 160, 0)
+                pdf.cell(3, TP_LINE_H, "4")
+                sl_pnl = sl_det.get("pnl", 0)
+                pdf.set_font("Helvetica", "", 6.5)
+                pdf.set_text_color(60, 60, 60)
+                s_str = f"Trailing SL: ${sl_det.get('price', 0):,.2f}"
+                if sl_det.get("pct") and sl_det["pct"] > 0:
+                    s_str += f" (closed {sl_det['pct']:.0f}%)"
+                s_str += f" {'+' if sl_pnl >= 0 else '-'}${abs(sl_pnl):,.2f}"
+                pdf.cell(cw - 3, TP_LINE_H, s_str)
+                cy += TP_LINE_H
+
+            # Unfilled targets
+            unfilled = t.get("unfilled_targets", [])
+            tp_count = len(tp_dets)
+            for k, uf in enumerate(unfilled, tp_count + 1):
+                pdf.set_xy(cx, cy)
+                pdf.set_font("ZapfDingbats", "", 6)
+                pdf.set_text_color(210, 0, 0)
+                pdf.cell(3, TP_LINE_H, "8")
+                pdf.set_font("Helvetica", "", 6.5)
+                pdf.set_text_color(150, 150, 150)
+                pdf.cell(cw - 3, TP_LINE_H, f"Target {k}: ${uf.get('price', 0):,.2f} (Never Hit)")
+                cy += TP_LINE_H
+
+            # Date + Duration
+            open_ts = t.get("opened_at", 0)
+            open_str = datetime.fromtimestamp(open_ts, tz=ET).strftime("%m/%d %I:%M%p") if open_ts and open_ts > 1_000_000_000 else "?"
+            close_str = datetime.fromtimestamp(ts, tz=ET).strftime("%m/%d %I:%M%p") if ts and ts > 1_000_000_000 else "?"
+            dur_h = t.get("duration_hours", 0)
+            if dur_h >= 24:
+                dur_str = f"{dur_h / 24:.1f}d"
+            elif dur_h >= 1:
+                dur_str = f"{dur_h:.1f}h"
+            else:
+                dur_str = f"{max(dur_h * 60, 1):.0f}m"
+            pdf.set_text_color(130, 130, 130)
+            pdf.set_font("Helvetica", "", 5.5)
+            pdf.set_xy(cx, cy)
+            pdf.cell(cw, 4, f"{open_str} - {close_str}  ({dur_str})", align="C")
+
+        i += len(row_cards)
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, prefix="gmx_trades_")
+    pdf.output(tmp.name)
+    return tmp.name
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
