@@ -55,12 +55,13 @@ API_KEYS_FILE = "json/api_keys.json"
 cfg = None
 w3 = None
 accounts = {}  # {wallet_id: Account}
+bx_client = None  # BitunixClient (if configured)
 start_time = time.time()
 
 
 def _init_web3_and_accounts():
     """Initialize Web3 connection and wallet accounts."""
-    global cfg, w3, accounts
+    global cfg, w3, accounts, bx_client
 
     cfg = load_config()
 
@@ -78,6 +79,15 @@ def _init_web3_and_accounts():
         accounts[3] = Account.from_key(cfg.private_key_3)
     if cfg.private_key_4:
         accounts[4] = Account.from_key(cfg.private_key_4)
+
+    # Initialize Bitunix client if configured
+    if cfg.bitunix_api_key and cfg.bitunix_secret_key:
+        try:
+            from bitunix_api import BitunixClient
+            bx_client = BitunixClient(cfg.bitunix_api_key, cfg.bitunix_secret_key)
+            logger.info("Bitunix client initialized")
+        except Exception as e:
+            logger.warning(f"Failed to init Bitunix client: {e}")
 
     logger.info(f"Initialized {len(accounts)} wallet(s), Web3 connected: {w3.is_connected()}")
 
@@ -289,6 +299,21 @@ async def dashboard(token: str = Depends(verify_api_key)):
             else:
                 # Fallback to stored PnL
                 unrealized_pnl += p.get("unrealized_pnl", 0)
+
+    # Include Bitunix balance + positions
+    if bx_client:
+        try:
+            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
+            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
+            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
+            free_usdc += bx_bal
+            for bp in bx_positions:
+                bx_margin = float(bp.get("margin", 0))
+                bx_pnl = float(bp.get("unrealizedPNL", 0))
+                deployed_collateral += bx_margin
+                unrealized_pnl += bx_pnl
+        except Exception as e:
+            logger.warning(f"Bitunix balance fetch failed: {e}")
 
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
@@ -949,16 +974,28 @@ async def wallet_info(token: str = Depends(verify_api_key)):
             "usdc_balance": round(usdc, 2),
         })
 
+    # Include Bitunix balance
+    bx_free = 0.0
+    if bx_client:
+        try:
+            from bitunix_executor import get_bitunix_balance
+            bx_free = await asyncio.to_thread(get_bitunix_balance, bx_client)
+        except Exception:
+            pass
+
     # Total portfolio includes deployed
     deployed = 0.0
-    for wid, acct in accounts.items():
-        chain_positions = await _fetch_chain_positions(acct)
-        for cp in chain_positions:
-            deployed += cp.collateral_amount + cp.unrealized_pnl
+    positions = safe_json_read(POSITIONS_FILE, {})
+    for pid, p in positions.items():
+        if p.get("is_open", False):
+            size = p.get("size_usd", 0)
+            lev = p.get("leverage", 1)
+            deployed += size / lev if lev > 0 else size
 
     return {
-        "total_portfolio": round(total_free + deployed, 2),
+        "total_portfolio": round(total_free + bx_free + deployed, 2),
         "free_usdc": round(total_free, 2),
+        "free_usdc_bitunix": round(bx_free, 2),
         "wallets": wallets,
     }
 
