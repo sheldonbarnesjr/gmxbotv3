@@ -418,6 +418,21 @@ class AnalyticsMixin:
             f"PnL=${trade.pnl_usd:,.2f} ({trade.pnl_percentage:+.1f}%) [{exit_reason}]"
         )
 
+        # Save balance snapshot on trade close for chart accuracy
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._snapshot_after_trade())
+        except RuntimeError:
+            pass
+
+    async def _snapshot_after_trade(self):
+        """Save a balance snapshot after a trade closes."""
+        try:
+            total = await self._get_total_portfolio_value()
+            self._save_balance_snapshot(total)
+        except Exception as e:
+            self.logger.debug(f"Post-trade snapshot failed: {e}")
+
     def _save_trade_history(self):
         """Persist trade history to disk as JSON (atomic write with backup)."""
         try:

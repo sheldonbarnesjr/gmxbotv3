@@ -267,6 +267,61 @@ class WalletMixin:
         change_pct = (change_usd / old_total) * 100
         return change_usd, change_pct, True
 
+    def backfill_snapshots_from_trades(self, current_total: float):
+        """Reconstruct balance history from trade_history.json if snapshots are sparse.
+
+        Walks backwards from current portfolio value, subtracting each trade's PnL
+        to estimate the balance at each trade's close time.  Merges with existing
+        snapshots (avoids duplicate timestamps within 60s).
+        """
+        trade_file = "json/trade_history.json"
+        if not os.path.exists(trade_file):
+            return
+
+        try:
+            with open(trade_file, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            return
+
+        if not trades:
+            return
+
+        trades.sort(key=lambda t: t.get("closed_at", 0))
+        existing = self._load_balance_snapshots()
+        existing_ts = {int(s["timestamp"]) for s in existing}
+
+        new_points = []
+        running = current_total
+
+        # Add current value as most recent point
+        new_points.append({"timestamp": time.time(), "total_portfolio": round(running, 2)})
+
+        for t in reversed(trades):
+            closed_at = t.get("closed_at", 0)
+            if closed_at <= 0:
+                continue
+            pnl = t.get("pnl_usd", 0)
+            running -= pnl
+            # Skip if we already have a snapshot within 60s of this timestamp
+            if any(abs(closed_at - ts) < 60 for ts in existing_ts):
+                continue
+            new_points.append({"timestamp": closed_at, "total_portfolio": round(running, 2)})
+
+        # Merge and sort
+        all_snapshots = existing + new_points
+        all_snapshots.sort(key=lambda s: s["timestamp"])
+
+        # Prune old entries
+        cutoff = time.time() - (MAX_SNAPSHOT_AGE_HOURS * 3600)
+        all_snapshots = [s for s in all_snapshots if s["timestamp"] >= cutoff]
+
+        try:
+            atomic_json_write(BALANCE_SNAPSHOTS_FILE, all_snapshots)
+            self.logger.info(f"Backfilled {len(new_points)} snapshot points from trade history")
+        except Exception as e:
+            self.logger.warning(f"Failed to save backfilled snapshots: {e}")
+
     async def _fund_wallet(self, target_wid: int, amount_needed: float):
         """Pull USDC from other wallets into the target wallet.
 

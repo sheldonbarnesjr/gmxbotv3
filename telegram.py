@@ -2065,14 +2065,17 @@ class CoreTelegramMixin:
                 await asyncio.sleep(60)
                 _hour_counter += 1
 
-                # Hourly tasks: balance snapshot + position sync (every 60 iterations)
-                if _hour_counter >= 60:
-                    _hour_counter = 0
+                # Balance snapshot every 15 min
+                if _hour_counter % 15 == 0 and _hour_counter > 0:
                     try:
                         total_portfolio = await self._get_total_portfolio_value()
                         self._save_balance_snapshot(total_portfolio)
                     except Exception as e:
                         self.logger.debug(f"Balance snapshot failed: {e}")
+
+                # Position sync every hour
+                if _hour_counter >= 60:
+                    _hour_counter = 0
                     try:
                         async with self._signal_lock:
                             await self._sync_on_chain_positions()

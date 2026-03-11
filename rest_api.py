@@ -56,6 +56,18 @@ cfg = None
 w3 = None
 accounts = {}  # {wallet_id: Account}
 bx_client = None  # BitunixClient (if configured)
+
+
+def _api_save_balance_snapshot(total: float):
+    """Save a balance snapshot from the REST API (standalone, no bot instance)."""
+    snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
+    snapshots.append({"timestamp": time.time(), "total_portfolio": round(total, 2)})
+    cutoff = time.time() - (90 * 24 * 3600)
+    snapshots = [s for s in snapshots if s["timestamp"] >= cutoff]
+    try:
+        atomic_json_write(BALANCE_SNAPSHOTS_FILE, snapshots)
+    except Exception:
+        pass
 start_time = time.time()
 
 
@@ -222,7 +234,64 @@ async def lifespan(app: FastAPI):
         print(f"  YOUR API KEY (save this for the iOS app):")
         print(f"  {key}")
         print(f"{'='*60}\n")
+    # Backfill balance snapshots from trade history if sparse
+    _backfill_snapshots_if_needed()
     yield
+
+
+def _backfill_snapshots_if_needed():
+    """Reconstruct balance history from trades if snapshots are sparse."""
+    snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
+    if len(snapshots) >= 20:
+        return  # enough data already
+
+    trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    if not trades:
+        return
+
+    trades.sort(key=lambda t: t.get("closed_at", 0))
+
+    # Estimate current total from wallets
+    current_total = 0.0
+    try:
+        for wid, acct in accounts.items():
+            current_total += _get_usdc_balance(acct)
+    except Exception:
+        return
+
+    positions = safe_json_read(POSITIONS_FILE, {})
+    for pid, p in positions.items():
+        if p.get("is_open", False):
+            lev = p.get("leverage", 1)
+            size = p.get("size_usd", 0)
+            current_total += size / lev if lev > 0 else size
+            current_total += p.get("unrealized_pnl", 0)
+
+    existing_ts = {int(s["timestamp"]) for s in snapshots}
+    new_points = []
+    running = current_total
+    new_points.append({"timestamp": time.time(), "total_portfolio": round(running, 2)})
+
+    for t in reversed(trades):
+        closed_at = t.get("closed_at", 0)
+        if closed_at <= 0:
+            continue
+        pnl = t.get("pnl_usd", 0)
+        running -= pnl
+        if any(abs(closed_at - ts) < 60 for ts in existing_ts):
+            continue
+        new_points.append({"timestamp": closed_at, "total_portfolio": round(running, 2)})
+
+    all_snapshots = snapshots + new_points
+    all_snapshots.sort(key=lambda s: s["timestamp"])
+    cutoff = time.time() - (90 * 24 * 3600)
+    all_snapshots = [s for s in all_snapshots if s["timestamp"] >= cutoff]
+
+    try:
+        atomic_json_write(BALANCE_SNAPSHOTS_FILE, all_snapshots)
+        logger.info(f"Backfilled {len(new_points)} snapshot points from trade history")
+    except Exception as e:
+        logger.warning(f"Failed to backfill snapshots: {e}")
 
 
 app = FastAPI(
@@ -351,6 +420,7 @@ async def dashboard(token: str = Depends(verify_api_key)):
 @app.get("/api/v1/dashboard/chart")
 async def dashboard_chart(
     period: str = Query("24h"),
+    mode: str = Query("balance"),
     token: str = Depends(verify_api_key),
 ):
     """Portfolio chart data from balance snapshots + trade history."""
@@ -374,7 +444,7 @@ async def dashboard_chart(
     points = [{"timestamp": s["timestamp"], "value": s["total_portfolio"]} for s in filtered]
 
     # If we don't have enough snapshot data, build from trade history
-    if len(points) < 3 and period in ("7d", "30d", "all"):
+    if len(points) < 10:
         trades = safe_json_read(TRADE_HISTORY_FILE, [])
         trades.sort(key=lambda t: t.get("closed_at", 0))
 
@@ -407,6 +477,23 @@ async def dashboard_chart(
         # Merge: use trade-derived points where snapshots are missing
         if trade_points:
             points = trade_points
+
+    # PnL chart mode: cumulative realized PnL over time
+    if mode == "pnl":
+        trades = safe_json_read(TRADE_HISTORY_FILE, [])
+        trades.sort(key=lambda t: t.get("closed_at", 0))
+        pnl_points = []
+        cumulative = 0.0
+        for t in trades:
+            closed_at = t.get("closed_at", 0)
+            if closed_at < cutoff or closed_at <= 0:
+                cumulative += t.get("pnl_usd", 0)
+                continue
+            cumulative += t.get("pnl_usd", 0)
+            pnl_points.append({"timestamp": closed_at, "value": round(cumulative, 2)})
+        if not pnl_points:
+            pnl_points = [{"timestamp": time.time(), "value": round(cumulative, 2)}]
+        return {"period": period, "points": pnl_points}
 
     return {
         "period": period,
@@ -545,6 +632,15 @@ async def close_position(position_id: str, token: str = Depends(verify_api_key))
             Web3.to_checksum_address(cfg.exchange_router),
         )
 
+        # Save balance snapshot after close
+        try:
+            total = 0.0
+            for wid, acct in accounts.items():
+                total += await asyncio.to_thread(_get_usdc_balance, acct)
+            _api_save_balance_snapshot(total)
+        except Exception:
+            pass
+
         return {
             "success": True,
             "message": f"Close order submitted for {symbol} {p.get('side', '')}",
@@ -645,22 +741,51 @@ async def trade_stats(
 
     if not trades:
         return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0,
-                "avg_win": 0, "avg_loss": 0, "pnl": 0, "best": 0, "worst": 0}
+                "avg_win": 0, "avg_loss": 0, "pnl": 0, "best": 0, "worst": 0,
+                "avg_tp_hits": 0, "avg_duration_hours": 0, "profit_factor": 0,
+                "avg_pnl": 0, "avg_leverage": 0}
 
     wins = [t for t in trades if t.get("pnl_usd", 0) > 0]
     losses = [t for t in trades if t.get("pnl_usd", 0) < 0]
     total_pnl = sum(t.get("pnl_usd", 0) for t in trades)
 
+    # Duration: compute from opened_at / closed_at
+    durations = []
+    for t in trades:
+        opened = t.get("opened_at", 0)
+        closed = t.get("closed_at", 0)
+        if opened > 0 and closed > opened:
+            durations.append((closed - opened) / 3600)
+    avg_duration = sum(durations) / len(durations) if durations else 0
+
+    # TP hits
+    tp_hits_list = [len(t.get("tp_details", []) or []) for t in trades]
+    avg_tp_hits = sum(tp_hits_list) / len(tp_hits_list) if tp_hits_list else 0
+
+    # Leverage
+    leverages = [t.get("leverage", 0) for t in trades if t.get("leverage", 0) > 0]
+    avg_leverage = sum(leverages) / len(leverages) if leverages else 0
+
+    # Profit factor
+    gross_profit = sum(t["pnl_usd"] for t in wins) if wins else 0
+    gross_loss = abs(sum(t["pnl_usd"] for t in losses)) if losses else 0
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0
+
     return {
-        "win_rate": len(wins) / len(trades) * 100,
+        "win_rate": round(len(wins) / len(trades) * 100, 1),
         "wins": len(wins),
         "losses": len(losses),
         "total": len(trades),
-        "avg_win": sum(t["pnl_usd"] for t in wins) / len(wins) if wins else 0,
-        "avg_loss": sum(t["pnl_usd"] for t in losses) / len(losses) if losses else 0,
+        "avg_win": round(sum(t["pnl_usd"] for t in wins) / len(wins), 2) if wins else 0,
+        "avg_loss": round(sum(t["pnl_usd"] for t in losses) / len(losses), 2) if losses else 0,
         "pnl": round(total_pnl, 2),
-        "best": max((t["pnl_usd"] for t in trades), default=0),
-        "worst": min((t["pnl_usd"] for t in trades), default=0),
+        "best": round(max((t["pnl_usd"] for t in trades), default=0), 2),
+        "worst": round(min((t["pnl_usd"] for t in trades), default=0), 2),
+        "avg_tp_hits": round(avg_tp_hits, 1),
+        "avg_duration_hours": round(avg_duration, 1),
+        "profit_factor": profit_factor,
+        "avg_pnl": round(total_pnl / len(trades), 2),
+        "avg_leverage": round(avg_leverage, 1),
     }
 
 
