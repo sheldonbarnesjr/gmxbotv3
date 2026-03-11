@@ -426,6 +426,12 @@ async def dashboard(token: str = Depends(verify_api_key)):
     free_usdc = free_usdc_gmx + free_usdc_bitunix
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
+    # Auto-save balance snapshot (throttled: max once per 15 min)
+    snapshots_all = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
+    last_snap_ts = snapshots_all[-1]["timestamp"] if snapshots_all else 0
+    if time.time() - last_snap_ts >= 900 and total_portfolio > 0:  # 15 min
+        _api_save_balance_snapshot(total_portfolio)
+
     # 24h change from balance snapshots
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     change_24h_usd = 0.0
@@ -536,6 +542,21 @@ async def dashboard_chart(
         if not pnl_points:
             pnl_points = [{"timestamp": time.time(), "value": round(cumulative, 2)}]
         return {"period": period, "points": pnl_points}
+
+    # Always return at least the current balance point so chart is never empty
+    if not points:
+        current_total = 0.0
+        for wid, acct in accounts.items():
+            current_total += await asyncio.to_thread(_get_usdc_balance, acct)
+        positions_data = safe_json_read(POSITIONS_FILE, {})
+        for pid, p in positions_data.items():
+            if p.get("is_open", False):
+                lev = p.get("leverage", 1)
+                size = p.get("size_usd", 0)
+                current_total += size / lev if lev > 0 else size
+                current_total += p.get("unrealized_pnl", 0)
+        if current_total > 0:
+            points = [{"timestamp": time.time(), "value": round(current_total, 2)}]
 
     return {
         "period": period,
