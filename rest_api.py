@@ -426,13 +426,11 @@ async def dashboard(token: str = Depends(verify_api_key)):
     free_usdc = free_usdc_gmx + free_usdc_bitunix
     total_portfolio = free_usdc + deployed_collateral + unrealized_pnl
 
-    # Auto-save balance snapshot — save if balance changed meaningfully or every 60s
+    # Auto-save balance snapshot every 5 minutes
     snapshots_all = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     last_snap_ts = snapshots_all[-1]["timestamp"] if snapshots_all else 0
-    last_snap_val = snapshots_all[-1]["total_portfolio"] if snapshots_all else 0
     time_elapsed = time.time() - last_snap_ts
-    value_changed = abs(total_portfolio - last_snap_val) >= 0.50  # $0.50 threshold
-    if total_portfolio > 0 and (value_changed or time_elapsed >= 60):
+    if total_portfolio > 0 and time_elapsed >= 300:
         _api_save_balance_snapshot(total_portfolio)
 
     # 24h change from balance snapshots
@@ -442,14 +440,18 @@ async def dashboard(token: str = Depends(verify_api_key)):
     has_24h_data = False
 
     if snapshots:
-        target_ts = time.time() - 86400
-        closest = min(snapshots, key=lambda s: abs(s["timestamp"] - target_ts))
-        if abs(closest["timestamp"] - target_ts) < 6 * 3600:
-            old_total = closest["total_portfolio"]
-            if old_total > 0:
-                change_24h_usd = total_portfolio - old_total
-                change_24h_pct = (change_24h_usd / old_total) * 100
-                has_24h_data = True
+        now = time.time()
+        oldest_snap = snapshots[0]["timestamp"]
+        # Only show 24h change if we have at least 20h of snapshot history
+        if now - oldest_snap >= 20 * 3600:
+            target_ts = now - 86400
+            closest = min(snapshots, key=lambda s: abs(s["timestamp"] - target_ts))
+            if abs(closest["timestamp"] - target_ts) < 3 * 3600:  # 3h tolerance
+                old_total = closest["total_portfolio"]
+                if old_total > 0:
+                    change_24h_usd = total_portfolio - old_total
+                    change_24h_pct = (change_24h_usd / old_total) * 100
+                    has_24h_data = True
 
     return {
         "total_portfolio": round(total_portfolio, 2),
