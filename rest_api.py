@@ -429,7 +429,7 @@ async def dashboard(token: str = Depends(verify_api_key)):
     # Auto-save balance snapshot (throttled: max once per 15 min)
     snapshots_all = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     last_snap_ts = snapshots_all[-1]["timestamp"] if snapshots_all else 0
-    if time.time() - last_snap_ts >= 900 and total_portfolio > 0:  # 15 min
+    if time.time() - last_snap_ts >= 300 and total_portfolio > 0:  # 5 min
         _api_save_balance_snapshot(total_portfolio)
 
     # 24h change from balance snapshots
