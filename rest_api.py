@@ -385,7 +385,7 @@ async def _fetch_all_live_positions() -> dict:
             # Use saved TPs if on-chain orders not found (they may have been filled)
             if not take_profits and saved.get("original_take_profits"):
                 take_profits = [
-                    {"price": tp.get("price", 0), "percentage": tp.get("close_pct", tp.get("percentage", 0))}
+                    {"price": tp.get("price", 0), "percentage": _close_pct_to_100(tp.get("close_pct", tp.get("percentage", 0)))}
                     for tp in saved["original_take_profits"]
                     if tp.get("price", 0) > 0
                 ]
@@ -463,7 +463,7 @@ async def _fetch_all_live_positions() -> dict:
                         "realized_pnl": saved.get("realized_pnl", 0),
                         "collateral_usd": round(margin, 2),
                         "take_profits": [
-                            {"price": tp.get("price", 0), "percentage": tp.get("close_pct", tp.get("percentage", 0))}
+                            {"price": tp.get("price", 0), "percentage": _close_pct_to_100(tp.get("close_pct", tp.get("percentage", 0)))}
                             for tp in saved.get("original_take_profits", [])
                             if tp.get("price", 0) > 0
                         ],
@@ -564,6 +564,57 @@ _connected_ws_clients: list[WebSocket] = []
 _last_notification_seq: int = 0  # track last broadcast notification seq
 
 
+# ── Notification format bridge ───────────────────────────────────────────────
+
+# Map backend categories to iOS NotificationType raw values
+_CATEGORY_TO_IOS_TYPE = {
+    "position_opened": "position_opened",
+    "position_closed": "position_closed",
+    "tp_hit": "target_reached",
+    "sl_moved": "stop_loss",
+    "sl_move_failed": "stop_loss",
+    "tp_sl_move_failed": "stop_loss",
+    "sl_missing": "stop_loss",
+    "trading_halted": "position_closed",
+    "trading_resumed": "position_opened",
+    "bot_online": "pnl_update",
+    "bot_offline": "pnl_update",
+    "signal_rejected": "pnl_update",
+    "signal_executing": "position_opened",
+    "signal_error": "stop_loss",
+    "mirror_error": "stop_loss",
+    "bitunix_error": "stop_loss",
+    "weekly_summary": "pnl_update",
+}
+
+
+def _format_notification_for_app(notif: dict) -> dict:
+    """Transform a raw backend notification into the format the iOS app expects.
+
+    Backend format:  {id: int, timestamp: float, message: str, category: str, priority: str}
+    iOS format:      {id: str, type: str, title: str, message: str, detail: str?, trade_id: str?, is_read: bool, created_at: float}
+    """
+    category = notif.get("category", "general")
+    ios_type = _CATEGORY_TO_IOS_TYPE.get(category, "pnl_update")
+    raw_message = notif.get("message", "")
+
+    # Extract title from first line, rest as detail
+    lines = raw_message.strip().split("\n")
+    title = lines[0] if lines else category.replace("_", " ").title()
+    detail = "\n".join(lines[1:]).strip() if len(lines) > 1 else None
+
+    return {
+        "id": str(notif.get("id", "")),
+        "type": ios_type,
+        "title": title,
+        "message": raw_message,
+        "detail": detail,
+        "trade_id": None,
+        "is_read": False,
+        "created_at": notif.get("timestamp", 0),
+    }
+
+
 async def _get_positions_payload() -> dict:
     """Build the positions_update payload, reusing existing position logic."""
     positions = await _fetch_all_live_positions()
@@ -644,7 +695,7 @@ async def _ws_notification_broadcast_loop():
             _last_notification_seq = new_seq
             # Notifications come newest-first from get_notifications; reverse for chronological send
             for notif in reversed(result["notifications"]):
-                msg = {"type": "notification", "data": notif}
+                msg = {"type": "notification", "data": _format_notification_for_app(notif)}
                 for client in _connected_ws_clients[:]:
                     try:
                         await client.send_json(msg)
@@ -792,7 +843,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     # Send recent notifications so the app catches up
     try:
         result = app_notifications.get_notifications(since_seq=0, limit=20)
-        await websocket.send_json({"type": "notifications_snapshot", "data": result})
+        formatted = {
+            "seq": result["seq"],
+            "notifications": [_format_notification_for_app(n) for n in result["notifications"]],
+        }
+        await websocket.send_json({"type": "notifications_snapshot", "data": formatted})
     except Exception:
         pass
 
@@ -1109,6 +1164,13 @@ async def dashboard_chart(
 # POSITIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _close_pct_to_100(value: float) -> float:
+    """Convert close_pct to 0-100 scale. Bot stores as 0-1 fraction; iOS expects 0-100."""
+    if value <= 1.0 and value > 0:
+        return round(value * 100, 1)
+    return round(value, 1)
+
+
 def _format_position(pid: str, p: dict) -> dict:
     """Format a position dict for API response — matches iOS Position model."""
     tps = p.get("take_profits", [])
@@ -1118,7 +1180,10 @@ def _format_position(pid: str, p: dict) -> dict:
     leverage = p.get("leverage", 0)
     side = p.get("side", "LONG")
     upnl = p.get("unrealized_pnl", 0)
-    collateral = size / leverage if leverage > 0 else size
+    # Use actual collateral from on-chain/exchange when available
+    collateral = p.get("collateral_usd", 0)
+    if collateral <= 0:
+        collateral = size / leverage if leverage > 0 else size
     pnl_pct = (upnl / collateral * 100) if collateral > 0 else 0
     opened_at = p.get("opened_at", 0)
     duration_h = (time.time() - opened_at) / 3600 if opened_at > 0 else 0
@@ -1156,21 +1221,24 @@ async def list_positions(token: str = Depends(verify_api_key)):
     positions = await _fetch_all_live_positions()
 
     # Update current prices from Chainlink (safe — positions is a deep copy)
+    # Only recalculate PnL for Bitunix positions; GMX on-chain PnL already
+    # accounts for borrowing/funding/closing fees and is more accurate.
     for pid, p in positions.items():
         if p.get("is_open"):
             symbol = p.get("symbol", "")
             price = await asyncio.to_thread(_get_chainlink_price, symbol)
             if price:
                 p["current_price"] = price
-                # Recalculate PnL
-                side = p.get("side", "LONG")
-                entry = p.get("entry_price", 0)
-                size = p.get("size_usd", 0)
-                if entry > 0 and size > 0:
-                    if side == "LONG":
-                        p["unrealized_pnl"] = (price - entry) / entry * size
-                    else:
-                        p["unrealized_pnl"] = (entry - price) / entry * size
+                # Only recalculate PnL for non-GMX positions (GMX has on-chain PnL with fees)
+                if p.get("exchange") != "gmx":
+                    side = p.get("side", "LONG")
+                    entry = p.get("entry_price", 0)
+                    size = p.get("size_usd", 0)
+                    if entry > 0 and size > 0:
+                        if side == "LONG":
+                            p["unrealized_pnl"] = (price - entry) / entry * size
+                        else:
+                            p["unrealized_pnl"] = (entry - price) / entry * size
 
     open_positions = [
         _format_position(pid, p)
@@ -2190,10 +2258,13 @@ async def list_notifications(
     if priority:
         notifications = [n for n in notifications if n.get("priority") == priority]
 
+    # Transform to iOS-compatible format
+    formatted = [_format_notification_for_app(n) for n in notifications]
+
     return {
         "seq": result["seq"],
-        "notifications": notifications,
-        "count": len(notifications),
+        "notifications": formatted,
+        "count": len(formatted),
     }
 
 

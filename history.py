@@ -874,8 +874,6 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
     results = []
 
     for (market, is_long), raw_events in groups.items():
-        if (market, is_long) in open_keys:
-            continue
         sym = market_to_sym.get(market)
         if not sym:
             continue
@@ -907,6 +905,11 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
                     all_event_lists[-1].append(orphan)
 
         for events in all_event_lists:
+            # Skip events belonging to a currently open position
+            pos_opened_at = events[0].get("opened_at", 0) if events else 0
+            if any(m == market and il == is_long and oa == pos_opened_at
+                   for m, il, oa in open_keys):
+                continue
             total_pnl = sum(_net(e) for e in events)
             total_size = sum(e.get("size_delta_usd", 0) for e in events)
             if abs(total_pnl) < 1:

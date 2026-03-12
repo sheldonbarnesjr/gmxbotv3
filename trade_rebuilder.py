@@ -109,7 +109,7 @@ async def _fetch_and_merge_onchain(w3, wallets: List[Tuple[int, Any]]) -> Tuple[
 # Bitunix closed-trade fetch
 # ─────────────────────────────────────────────────────────────────────
 
-async def _fetch_bitunix_trades(bitunix_client) -> list:
+async def _fetch_bitunix_trades(bitunix_client, open_position_ids: set = None) -> list:
     """Fetch closed Bitunix positions from API, return list of TradeRecord."""
     from analytics import TradeRecord
 
@@ -130,6 +130,10 @@ async def _fetch_bitunix_trades(bitunix_client) -> list:
 
     for p in positions:
         try:
+            pos_id = p.get("positionId", "")
+            if open_position_ids and str(pos_id) in open_position_ids:
+                continue
+
             symbol_raw = p.get("symbol", "")
             symbol = symbol_raw.replace("USDT", "").replace("-", "")
 
@@ -324,13 +328,14 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
     # Step 2: Build market → symbol map
     market_to_sym = {addr.lower(): sym for sym, addr in markets.items()}
 
-    # Step 3: Identify open positions to exclude
+    # Step 3: Identify open positions to exclude (by market, direction, AND opened_at)
     open_keys = set()
     if open_positions:
         for pos in open_positions.values():
             if getattr(pos, 'is_open', False) and getattr(pos, 'market_addr', None):
                 is_long = getattr(pos, 'side', '') == "LONG"
-                open_keys.add((pos.market_addr.lower(), is_long))
+                opened_at = int(getattr(pos, 'opened_at', 0) or 0)
+                open_keys.add((pos.market_addr.lower(), is_long, opened_at))
 
     # Step 4: Build rich GMX trades
     trade_history = []
@@ -363,10 +368,18 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
 
     gmx_count = len(trade_history)
 
-    # Step 5: Fetch Bitunix closed trades
+    # Step 5: Fetch Bitunix closed trades (exclude still-open positions)
+    open_bx_position_ids = set()
+    if open_positions:
+        for pos in open_positions.values():
+            if getattr(pos, 'exchange', '') == 'bitunix' and getattr(pos, 'is_open', False):
+                bx_id = getattr(pos, 'bitunix_position_id', None)
+                if bx_id:
+                    open_bx_position_ids.add(str(bx_id))
+
     bx_count = 0
     if bitunix_client:
-        bx_trades = await _fetch_bitunix_trades(bitunix_client)
+        bx_trades = await _fetch_bitunix_trades(bitunix_client, open_bx_position_ids)
         trade_history.extend(bx_trades)
         bx_count = len(bx_trades)
 

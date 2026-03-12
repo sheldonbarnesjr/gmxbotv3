@@ -583,23 +583,38 @@ class AnalyticsMixin:
             key = (t.get("market_address", "").lower(), t.get("is_long", True))
             groups[key].append(t)
 
-        # Exclude currently-open positions
+        # Exclude currently-open positions (by market, direction, AND opened_at)
         open_keys = set()
         for pos in self.positions.values():
             if pos.is_open and pos.market_addr:
                 is_long = pos.side == "LONG"
-                open_keys.add((pos.market_addr.lower(), is_long))
+                opened_at = int(getattr(pos, 'opened_at', 0) or 0)
+                open_keys.add((pos.market_addr.lower(), is_long, opened_at))
 
         result = []
         for (market, is_long), events in groups.items():
-            if (market, is_long) in open_keys:
-                continue
             sym = market_to_sym.get(market)
             if not sym:
                 continue
 
             def _net(e):
                 return e.get("net_pnl_usd", e.get("pnl_usd", 0))
+
+            # Split by opened_at to check per-position
+            _pos_groups = defaultdict(list)
+            for e in events:
+                _pos_groups[e.get("opened_at", 0)].append(e)
+
+            filtered_events = []
+            for oa, evts in _pos_groups.items():
+                if any(m == market and il == is_long and o == oa
+                       for m, il, o in open_keys):
+                    continue
+                filtered_events.extend(evts)
+
+            if not filtered_events:
+                continue
+            events = filtered_events
 
             total_pnl = sum(_net(e) for e in events)
             if abs(total_pnl) < 1:
