@@ -473,25 +473,31 @@ async def _fetch_all_live_positions() -> dict:
                                     pending_tp_prices.add(round(tp_price, 1))
 
                         # TPs not in pending are hit — build verified_decreases from them
+                        hit_tps = []
                         for tp in all_tps:
                             tp_price = tp.get("price", 0)
                             if round(tp_price, 1) not in pending_tp_prices:
-                                tp_pct = tp.get("percentage", 0) / 100.0
-                                tp_size = saved.get("original_size_usd", size_usd) * tp_pct
-                                if entry_price > 0 and tp_size > 0:
-                                    if side == "LONG":
-                                        tp_pnl = (tp_price - entry_price) / entry_price * tp_size
-                                    else:
-                                        tp_pnl = (entry_price - tp_price) / entry_price * tp_size
-                                else:
-                                    tp_pnl = 0
-                                bx_verified.append({
-                                    "execution_price": tp_price,
-                                    "matched_tp_price": tp_price,
-                                    "size_delta_usd": tp_size,
-                                    "pnl_usd": tp_pnl,
-                                    "net_pnl_usd": tp_pnl,
-                                })
+                                hit_tps.append(tp)
+
+                        # Use actual realized_pnl from bot state, distributed
+                        # proportionally across hit TPs (accounts for fees/slippage)
+                        actual_rpnl = saved.get("realized_pnl", 0)
+                        hit_pct_total = sum(t.get("percentage", 0) for t in hit_tps)
+
+                        for tp in hit_tps:
+                            tp_price = tp.get("price", 0)
+                            tp_pct = tp.get("percentage", 0)
+                            if hit_pct_total > 0 and actual_rpnl != 0:
+                                tp_pnl = actual_rpnl * (tp_pct / hit_pct_total)
+                            else:
+                                tp_pnl = 0
+                            bx_verified.append({
+                                "execution_price": tp_price,
+                                "matched_tp_price": tp_price,
+                                "size_delta_usd": saved.get("original_size_usd", size_usd) * tp_pct / 100.0,
+                                "pnl_usd": tp_pnl,
+                                "net_pnl_usd": tp_pnl,
+                            })
                     except Exception as e:
                         logger.debug(f"Bitunix pending TP query failed for {symbol}: {e}")
                         bx_verified = saved.get("verified_decreases", [])
