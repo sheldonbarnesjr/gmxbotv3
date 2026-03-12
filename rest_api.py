@@ -382,8 +382,10 @@ async def _fetch_all_live_positions() -> dict:
             opened_at = saved.get("opened_at", 0)
             original_size = saved.get("original_size_usd", gpos.size_usd)
 
-            # Use saved TPs if on-chain orders not found (they may have been filled)
-            if not take_profits and saved.get("original_take_profits"):
+            # Always prefer original_take_profits (has ALL TPs including filled ones)
+            # On-chain orders only contain unfilled TPs, so using them causes
+            # TP numbering to shift (e.g. TP2 shown as TP1 after TP1 is hit).
+            if saved.get("original_take_profits"):
                 take_profits = [
                     {"price": tp.get("price", 0), "percentage": _close_pct_to_100(tp.get("close_pct", tp.get("percentage", 0)))}
                     for tp in saved["original_take_profits"]
@@ -587,27 +589,153 @@ _CATEGORY_TO_IOS_TYPE = {
     "weekly_summary": "pnl_update",
 }
 
+# Only these categories get sent to the iOS app.
+# Everything else (bot_online, signal_rejected, errors, etc.) stays on Telegram only.
+_APP_CATEGORIES = {
+    "position_opened",
+    "position_closed",
+    "tp_hit",
+    "sl_moved",
+}
+
+
+def _strip_emoji(text: str) -> str:
+    """Remove leading emoji/symbols from a string."""
+    import re
+    # Strip leading emoji, unicode symbols, and common markdown
+    cleaned = re.sub(r'^[\U0001F300-\U0001FAD6\u2600-\u27BF\u2B50\u26A0\uFE0F\u200D\U0001F1E0-\U0001F1FF*_#]+\s*', '', text)
+    return cleaned.strip()
+
 
 def _format_notification_for_app(notif: dict) -> dict:
-    """Transform a raw backend notification into the format the iOS app expects.
+    """Transform a raw backend notification into a clean iOS-friendly format.
 
-    Backend format:  {id: int, timestamp: float, message: str, category: str, priority: str}
-    iOS format:      {id: str, type: str, title: str, message: str, detail: str?, trade_id: str?, is_read: bool, created_at: float}
+    Produces short, scannable titles with optional one-line detail.
+    Strips Telegram-style formatting (emoji prefixes, ALL CAPS, verbose errors).
     """
+    import re
+
     category = notif.get("category", "general")
     ios_type = _CATEGORY_TO_IOS_TYPE.get(category, "pnl_update")
     raw_message = notif.get("message", "")
+    lines = [ln.strip() for ln in raw_message.strip().split("\n") if ln.strip()]
 
-    # Extract title from first line, rest as detail
-    lines = raw_message.strip().split("\n")
-    title = lines[0] if lines else category.replace("_", " ").title()
-    detail = "\n".join(lines[1:]).strip() if len(lines) > 1 else None
+    title = ""
+    detail = None
+
+    if category == "position_opened":
+        # "Opened ETH SHORT 25x on GMX" / extract symbol, side, leverage, exchange
+        m = re.search(r'(\w+)\s+(LONG|SHORT)\s+([\d.]+)x', raw_message, re.IGNORECASE)
+        exchange = "Bitunix" if "bitunix" in raw_message.lower() else "GMX"
+        if m:
+            title = f"Opened {m.group(1)} {m.group(2).upper()} {m.group(3)}x"
+            detail = exchange
+        else:
+            title = _strip_emoji(lines[0]) if lines else "Position Opened"
+
+    elif category == "position_closed":
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        pnl_m = re.search(r'[+-]?\$[\d,.]+', raw_message)
+        if m:
+            title = f"Closed {m.group(1)} {m.group(2).upper()}"
+            if pnl_m:
+                detail = pnl_m.group(0)
+        else:
+            title = _strip_emoji(lines[0]) if lines else "Position Closed"
+
+    elif category == "tp_hit":
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        tp_m = re.search(r'(?:TP|Target)\s*(\d+)', raw_message, re.IGNORECASE)
+        pnl_m = re.search(r'[+-]?\$[\d,.]+', raw_message)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        tp_num = tp_m.group(1) if tp_m else ""
+        title = f"TP{tp_num} Hit {sym} {side}".strip() if sym else "Target Hit"
+        if pnl_m:
+            detail = pnl_m.group(0)
+
+    elif category in ("sl_moved", "sl_move_failed", "tp_sl_move_failed"):
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        target_m = re.search(r'(?:to\s+)?Target\s*(\d+)', raw_message, re.IGNORECASE)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        if "failed" in category.lower():
+            title = f"SL Move Failed {sym} {side}".strip()
+            err_m = re.search(r'Error:\s*(.+?)(?:\s*\(code|$)', raw_message)
+            detail = err_m.group(1).strip()[:60] if err_m else None
+        else:
+            entry_m = re.search(r'Entry', raw_message, re.IGNORECASE)
+            if target_m:
+                dest = f" to TP{target_m.group(1)}"
+            elif entry_m:
+                dest = " to Entry"
+            else:
+                dest = ""
+            title = f"SL Moved{dest} {sym} {side}".strip()
+            # Grab the destination price: after -> or in parentheses
+            arrow_m = re.search(r'->\s*\$([\d,.]+)', raw_message)
+            paren_m = re.search(r'\(\$([\d,.]+)\)', raw_message)
+            if arrow_m:
+                detail = f"${arrow_m.group(1)}"
+            elif paren_m:
+                detail = f"${paren_m.group(1)}"
+            else:
+                price_m = re.search(r'\$[\d,.]+', raw_message)
+                detail = price_m.group(0) if price_m else None
+
+    elif category == "sl_missing":
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        title = f"SL Missing {sym} {side}".strip() if sym else "Stop Loss Missing"
+
+    elif category == "bot_online":
+        title = "Bot Online"
+
+    elif category == "bot_offline":
+        title = "Bot Offline"
+
+    elif category == "signal_rejected":
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        reason_m = re.search(r'Reason:\s*(.+)', raw_message, re.IGNORECASE)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        title = f"Signal Skipped {sym} {side}".strip() if sym else "Signal Rejected"
+        detail = reason_m.group(1).strip()[:60] if reason_m else None
+
+    elif category == "signal_executing":
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        title = f"Executing {sym} {side}".strip() if sym else "Executing Signal"
+
+    elif category in ("signal_error", "mirror_error", "bitunix_error"):
+        m = re.search(r'(\w+)\s+(LONG|SHORT)', raw_message, re.IGNORECASE)
+        sym = m.group(1) if m else ""
+        side = m.group(2).upper() if m else ""
+        title = f"Error {sym} {side}".strip() if sym else "Trade Error"
+        err_m = re.search(r'Error:\s*(.+?)(?:\s*\(code|$)', raw_message)
+        detail = err_m.group(1).strip()[:60] if err_m else None
+
+    elif category == "weekly_summary":
+        title = "Weekly Summary"
+        pnl_m = re.search(r'[+-]?\$[\d,.]+', raw_message)
+        detail = pnl_m.group(0) if pnl_m else None
+
+    else:
+        # Fallback: clean up the first line
+        title = _strip_emoji(lines[0]) if lines else category.replace("_", " ").title()
+        # Strip common prefixes
+        for prefix in ("STARTUP CATCH-UP:", "Startup SL fix:"):
+            if title.upper().startswith(prefix.upper()):
+                title = title[len(prefix):].strip()
+        detail = lines[1][:60] if len(lines) > 1 else None
 
     return {
         "id": str(notif.get("id", "")),
         "type": ios_type,
         "title": title,
-        "message": raw_message,
+        "message": title,
         "detail": detail,
         "trade_id": None,
         "is_read": False,
@@ -695,6 +823,8 @@ async def _ws_notification_broadcast_loop():
             _last_notification_seq = new_seq
             # Notifications come newest-first from get_notifications; reverse for chronological send
             for notif in reversed(result["notifications"]):
+                if notif.get("category", "") not in _APP_CATEGORIES:
+                    continue
                 msg = {"type": "notification", "data": _format_notification_for_app(notif)}
                 for client in _connected_ws_clients[:]:
                     try:
@@ -843,9 +973,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     # Send recent notifications so the app catches up
     try:
         result = app_notifications.get_notifications(since_seq=0, limit=20)
+        app_only = [n for n in result["notifications"] if n.get("category", "") in _APP_CATEGORIES]
         formatted = {
             "seq": result["seq"],
-            "notifications": [_format_notification_for_app(n) for n in result["notifications"]],
+            "notifications": [_format_notification_for_app(n) for n in app_only],
         }
         await websocket.send_json({"type": "notifications_snapshot", "data": formatted})
     except Exception:
@@ -1434,15 +1565,33 @@ async def list_trades(
 @app.get("/api/v1/trades/stats")
 async def trade_stats(
     symbol: Optional[str] = None,
+    period: Optional[str] = None,
     token: str = Depends(verify_api_key),
 ):
-    """Trade statistics — win rate, avg PnL, etc."""
+    """Trade statistics — win rate, avg PnL, etc.
+    Optional period filter: 24h, 7d, 30d, 90d, ytd, 365d, all
+    """
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
 
     # Filter by symbol if provided
     trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
     if symbol:
         trades = [t for t in trades if t.get("symbol") == symbol]
+
+    # Filter by period if provided
+    if period:
+        import datetime as _dt
+        _now = _dt.datetime.now()
+        _jan1 = _dt.datetime(_now.year, 1, 1)
+        _ytd_hours = (_now - _jan1).total_seconds() / 3600
+        _period_map = {
+            "1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720,
+            "90d": 2160, "ytd": _ytd_hours, "365d": 8760, "all": 999999,
+        }
+        _period_hours = _period_map.get(period, 24)
+        _reset_ts = _load_reset_timestamp()
+        _cutoff = max(time.time() - (_period_hours * 3600), _reset_ts)
+        trades = [t for t in trades if t.get("closed_at", 0) >= _cutoff]
 
     if not trades:
         return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0,
@@ -2258,8 +2407,9 @@ async def list_notifications(
     if priority:
         notifications = [n for n in notifications if n.get("priority") == priority]
 
-    # Transform to iOS-compatible format
-    formatted = [_format_notification_for_app(n) for n in notifications]
+    # Filter to app-relevant categories only, then transform
+    app_only = [n for n in notifications if n.get("category", "") in _APP_CATEGORIES]
+    formatted = [_format_notification_for_app(n) for n in app_only]
 
     return {
         "seq": result["seq"],
