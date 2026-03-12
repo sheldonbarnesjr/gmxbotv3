@@ -391,10 +391,9 @@ def determine_new_sl_target(
     if sl_rules and isinstance(sl_rules, list):
         # New per-TP format: index 0 = after TP1 hit
         rule_idx = tp_hits_count - 1
-        if rule_idx < len(sl_rules):
-            return _apply_sl_rule(sl_rules[rule_idx], entry_price, sorted_tps)
-        # Beyond configured rules — no move
-        return None, None
+        if rule_idx >= len(sl_rules):
+            rule_idx = len(sl_rules) - 1  # Clamp to last rule (keep SL protection)
+        return _apply_sl_rule(sl_rules[rule_idx], entry_price, sorted_tps)
 
     # Legacy format fallback (only when using global config, not per-position override)
     sl_after_tp1 = tsl_cfg.get("sl_after_tp1", "entry")

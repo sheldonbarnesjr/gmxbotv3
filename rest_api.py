@@ -1794,26 +1794,47 @@ async def change_position_strategy(
     is_long = side == "LONG"
     entry_price = p.get("entry_price", 0)
 
+    # Validate sl_rules
+    if not req.sl_rules:
+        raise HTTPException(status_code=400, detail="sl_rules must not be empty")
+    VALID_SL_RULES = {"entry", "none", "breakeven"}
+    for rule in req.sl_rules:
+        if rule not in VALID_SL_RULES and not (rule.startswith("tp") and rule[2:].isdigit()):
+            raise HTTPException(status_code=400, detail=f"Invalid SL rule: '{rule}'")
+
     # 2. Load position state for original TPs and tp_hits
     pos_state = safe_json_read(POSITION_STATE_FILE, {})
 
-    # Find the matching state key
+    # Find the matching state key — use exact key format when possible
     state_key = None
     saved = {}
-    for key, val in pos_state.items():
-        # Match by symbol + side + exchange
-        s_sym = val.get("symbol", "")
-        s_side = val.get("side", "")
-        s_exchange = val.get("exchange", "gmx")
-        if (s_sym == symbol and s_side == side and s_exchange == exchange):
-            state_key = key
-            saved = val
-            break
+
+    if exchange == "gmx":
+        # GMX: construct exact state key from wallet_id:market_addr:side
+        wid = p.get("wallet_id", 1)
+        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
+        if market_addr:
+            state_key = f"{wid}:{market_addr.lower()}:{side}"
+            saved = pos_state.get(state_key, {})
+        if not saved:
+            state_key = None  # fall through to generic match
+
+    if not state_key and exchange == "bitunix":
+        # Bitunix: try matching by bitunix_position_id first
+        for key, val in pos_state.items():
+            bid = val.get("bitunix_position_id", "")
+            if bid and position_id.endswith(bid):
+                state_key = key
+                saved = val
+                break
 
     if not state_key:
-        # Try matching by position_id format
+        # Fallback: match by symbol + side + exchange
         for key, val in pos_state.items():
-            if position_id.startswith(f"{exchange}_") and key.endswith(f":{side}"):
+            s_sym = val.get("symbol", "")
+            s_side = val.get("side", "")
+            s_exchange = val.get("exchange", "gmx")
+            if (s_sym == symbol and s_side == side and s_exchange == exchange):
                 state_key = key
                 saved = val
                 break
@@ -1894,13 +1915,13 @@ async def change_position_strategy(
 
     if exchange == "gmx":
         # GMX: cancel and recreate on-chain TP/SL orders
-        wid = p.get("wallet_id", 1)
-        acct = accounts.get(wid)
+        wid_gmx = p.get("wallet_id", 1)
+        acct = accounts.get(wid_gmx)
         if not acct:
-            raise HTTPException(status_code=500, detail=f"Wallet {wid} not configured")
+            raise HTTPException(status_code=500, detail=f"Wallet {wid_gmx} not configured")
 
-        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
-        if not market_addr:
+        market_addr_gmx = p.get("market_addr") or cfg.markets.get(symbol, "")
+        if not market_addr_gmx:
             raise HTTPException(status_code=500, detail=f"No market address for {symbol}")
 
         try:
@@ -1922,7 +1943,7 @@ async def change_position_strategy(
             cancelled = await asyncio.to_thread(
                 cancel_orders_for_market,
                 w3, acct, exchange_contract,
-                Web3.to_checksum_address(market_addr),
+                Web3.to_checksum_address(market_addr_gmx),
                 False,  # dry_run=False
             )
             tx_count += 1 if cancelled > 0 else 0
@@ -1943,7 +1964,7 @@ async def change_position_strategy(
                     create_tp_order,
                     w3, acct, exchange_contract,
                     acct.address,
-                    Web3.to_checksum_address(market_addr),
+                    Web3.to_checksum_address(market_addr_gmx),
                     Web3.to_checksum_address(cfg.collateral_token),
                     Web3.to_checksum_address(cfg.order_vault),
                     tp_obj, size_usd, collateral_usd,
@@ -1961,7 +1982,7 @@ async def change_position_strategy(
                     create_sl_order,
                     w3, acct, exchange_contract,
                     acct.address,
-                    Web3.to_checksum_address(market_addr),
+                    Web3.to_checksum_address(market_addr_gmx),
                     Web3.to_checksum_address(cfg.collateral_token),
                     Web3.to_checksum_address(cfg.order_vault),
                     sl_price_to_set, size_usd,
@@ -1973,10 +1994,12 @@ async def change_position_strategy(
                 tx_count += 1
 
         except Exception as e:
+            # On-chain ops failed — do NOT update position_state.json
             logger.error(f"Failed to change strategy for {position_id}: {e}")
             raise HTTPException(status_code=500, detail=f"On-chain order update failed: {e}")
 
     # 8. Update position_state.json with new TPs and per-position SL rules
+    # (only reached if GMX on-chain ops succeeded, or if Bitunix which has no on-chain ops)
     pos_state = safe_json_read(POSITION_STATE_FILE, {})
     if state_key and state_key in pos_state:
         pos_state[state_key]["original_take_profits"] = new_tps
@@ -1985,6 +2008,11 @@ async def change_position_strategy(
             pos_state[state_key]["stop_loss"] = new_sl_price
             pos_state[state_key]["sl_move_label"] = sl_rule_label
         atomic_json_write(POSITION_STATE_FILE, pos_state)
+    else:
+        logger.warning(
+            f"Strategy applied but position state key '{state_key}' not found in "
+            f"position_state.json — state not updated"
+        )
 
     _invalidate_positions_cache()
 

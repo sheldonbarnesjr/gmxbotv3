@@ -64,6 +64,19 @@ class BitunixMonitorMixin:
             return self._bx_tp_tracking[bpid]
         return self._bx_tp_tracking.get(pos.id, [])
 
+    def _get_bitunix_sl_override(self, pos) -> list:
+        """Load per-position SL rules override from position_state.json for Bitunix positions."""
+        try:
+            pos_state = self._load_position_state()
+            for _key, val in pos_state.items():
+                if (val.get("exchange") == "bitunix"
+                        and val.get("symbol") == pos.symbol
+                        and val.get("side") == pos.side):
+                    return val.get("position_sl_rules")
+        except Exception:
+            pass
+        return None
+
     def _pop_tp_tracking(self, pos):
         """Remove TP tracking for a position."""
         bpid = getattr(pos, 'bitunix_position_id', None)
@@ -297,8 +310,10 @@ class BitunixMonitorMixin:
 
                     # Move SL after TP hit — but only if current SL is wrong
                     sorted_tp_prices = sorted(t["price"] for t in tracked)
+                    override_sl_rules = self._get_bitunix_sl_override(pos)
                     new_sl, sl_label = determine_new_sl_target(
-                        total_hits, pos.entry_price, sorted_tp_prices, pos.leverage
+                        total_hits, pos.entry_price, sorted_tp_prices, pos.leverage,
+                        override_sl_rules=override_sl_rules,
                     )
                     if new_sl is not None and new_sl != pos.stop_loss:
                         should_move = True
@@ -773,8 +788,10 @@ class BitunixMonitorMixin:
 
                     # Correct SL level based on TP hits — only if current SL is wrong
                     sorted_tp_prices = sorted(t["price"] for t in tracked)
+                    override_sl_rules = self._get_bitunix_sl_override(pos)
                     new_sl, sl_label = determine_new_sl_target(
-                        total_hits, pos.entry_price, sorted_tp_prices, pos.leverage
+                        total_hits, pos.entry_price, sorted_tp_prices, pos.leverage,
+                        override_sl_rules=override_sl_rules,
                     )
                     if new_sl is not None and pos.stop_loss is not None:
                         tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
@@ -797,8 +814,10 @@ class BitunixMonitorMixin:
             # ── Step 3 (no new hits): Still verify SL is at correct level ──
             if pos.tp_hits_count > 0 and pos.take_profits:
                 sorted_tp_prices = sorted(tp.price for tp in pos.take_profits)
+                override_sl_rules = self._get_bitunix_sl_override(pos)
                 new_sl, sl_label = determine_new_sl_target(
-                    pos.tp_hits_count, pos.entry_price, sorted_tp_prices, pos.leverage
+                    pos.tp_hits_count, pos.entry_price, sorted_tp_prices, pos.leverage,
+                    override_sl_rules=override_sl_rules,
                 )
                 if new_sl is not None and pos.stop_loss is not None:
                     tolerance = pos.entry_price * 0.003 if pos.entry_price else 1.0
