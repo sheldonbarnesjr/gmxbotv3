@@ -906,8 +906,10 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
 
         for events in all_event_lists:
             # Skip events belonging to a currently open position
+            # Use 60s tolerance because bot's opened_at (time.time()) differs
+            # slightly from on-chain opened_at
             pos_opened_at = events[0].get("opened_at", 0) if events else 0
-            if any(m == market and il == is_long and oa == pos_opened_at
+            if any(m == market and il == is_long and abs(oa - pos_opened_at) < 60
                    for m, il, oa in open_keys):
                 continue
             total_pnl = sum(_net(e) for e in events)

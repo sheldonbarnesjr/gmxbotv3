@@ -607,7 +607,7 @@ class AnalyticsMixin:
 
             filtered_events = []
             for oa, evts in _pos_groups.items():
-                if any(m == market and il == is_long and o == oa
+                if any(m == market and il == is_long and abs(o - oa) < 60
                        for m, il, o in open_keys):
                     continue
                 filtered_events.extend(evts)
