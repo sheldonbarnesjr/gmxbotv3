@@ -2663,6 +2663,8 @@ async def get_config(token: str = Depends(verify_api_key)):
                 # Fix rounding so it sums to 100
                 tp_distributions[key][-1] = 100 - sum(tp_distributions[key][:-1])
 
+    max_tp_count = user_cfg.get("max_tp_count", 8)
+
     return {
         "exchange_mode": cfg.exchange_mode,
         "min_leverage": cfg.min_leverage,
@@ -2680,6 +2682,7 @@ async def get_config(token: str = Depends(verify_api_key)):
         "slippage_bps": cfg.slippage_bps,
         "allowed_symbols": list(ALLOWED_SYMBOLS),
         "tp_distributions": tp_distributions,
+        "max_tp_count": max_tp_count,
     }
 
 
@@ -2689,6 +2692,7 @@ class ConfigUpdateRequest(BaseModel):
     bitunix_portfolio_pct: Optional[float] = None
     bitunix_portfolio_fixed_usd: Optional[float] = None
     tp_distributions: Optional[Dict[str, List[int]]] = None
+    max_tp_count: Optional[int] = None
 
 
 @app.post("/api/v1/config/update")
@@ -2715,6 +2719,12 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
             raise HTTPException(status_code=400, detail="bitunix_portfolio_fixed_usd must be >= 0")
         cfg.bitunix_portfolio_fixed_usd = req.bitunix_portfolio_fixed_usd
         updated["bitunix_portfolio_fixed_usd"] = cfg.bitunix_portfolio_fixed_usd
+
+    # Validate max TP count
+    if req.max_tp_count is not None:
+        if not (2 <= req.max_tp_count <= 8):
+            raise HTTPException(status_code=400, detail="max_tp_count must be 2-8")
+        updated["max_tp_count"] = req.max_tp_count
 
     # Validate and store TP distributions
     if req.tp_distributions is not None:

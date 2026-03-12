@@ -643,8 +643,16 @@ def parse_signal(text: str) -> Signal:
                 f"keeping originals to avoid empty TP list"
             )
 
-    # Cap at 8 TPs max — drop extras (keep the closest targets)
+    # Cap TPs — use user-configured max from user_config.json, default 8
     MAX_TPS = 8
+    try:
+        _cfg_path = os.path.join(os.path.dirname(__file__), "json", "user_config.json")
+        if os.path.exists(_cfg_path):
+            with open(_cfg_path, "r") as _f:
+                _ucfg = json.load(_f)
+            MAX_TPS = _ucfg.get("max_tp_count", 8)
+    except Exception:
+        pass
     if len(take_profits) > MAX_TPS:
         log.warning(
             f"Signal has {len(take_profits)} TPs — trimming to {MAX_TPS}"
