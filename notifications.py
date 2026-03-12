@@ -19,6 +19,7 @@ import logging
 from typing import Optional
 
 import bot_api
+import app_notifications
 
 
 class NotificationsMixin:
@@ -71,6 +72,12 @@ class NotificationsMixin:
                 self._notify_chat_warned = True
             else:
                 self.logger.warning("Notification delivery failed (all channels)")
+
+        # Push to app notification store (for REST API / iOS app)
+        try:
+            app_notifications.push_notification(message)
+        except Exception as e:
+            self.logger.debug(f"App notification push failed: {e}")
 
         return sent
 

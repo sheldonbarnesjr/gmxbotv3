@@ -1,21 +1,22 @@
 """
 REST API Server for GMX Trading Bot — serves the iOS Multiply app.
 
-Reads bot state from JSON files and on-chain data to expose endpoints
-that the iOS app's APIClient.swift expects.
+Queries positions live from on-chain (GMX via Web3) and exchange API (Bitunix).
+Reads bot metadata from position_state.json for TP/SL and realized PnL data.
 
 Run standalone:  python rest_api.py
 Or with uvicorn: uvicorn rest_api:app --host 0.0.0.0 --port 8000
 
-Requires a running bot instance OR at minimum:
+Requires:
   - .env with config (RPC, keys, etc.)
-  - json/ directory with state files
+  - json/ directory for trade history and balance snapshots
 """
 
 import os
 import sys
 import json
 import time
+import copy
 import hmac
 import hashlib
 import logging
@@ -36,6 +37,7 @@ from pydantic import BaseModel
 # ── Bot imports ──
 from config import load_config, ALLOWED_SYMBOLS, CHAINLINK_FEEDS, CHAINLINK_ABI
 from state_io import safe_json_read, atomic_json_write
+import app_notifications
 
 logger = logging.getLogger("GMXBot.rest_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -43,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # State file paths (same as the bot uses)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-POSITIONS_FILE = "json/positions.json"
+POSITION_STATE_FILE = "json/position_state.json"
 TRADE_HISTORY_FILE = "json/trade_history.json"
 BALANCE_SNAPSHOTS_FILE = "json/balance_snapshots.json"
 SIGNAL_STORE_FILE = "json/signal_store.json"
@@ -266,6 +268,245 @@ async def _fetch_chain_positions(account) -> list:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Live position fetching (on-chain + exchange — no JSON file dependency)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_positions_cache: dict = {}
+_positions_cache_ts: float = 0
+_positions_stale: dict = {}          # last known good result (survives cache expiry)
+_positions_fetch_errors: list = []   # errors from last fetch attempt
+_POSITIONS_CACHE_TTL: float = 5.0    # seconds
+_POSITIONS_STALE_TTL: float = 120.0  # serve stale data up to 2 minutes
+_POSITIONS_RETRY_COUNT: int = 2      # retry failed RPC/API calls
+
+
+async def _fetch_chain_positions_with_retry(account, retries: int = _POSITIONS_RETRY_COUNT) -> list:
+    """Fetch on-chain positions with retry logic for transient RPC failures."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = await _fetch_chain_positions(account)
+            return result
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(0.5 * attempt)  # brief backoff
+                logger.debug(f"Retrying GMX fetch for {account.address} (attempt {attempt + 1}): {e}")
+    raise last_err
+
+
+async def _fetch_all_live_positions() -> dict:
+    """Fetch open positions directly from on-chain (GMX) and exchange API (Bitunix).
+
+    Returns a dict keyed by position ID, matching the format _format_position() expects.
+    Results are cached for 5 seconds to avoid hammering RPC/exchange APIs.
+    Falls back to stale cache (up to 2 min) if all live fetches fail.
+    """
+    global _positions_cache, _positions_cache_ts, _positions_stale, _positions_fetch_errors
+
+    now = time.time()
+    # Return fresh cache if available (works even for empty results now)
+    if _positions_cache_ts > 0 and (now - _positions_cache_ts) < _POSITIONS_CACHE_TTL:
+        return copy.deepcopy(_positions_cache)
+
+    positions = {}
+    fetch_errors = []
+
+    # Load bot's position_state.json for metadata (realized PnL, TP hits, opened_at, etc.)
+    pos_state = safe_json_read(POSITION_STATE_FILE, {})
+
+    # ── GMX on-chain positions ──
+    try:
+        from open import fetch_open_orders
+    except ImportError:
+        fetch_open_orders = None
+
+    gmx_success_count = 0
+    gmx_fail_count = 0
+    for wid, acct in accounts.items():
+        try:
+            chain_positions = await _fetch_chain_positions_with_retry(acct)
+            gmx_success_count += 1
+        except Exception as e:
+            gmx_fail_count += 1
+            fetch_errors.append(f"GMX wallet {wid}: {e}")
+            logger.warning(f"Failed to fetch GMX positions for wallet {wid} after retries: {e}")
+            continue
+
+        # Fetch open orders for TP/SL data
+        orders = []
+        if fetch_open_orders:
+            try:
+                orders = await asyncio.to_thread(fetch_open_orders, w3, acct.address)
+            except Exception as e:
+                logger.debug(f"Failed to fetch orders for wallet {wid}: {e}")
+
+        for gpos in chain_positions:
+            side = "LONG" if gpos.is_long else "SHORT"
+            symbol = gpos.symbol.split("/")[0] if "/" in gpos.symbol else gpos.symbol
+            pid = f"gmx_{wid}_{gpos.market[-8:].lower()}_{side.lower()}"
+            collateral = gpos.collateral_amount
+
+            # Match TP orders for this position (LimitDecrease, order_type=5)
+            take_profits = []
+            for o in orders:
+                if (o.get("market", "").lower() == gpos.market.lower()
+                        and o.get("is_long") == gpos.is_long
+                        and o.get("order_type") == 5
+                        and o.get("trigger_price", 0) > 0):
+                    take_profits.append({
+                        "price": o["trigger_price"],
+                        "percentage": round(o.get("size_usd", 0) / gpos.size_usd * 100, 1)
+                            if gpos.size_usd > 0 else 0,
+                    })
+            take_profits.sort(
+                key=lambda tp: tp["price"],
+                reverse=gpos.is_long,
+            )
+
+            # Match SL order (StopLossDecrease, order_type=6)
+            stop_loss = None
+            for o in orders:
+                if (o.get("market", "").lower() == gpos.market.lower()
+                        and o.get("is_long") == gpos.is_long
+                        and o.get("order_type") == 6
+                        and o.get("trigger_price", 0) > 0):
+                    stop_loss = o["trigger_price"]
+                    break
+
+            # Enrich with bot state metadata (realized PnL, verified_decreases, etc.)
+            state_key = f"{wid}:{gpos.market.lower()}:{side}"
+            saved = pos_state.get(state_key, {})
+            realized_pnl = saved.get("realized_pnl", 0)
+            verified_decreases = saved.get("verified_decreases", [])
+            opened_at = saved.get("opened_at", 0)
+            original_size = saved.get("original_size_usd", gpos.size_usd)
+
+            # Use saved TPs if on-chain orders not found (they may have been filled)
+            if not take_profits and saved.get("original_take_profits"):
+                take_profits = [
+                    {"price": tp.get("price", 0), "percentage": tp.get("close_pct", tp.get("percentage", 0))}
+                    for tp in saved["original_take_profits"]
+                    if tp.get("price", 0) > 0
+                ]
+            if not stop_loss and saved.get("stop_loss"):
+                stop_loss = saved["stop_loss"]
+
+            positions[pid] = {
+                "id": pid,
+                "symbol": symbol,
+                "side": side,
+                "size_usd": gpos.size_usd,
+                "leverage": gpos.leverage,
+                "entry_price": gpos.entry_price,
+                "current_price": gpos.current_price,
+                "stop_loss": stop_loss,
+                "is_open": True,
+                "opened_at": opened_at,
+                "unrealized_pnl": gpos.unrealized_pnl,
+                "realized_pnl": realized_pnl,
+                "collateral_usd": collateral,
+                "take_profits": take_profits,
+                "verified_decreases": verified_decreases,
+                "wallet_id": wid,
+                "exchange": "gmx",
+                "market_addr": gpos.market,
+                "original_size_usd": original_size,
+            }
+
+    # ── Bitunix exchange positions ──
+    bx_success = False
+    if bx_client:
+        for attempt in range(1, _POSITIONS_RETRY_COUNT + 1):
+            try:
+                from bitunix_executor import get_bitunix_positions
+                bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
+                bx_success = True
+                for bp in bx_positions:
+                    raw_side = (bp.get("side") or "").upper()
+                    side = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
+                    bx_symbol_raw = bp.get("symbol", "")
+                    # Convert BTCUSDT → BTC
+                    symbol = bx_symbol_raw.replace("USDT", "").replace("USDC", "")
+                    position_id = bp.get("positionId", "")
+                    pid = f"bx_{position_id}" if position_id else f"bx_{symbol}_{side.lower()}"
+
+                    margin = float(bp.get("margin", 0))
+                    unrealized_pnl = float(bp.get("unrealizedPNL", 0))
+                    entry_price = float(bp.get("avgOpenPrice", 0))
+                    mark_price = float(bp.get("markPrice", 0))
+                    qty = float(bp.get("qty", 0))
+                    leverage = float(bp.get("leverage", 1))
+                    size_usd = margin * leverage if margin > 0 else qty * mark_price
+
+                    # Find matching state entry for metadata
+                    saved = {}
+                    for sk, sv in pos_state.items():
+                        if (sv.get("exchange") == "bitunix"
+                                and sv.get("symbol", "").upper() == symbol.upper()
+                                and sv.get("side", "").upper() == side):
+                            saved = sv
+                            break
+
+                    positions[pid] = {
+                        "id": pid,
+                        "symbol": symbol,
+                        "side": side,
+                        "size_usd": round(size_usd, 2),
+                        "leverage": leverage,
+                        "entry_price": entry_price,
+                        "current_price": mark_price,
+                        "stop_loss": saved.get("stop_loss"),
+                        "is_open": True,
+                        "opened_at": saved.get("opened_at", 0),
+                        "unrealized_pnl": round(unrealized_pnl, 2),
+                        "realized_pnl": saved.get("realized_pnl", 0),
+                        "collateral_usd": round(margin, 2),
+                        "take_profits": [
+                            {"price": tp.get("price", 0), "percentage": tp.get("close_pct", tp.get("percentage", 0))}
+                            for tp in saved.get("original_take_profits", [])
+                            if tp.get("price", 0) > 0
+                        ],
+                        "verified_decreases": saved.get("verified_decreases", []),
+                        "wallet_id": 1,
+                        "exchange": "bitunix",
+                        "market_addr": None,
+                        "original_size_usd": saved.get("original_size_usd", size_usd),
+                    }
+                break  # success, no more retries
+            except Exception as e:
+                if attempt == _POSITIONS_RETRY_COUNT:
+                    fetch_errors.append(f"Bitunix: {e}")
+                    logger.warning(f"Failed to fetch Bitunix positions after {_POSITIONS_RETRY_COUNT} attempts: {e}")
+                else:
+                    await asyncio.sleep(0.5 * attempt)
+
+    # ── Determine whether to use fresh result or fall back to stale ──
+    all_sources_failed = (gmx_success_count == 0 and len(accounts) > 0) and (not bx_success and bx_client)
+
+    if all_sources_failed and _positions_stale and (now - _positions_cache_ts) < _POSITIONS_STALE_TTL:
+        # All fetches failed — serve stale data rather than empty
+        logger.warning(f"All position fetches failed, serving stale cache ({now - _positions_cache_ts:.0f}s old)")
+        _positions_fetch_errors = fetch_errors
+        return copy.deepcopy(_positions_stale)
+
+    # Update caches
+    _positions_cache = positions
+    _positions_cache_ts = now
+    _positions_fetch_errors = fetch_errors
+    if positions:
+        _positions_stale = copy.deepcopy(positions)  # save as last known good
+    return copy.deepcopy(positions)
+
+
+def _invalidate_positions_cache():
+    """Clear the positions cache (e.g. after closing a position)."""
+    global _positions_cache, _positions_cache_ts
+    _positions_cache = {}
+    _positions_cache_ts = 0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Pydantic response models (matching iOS APIClient.swift)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -275,40 +516,30 @@ async def _fetch_chain_positions(account) -> list:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def _calculate_total_portfolio() -> float:
-    """Calculate total portfolio value from wallets + positions + Bitunix."""
+    """Calculate total portfolio value from wallets + positions (both chains)."""
     total = 0.0
     for wid, acct in accounts.items():
         total += await asyncio.to_thread(_get_usdc_balance, acct)
 
-    positions = safe_json_read(POSITIONS_FILE, {})
+    # Live positions already include both GMX and Bitunix
+    positions = await _fetch_all_live_positions()
     for pid, p in positions.items():
         if p.get("is_open", False):
-            size = p.get("size_usd", 0)
-            lev = p.get("leverage", 1)
-            total += size / lev if lev > 0 else size
-            symbol = p.get("symbol", "")
-            entry = p.get("entry_price", 0)
-            side = p.get("side", "LONG")
-            price = await asyncio.to_thread(_get_chainlink_price, symbol)
-            if price and entry > 0 and size > 0:
-                if side == "LONG":
-                    total += (price - entry) / entry * size
-                else:
-                    total += (entry - price) / entry * size
-            else:
-                total += p.get("unrealized_pnl", 0)
+            collateral = p.get("collateral_usd", 0)
+            if collateral <= 0:
+                size = p.get("size_usd", 0)
+                lev = p.get("leverage", 1)
+                collateral = size / lev if lev > 0 else size
+            total += collateral
+            total += p.get("unrealized_pnl", 0)
 
+    # Add Bitunix available balance
     if bx_client:
         try:
-            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
-            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
-            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
-            total += bx_bal
-            for bp in bx_positions:
-                total += float(bp.get("margin", 0))
-                total += float(bp.get("unrealizedPNL", 0))
+            from bitunix_executor import get_bitunix_balance
+            total += await asyncio.to_thread(get_bitunix_balance, bx_client)
         except Exception as e:
-            logger.warning(f"Bitunix fetch in periodic snapshot failed: {e}")
+            logger.warning(f"Bitunix balance fetch failed: {e}")
 
     return total
 
@@ -328,14 +559,16 @@ async def _periodic_snapshot_task():
 
 _snapshot_bg_task = None
 _ws_broadcast_task = None
+_ws_notification_task = None
 _connected_ws_clients: list[WebSocket] = []
+_last_notification_seq: int = 0  # track last broadcast notification seq
 
 
 async def _get_positions_payload() -> dict:
     """Build the positions_update payload, reusing existing position logic."""
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
 
-    # Update current prices from Chainlink
+    # Update current prices from Chainlink (safe — positions is a deep copy)
     for pid, p in positions.items():
         if p.get("is_open"):
             symbol = p.get("symbol", "")
@@ -360,12 +593,18 @@ async def _get_positions_payload() -> dict:
     total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions.values() if p.get("is_open"))
     total_value = sum(p.get("size_usd", 0) for p in positions.values() if p.get("is_open"))
 
-    return {
+    result = {
         "positions": open_positions,
         "total_pnl": round(total_pnl, 2),
         "total_value": round(total_value, 2),
         "count": len(open_positions),
     }
+
+    if _positions_fetch_errors:
+        result["fetch_errors"] = _positions_fetch_errors
+        result["is_stale"] = bool(_positions_stale and not open_positions and _positions_fetch_errors)
+
+    return result
 
 
 async def _ws_broadcast_loop():
@@ -389,6 +628,35 @@ async def _ws_broadcast_loop():
             logger.warning(f"WebSocket broadcast error: {e}")
 
 
+async def _ws_notification_broadcast_loop():
+    """Check for new bot notifications and broadcast them to WebSocket clients."""
+    global _last_notification_seq
+    _last_notification_seq = app_notifications.get_current_seq()
+    while True:
+        await asyncio.sleep(2)
+        if not _connected_ws_clients:
+            continue
+        try:
+            result = app_notifications.get_notifications(since_seq=_last_notification_seq, limit=50)
+            new_seq = result["seq"]
+            if new_seq <= _last_notification_seq:
+                continue
+            _last_notification_seq = new_seq
+            # Notifications come newest-first from get_notifications; reverse for chronological send
+            for notif in reversed(result["notifications"]):
+                msg = {"type": "notification", "data": notif}
+                for client in _connected_ws_clients[:]:
+                    try:
+                        await client.send_json(msg)
+                    except Exception:
+                        try:
+                            _connected_ws_clients.remove(client)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            logger.warning(f"Notification broadcast error: {e}")
+
+
 def _verify_ws_token(token: str) -> bool:
     """Verify a WebSocket token against stored API keys."""
     keys = _load_api_keys()
@@ -398,7 +666,7 @@ def _verify_ws_token(token: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_bg_task, _ws_broadcast_task
+    global _snapshot_bg_task, _ws_broadcast_task, _ws_notification_task
     _init_web3_and_accounts()
     # Generate initial API key if none exist
     keys = _load_api_keys()
@@ -409,13 +677,14 @@ async def lifespan(app: FastAPI):
         print(f"  {key}")
         print(f"{'='*60}\n")
     # Backfill balance snapshots from trade history if sparse
-    _backfill_snapshots_if_needed()
+    await _backfill_snapshots_if_needed()
     # Start background tasks
     _snapshot_bg_task = asyncio.create_task(_periodic_snapshot_task())
     _ws_broadcast_task = asyncio.create_task(_ws_broadcast_loop())
+    _ws_notification_task = asyncio.create_task(_ws_notification_broadcast_loop())
     yield
     # Cleanup
-    for task in [_snapshot_bg_task, _ws_broadcast_task]:
+    for task in [_snapshot_bg_task, _ws_broadcast_task, _ws_notification_task]:
         if task:
             task.cancel()
             try:
@@ -424,7 +693,7 @@ async def lifespan(app: FastAPI):
                 pass
 
 
-def _backfill_snapshots_if_needed():
+async def _backfill_snapshots_if_needed():
     """Reconstruct balance history from trades if snapshots are sparse."""
     snapshots = safe_json_read(BALANCE_SNAPSHOTS_FILE, [])
     if len(snapshots) >= 20:
@@ -448,7 +717,7 @@ def _backfill_snapshots_if_needed():
     except Exception:
         return
 
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
     for pid, p in positions.items():
         if p.get("is_open", False):
             lev = p.get("leverage", 1)
@@ -520,6 +789,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     except Exception:
         pass
 
+    # Send recent notifications so the app catches up
+    try:
+        result = app_notifications.get_notifications(since_seq=0, limit=20)
+        await websocket.send_json({"type": "notifications_snapshot", "data": result})
+    except Exception:
+        pass
+
     try:
         while True:
             # Keep alive — receive pings/messages from client
@@ -543,7 +819,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 @app.get("/api/v1/health")
 async def health(token: str = Depends(verify_api_key)):
     """Health check — matches iOS HealthResponse."""
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
     trades = safe_json_read(TRADE_HISTORY_FILE, [])
     open_count = sum(1 for p in positions.values() if p.get("is_open", False)) if isinstance(positions, dict) else 0
 
@@ -570,45 +846,32 @@ async def dashboard(token: str = Depends(verify_api_key)):
     for wid, acct in accounts.items():
         free_usdc_gmx += await asyncio.to_thread(_get_usdc_balance, acct)
 
-    # Calculate deployed collateral + unrealized PnL from positions.json
-    # (more reliable than on-chain fetch which can fail silently)
+    # Calculate deployed collateral + unrealized PnL from live on-chain + exchange data
     deployed_collateral = 0.0
+    deployed_gmx = 0.0
+    deployed_bitunix = 0.0
     unrealized_pnl = 0.0
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
     for pid, p in positions.items():
         if p.get("is_open", False):
-            size = p.get("size_usd", 0)
-            lev = p.get("leverage", 1)
-            collateral = size / lev if lev > 0 else size
+            collateral = p.get("collateral_usd", 0)
+            if collateral <= 0:
+                size = p.get("size_usd", 0)
+                lev = p.get("leverage", 1)
+                collateral = size / lev if lev > 0 else size
             deployed_collateral += collateral
-
-            # Get live price for PnL calculation
-            symbol = p.get("symbol", "")
-            entry = p.get("entry_price", 0)
-            side = p.get("side", "LONG")
-            price = await asyncio.to_thread(_get_chainlink_price, symbol)
-            if price and entry > 0 and size > 0:
-                if side == "LONG":
-                    unrealized_pnl += (price - entry) / entry * size
-                else:
-                    unrealized_pnl += (entry - price) / entry * size
+            if p.get("exchange", "gmx") == "bitunix":
+                deployed_bitunix += collateral
             else:
-                # Fallback to stored PnL
-                unrealized_pnl += p.get("unrealized_pnl", 0)
+                deployed_gmx += collateral
+            unrealized_pnl += p.get("unrealized_pnl", 0)
 
-    # Include Bitunix balance + positions
+    # Fetch Bitunix available balance (separate from positions)
     free_usdc_bitunix = 0.0
     if bx_client:
         try:
-            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
-            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
-            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
-            free_usdc_bitunix = bx_bal
-            for bp in bx_positions:
-                bx_margin = float(bp.get("margin", 0))
-                bx_pnl = float(bp.get("unrealizedPNL", 0))
-                deployed_collateral += bx_margin
-                unrealized_pnl += bx_pnl
+            from bitunix_executor import get_bitunix_balance
+            free_usdc_bitunix = await asyncio.to_thread(get_bitunix_balance, bx_client)
         except Exception as e:
             logger.warning(f"Bitunix balance fetch failed: {e}")
 
@@ -648,6 +911,8 @@ async def dashboard(token: str = Depends(verify_api_key)):
         "free_usdc_gmx": round(free_usdc_gmx, 2),
         "free_usdc_bitunix": round(free_usdc_bitunix, 2),
         "deployed_collateral": round(deployed_collateral, 2),
+        "deployed_gmx": round(deployed_gmx, 2),
+        "deployed_bitunix": round(deployed_bitunix, 2),
         "unrealized_pnl": round(unrealized_pnl, 2),
         "change_24h_usd": round(change_24h_usd, 2),
         "change_24h_pct": round(change_24h_pct, 2),
@@ -741,7 +1006,7 @@ async def dashboard_chart(
         current_total = 0.0
         for wid, acct in accounts.items():
             current_total += await asyncio.to_thread(_get_usdc_balance, acct)
-        positions = safe_json_read(POSITIONS_FILE, {})
+        positions = await _fetch_all_live_positions()
         for pid, p in positions.items():
             if p.get("is_open", False):
                 size = p.get("size_usd", 0)
@@ -785,7 +1050,7 @@ async def dashboard_chart(
 
         # Add current point including unrealized PnL from open positions
         current_unrealized = 0.0
-        pos_data = safe_json_read(POSITIONS_FILE, {})
+        pos_data = await _fetch_all_live_positions()
         for pid, p in pos_data.items():
             if p.get("is_open", False):
                 symbol = p.get("symbol", "")
@@ -817,38 +1082,8 @@ async def dashboard_chart(
         }
 
     # Compute live portfolio value for the "now" endpoint
-    live_total = 0.0
-    for wid, acct in accounts.items():
-        live_total += await asyncio.to_thread(_get_usdc_balance, acct)
-    positions_data = safe_json_read(POSITIONS_FILE, {})
-    for pid, p in positions_data.items():
-        if p.get("is_open", False):
-            lev = p.get("leverage", 1)
-            size = p.get("size_usd", 0)
-            live_total += size / lev if lev > 0 else size
-            # Use live price for accuracy
-            symbol = p.get("symbol", "")
-            entry = p.get("entry_price", 0)
-            side = p.get("side", "LONG")
-            price = await asyncio.to_thread(_get_chainlink_price, symbol)
-            if price and entry > 0 and size > 0:
-                if side == "LONG":
-                    live_total += (price - entry) / entry * size
-                else:
-                    live_total += (entry - price) / entry * size
-            else:
-                live_total += p.get("unrealized_pnl", 0)
-    if bx_client:
-        try:
-            from bitunix_executor import get_bitunix_balance, get_bitunix_positions
-            bx_bal = await asyncio.to_thread(get_bitunix_balance, bx_client)
-            bx_positions = await asyncio.to_thread(get_bitunix_positions, bx_client)
-            live_total += bx_bal
-            for bp in bx_positions:
-                live_total += float(bp.get("margin", 0))
-                live_total += float(bp.get("unrealizedPNL", 0))
-        except Exception:
-            pass
+    # Calculate live total from all positions (both chains) + wallet balances
+    live_total = await _calculate_total_portfolio()
 
     # Always append a live "now" point so chart reflects current state
     if live_total > 0:
@@ -918,9 +1153,9 @@ def _format_position(pid: str, p: dict) -> dict:
 @app.get("/api/v1/positions")
 async def list_positions(token: str = Depends(verify_api_key)):
     """List open positions — matches iOS PositionsListResponse."""
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
 
-    # Update current prices from Chainlink
+    # Update current prices from Chainlink (safe — positions is a deep copy)
     for pid, p in positions.items():
         if p.get("is_open"):
             symbol = p.get("symbol", "")
@@ -946,18 +1181,25 @@ async def list_positions(token: str = Depends(verify_api_key)):
     total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions.values() if p.get("is_open"))
     total_value = sum(p.get("size_usd", 0) for p in positions.values() if p.get("is_open"))
 
-    return {
+    result = {
         "positions": open_positions,
         "total_pnl": round(total_pnl, 2),
         "total_value": round(total_value, 2),
         "count": len(open_positions),
     }
 
+    # Include fetch errors so the iOS app knows if data may be stale/incomplete
+    if _positions_fetch_errors:
+        result["fetch_errors"] = _positions_fetch_errors
+        result["is_stale"] = bool(_positions_stale and not open_positions and _positions_fetch_errors)
+
+    return result
+
 
 @app.get("/api/v1/positions/{position_id}")
 async def get_position(position_id: str, token: str = Depends(verify_api_key)):
     """Get a specific position."""
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
     if position_id not in positions:
         raise HTTPException(status_code=404, detail="Position not found")
 
@@ -966,8 +1208,8 @@ async def get_position(position_id: str, token: str = Depends(verify_api_key)):
 
 @app.post("/api/v1/positions/{position_id}/close")
 async def close_position(position_id: str, token: str = Depends(verify_api_key)):
-    """Close a position on-chain."""
-    positions = safe_json_read(POSITIONS_FILE, {})
+    """Close a position on-chain (GMX) or via exchange API (Bitunix)."""
+    positions = await _fetch_all_live_positions()
     if position_id not in positions:
         raise HTTPException(status_code=404, detail="Position not found")
 
@@ -975,14 +1217,38 @@ async def close_position(position_id: str, token: str = Depends(verify_api_key))
     if not p.get("is_open"):
         raise HTTPException(status_code=400, detail="Position already closed")
 
+    symbol = p.get("symbol", "")
+    is_long = p.get("side", "LONG") == "LONG"
+    exchange = p.get("exchange", "gmx")
+
+    if exchange == "bitunix":
+        # Close via Bitunix exchange API
+        if not bx_client:
+            raise HTTPException(status_code=500, detail="Bitunix client not configured")
+        try:
+            from bitunix_executor import close_bitunix_position
+            result = await asyncio.to_thread(
+                close_bitunix_position, bx_client, symbol, is_long
+            )
+            _invalidate_positions_cache()
+            return {
+                "success": result is not None,
+                "message": f"Close submitted for {symbol} {p.get('side', '')} on Bitunix",
+                "tx_hash": None,
+            }
+        except Exception as e:
+            logger.error(f"Failed to close Bitunix position {position_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # GMX: close on-chain
     wid = p.get("wallet_id", 1)
     acct = accounts.get(wid)
     if not acct:
         raise HTTPException(status_code=500, detail=f"Wallet {wid} not configured")
 
-    symbol = p.get("symbol", "")
-    market_addr = cfg.markets.get(symbol, "")
-    is_long = p.get("side", "LONG") == "LONG"
+    market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
+    if not market_addr:
+        raise HTTPException(status_code=500, detail=f"No market address for {symbol}")
 
     try:
         from close import create_close_order
@@ -995,17 +1261,19 @@ async def close_position(position_id: str, token: str = Depends(verify_api_key))
             Web3.to_checksum_address(market_addr),
             Web3.to_checksum_address(cfg.collateral_token),
             is_long,
-            int(p.get("size_usd", 0) * 10**30),  # size in USD with 30 decimals
+            int(p.get("size_usd", 0) * 10**30),
             cfg.execution_fee_wei,
             Web3.to_checksum_address(cfg.order_vault),
             Web3.to_checksum_address(cfg.exchange_router),
         )
 
+        _invalidate_positions_cache()
+
         # Save balance snapshot after close
         try:
             total = 0.0
-            for wid, acct in accounts.items():
-                total += await asyncio.to_thread(_get_usdc_balance, acct)
+            for w, a in accounts.items():
+                total += await asyncio.to_thread(_get_usdc_balance, a)
             _api_save_balance_snapshot(total)
         except Exception:
             pass
@@ -1493,7 +1761,7 @@ async def wallet_info(token: str = Depends(verify_api_key)):
 
     # Total portfolio includes deployed
     deployed = 0.0
-    positions = safe_json_read(POSITIONS_FILE, {})
+    positions = await _fetch_all_live_positions()
     for pid, p in positions.items():
         if p.get("is_open", False):
             size = p.get("size_usd", 0)
@@ -1884,6 +2152,49 @@ async def list_signals(
     signals = signals[:limit]
 
     return {"signals": signals}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOTIFICATIONS — app notification feed
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/api/v1/notifications")
+async def list_notifications(
+    since: int = Query(0, ge=0, description="Return notifications after this sequence number"),
+    limit: int = Query(50, ge=1, le=200),
+    category: Optional[str] = Query(None, description="Filter by category"),
+    priority: Optional[str] = Query(None, description="Filter by priority (critical, high, medium)"),
+    token: str = Depends(verify_api_key),
+):
+    """App notification feed.
+
+    Notifications are pushed by the bot in real-time. Use `since` param
+    with the returned `seq` value to poll for new notifications, or
+    connect to the WebSocket for instant delivery.
+
+    Categories: position_opened, position_closed, tp_hit, sl_moved,
+    sl_move_failed, tp_sl_move_failed, trading_halted, trading_resumed,
+    bot_online, bot_offline, signal_rejected, duplicate_blocked,
+    signal_executing, signal_error, channel_confirmed, mirror_error,
+    mirror_close, mirror_info, bitunix_error, startup_sl_fix,
+    startup_sl_failed, startup_cleanup, sl_missing, weekly_summary,
+    position_override, general.
+
+    Priorities: critical, high, medium.
+    """
+    result = app_notifications.get_notifications(since_seq=since, limit=limit)
+    notifications = result["notifications"]
+
+    if category:
+        notifications = [n for n in notifications if n.get("category") == category]
+    if priority:
+        notifications = [n for n in notifications if n.get("priority") == priority]
+
+    return {
+        "seq": result["seq"],
+        "notifications": notifications,
+        "count": len(notifications),
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
