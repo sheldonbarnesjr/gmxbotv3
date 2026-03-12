@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import time
+import traceback
 import copy
 import hmac
 import hashlib
@@ -2236,12 +2237,115 @@ class WithdrawRequest(BaseModel):
 
 @app.post("/api/v1/wallet/withdraw")
 async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
-    """Withdraw USDC — placeholder, requires careful implementation."""
-    # Safety: withdrawals need extra verification in production
-    raise HTTPException(
-        status_code=501,
-        detail="Withdrawals via API are disabled for safety. Use Telegram /withdraw command."
-    )
+    """Withdraw USDC from bot wallets to an external Arbitrum address."""
+    from web3 import Web3
+
+    # ── Validate address ──
+    addr = req.to_address.strip()
+    if not Web3.is_address(addr):
+        raise HTTPException(status_code=400, detail="Invalid Arbitrum address.")
+    destination = Web3.to_checksum_address(addr)
+
+    # ── Validate amount ──
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0.")
+    if req.amount < 1:
+        raise HTTPException(status_code=400, detail="Minimum withdrawal is $1.")
+
+    # ── Check combined balance ──
+    combined = 0.0
+    for wid, acct in accounts.items():
+        combined += _get_usdc_balance(acct)
+    if combined < req.amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient balance. Combined USDC: ${combined:,.2f}, requested: ${req.amount:,.2f}",
+        )
+
+    # ── Use W1 as the sending wallet ──
+    if 1 not in accounts:
+        raise HTTPException(status_code=500, detail="Primary wallet (W1) not configured.")
+    acct = accounts[1]
+
+    try:
+        # Check W1 balance; consolidate from other wallets if needed
+        w1_balance = _get_usdc_balance(acct)
+        if w1_balance < req.amount:
+            logger.info(f"Withdraw: W1 has ${w1_balance:.2f}, need ${req.amount:.2f} — consolidating...")
+            # Transfer from other wallets to W1
+            for wid in sorted(accounts.keys()):
+                if wid == 1:
+                    continue
+                other_acct = accounts[wid]
+                other_bal_raw, other_bal, decimals = await asyncio.to_thread(
+                    _get_token_balance, cfg.collateral_token, other_acct
+                )
+                if other_bal < 1:
+                    continue
+                transfer_data = w3.eth.contract(
+                    address=Web3.to_checksum_address(cfg.collateral_token),
+                    abi=ERC20_ABI,
+                ).encode_abi("transfer", [acct.address, other_bal_raw])
+                tx_h = await asyncio.to_thread(
+                    _api_send_tx, cfg.collateral_token, transfer_data, 0, other_acct
+                )
+                receipt = await asyncio.to_thread(_api_wait_receipt, tx_h)
+                if receipt.get("status") != 1:
+                    logger.warning(f"Consolidation from W{wid} failed")
+                else:
+                    logger.info(f"Consolidated ${other_bal:.2f} from W{wid} to W1")
+
+            # Re-check W1 balance
+            w1_balance = _get_usdc_balance(acct)
+            if w1_balance < req.amount:
+                return {
+                    "success": False,
+                    "message": f"W1 balance (${w1_balance:,.2f}) insufficient after consolidation.",
+                    "tx_hash": None,
+                }
+
+        # ── Build and send USDC transfer ──
+        usdc_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(cfg.collateral_token),
+            abi=ERC20_ABI,
+        )
+        decimals = await asyncio.to_thread(lambda: usdc_contract.functions.decimals().call())
+        raw_amount = round(req.amount * (10 ** decimals))
+
+        transfer_data = usdc_contract.encode_abi(
+            "transfer", [destination, raw_amount]
+        )
+
+        tx_hash = await asyncio.to_thread(
+            _api_send_tx, cfg.collateral_token, transfer_data, 0, acct
+        )
+
+        receipt = await asyncio.to_thread(_api_wait_receipt, tx_hash)
+        if receipt.get("status") != 1:
+            return {
+                "success": False,
+                "message": "Transfer transaction reverted on-chain.",
+                "tx_hash": tx_hash,
+            }
+
+        short = f"{destination[:8]}...{destination[-6:]}"
+        logger.info(f"Withdrawal complete: ${req.amount:.2f} USDC to {short}, tx={tx_hash}")
+
+        return {
+            "success": True,
+            "message": f"Sent ${req.amount:,.2f} USDC to {short}",
+            "tx_hash": tx_hash,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Withdraw failed: {e}\n{traceback.format_exc()}")
+        return {
+            "success": False,
+            "message": f"Withdrawal failed: {str(e)}",
+            "tx_hash": None,
+        }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
