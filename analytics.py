@@ -25,7 +25,7 @@ import asyncio
 import logging
 import tempfile
 import statistics
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
