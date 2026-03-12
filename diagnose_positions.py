@@ -484,8 +484,6 @@ async def diagnose_pnl():
         if not sym:
             continue
         total_pnl = sum(e.get("pnl_usd", 0) for e in events)
-        if abs(total_pnl) < 1:
-            continue
         last_ts = max(e.get("timestamp", 0) for e in events)
         closed_trades.append({"sym": sym, "pnl": total_pnl, "timestamp": last_ts})
 

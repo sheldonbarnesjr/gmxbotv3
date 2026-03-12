@@ -6,7 +6,9 @@ Handles position sizing, portfolio % logic, max risk checks,
 SL/TP validation, and "should trade?" guards.
 """
 
+import json
 import logging
+import os
 import re
 from typing import Optional, List, Tuple
 
@@ -324,6 +326,18 @@ def get_tp_allocations(n_tps: int) -> List[int]:
     return alloc
 
 
+def _load_trailing_sl_config() -> dict:
+    """Load trailing SL settings from user_config.json."""
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "json", "user_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r") as f:
+                return json.load(f).get("trailing_sl", {})
+    except Exception:
+        pass
+    return {}
+
+
 def determine_new_sl_target(
     tp_hits_count: int,
     entry_price: float,
@@ -332,16 +346,18 @@ def determine_new_sl_target(
 ) -> Tuple[Optional[float], Optional[str]]:
     """Determine where SL should move after TP hit(s).
 
-    Strategy:
-      TP1 hit → SL to Entry (breakeven)
-      TP2 hit → SL stays at Entry
-      TP3 hit → SL to TP1
-      TP4 hit → SL to TP2
-      TP5 hit → SL to TP3
-      ... always trail 2 levels back from TP3 onward
+    Reads trailing SL config from user_config.json:
+      sl_after_tp1: "entry" | "none"          (default: "entry")
+      sl_after_tp2: "entry" | "tp1" | "none"  (default: "none")
+      sl_trail_offset: int                     (default: 2, trail N levels back from TP3+)
 
     Returns (new_sl_price, sl_label), or (None, None) if no move needed.
     """
+    tsl_cfg = _load_trailing_sl_config()
+    sl_after_tp1 = tsl_cfg.get("sl_after_tp1", "entry")
+    sl_after_tp2 = tsl_cfg.get("sl_after_tp2", "none")
+    trail_offset = tsl_cfg.get("sl_trail_offset", 2)
+
     def _tp_price(idx):
         tp = sorted_tps[idx]
         return tp.price if hasattr(tp, "price") else tp
@@ -353,17 +369,23 @@ def determine_new_sl_target(
     if tp_hits_count >= len(sorted_tps):
         return None, None
 
-    # TP1 hit → SL to entry (breakeven)
+    # TP1 hit
     if tp_hits_count == 1:
-        return entry_price, "Entry"
-
-    # TP2 hit → SL already at Entry from TP1, no move needed
-    if tp_hits_count == 2:
+        if sl_after_tp1 == "entry":
+            return entry_price, "Entry"
         return None, None
 
-    # TP3+ hit → trail 2 levels back (TP3→Target 1, TP4→Target 2, TP5→Target 3, etc.)
-    trail_idx = tp_hits_count - 3  # 0-indexed: TP3→0(TP1), TP4→1(TP2), ...
-    if trail_idx < len(sorted_tps):
+    # TP2 hit
+    if tp_hits_count == 2:
+        if sl_after_tp2 == "entry":
+            return entry_price, "Entry"
+        elif sl_after_tp2 == "tp1":
+            return _tp_price(0), "Target 1"
+        return None, None
+
+    # TP3+ hit → trail N levels back
+    trail_idx = tp_hits_count - (trail_offset + 1)  # e.g. offset=2: TP3→idx 0 (TP1)
+    if 0 <= trail_idx < len(sorted_tps):
         return _tp_price(trail_idx), f"Target {trail_idx + 1}"
 
     return entry_price, "Entry"

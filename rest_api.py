@@ -2681,7 +2681,18 @@ async def get_config(token: str = Depends(verify_api_key)):
         "allowed_symbols": list(ALLOWED_SYMBOLS),
         "tp_distributions": tp_distributions,
         "max_tp_count": max_tp_count,
+        "trailing_sl": user_cfg.get("trailing_sl", {
+            "sl_after_tp1": "entry",
+            "sl_after_tp2": "none",
+            "sl_trail_offset": 2,
+        }),
     }
+
+
+class TrailingSLConfig(BaseModel):
+    sl_after_tp1: Optional[str] = None
+    sl_after_tp2: Optional[str] = None
+    sl_trail_offset: Optional[int] = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2691,6 +2702,7 @@ class ConfigUpdateRequest(BaseModel):
     bitunix_portfolio_fixed_usd: Optional[float] = None
     tp_distributions: Optional[Dict[str, List[int]]] = None
     max_tp_count: Optional[int] = None
+    trailing_sl: Optional[TrailingSLConfig] = None
 
 
 @app.post("/api/v1/config/update")
@@ -2737,6 +2749,28 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
             if any(p < 0 for p in pcts):
                 raise HTTPException(status_code=400, detail=f"TP split values must be >= 0")
         updated["tp_distributions"] = req.tp_distributions
+
+    # Validate and store trailing SL config
+    if req.trailing_sl is not None:
+        tsl = {}
+        if req.trailing_sl.sl_after_tp1 is not None:
+            if req.trailing_sl.sl_after_tp1 not in ("entry", "none"):
+                raise HTTPException(status_code=400, detail="sl_after_tp1 must be 'entry' or 'none'")
+            tsl["sl_after_tp1"] = req.trailing_sl.sl_after_tp1
+        if req.trailing_sl.sl_after_tp2 is not None:
+            if req.trailing_sl.sl_after_tp2 not in ("entry", "tp1", "none"):
+                raise HTTPException(status_code=400, detail="sl_after_tp2 must be 'entry', 'tp1', or 'none'")
+            tsl["sl_after_tp2"] = req.trailing_sl.sl_after_tp2
+        if req.trailing_sl.sl_trail_offset is not None:
+            if not (1 <= req.trailing_sl.sl_trail_offset <= 5):
+                raise HTTPException(status_code=400, detail="sl_trail_offset must be 1-5")
+            tsl["sl_trail_offset"] = req.trailing_sl.sl_trail_offset
+        if tsl:
+            # Merge with existing trailing_sl config
+            user_cfg_current = _load_user_config()
+            existing_tsl = user_cfg_current.get("trailing_sl", {})
+            existing_tsl.update(tsl)
+            updated["trailing_sl"] = existing_tsl
 
     # Persist all changes to user_config.json (survives restart)
     if updated:

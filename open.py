@@ -474,33 +474,42 @@ def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
     if n_tps < 2:
         return take_profits
 
-    # Check persistent user config overrides first
+    # Check persistent user config (single source of truth once saved from app)
     user_pcts = None
+    user_config_has_tp = False
     try:
         cfg_path = os.path.join(os.path.dirname(__file__), "json", "user_config.json")
         if os.path.exists(cfg_path):
             with open(cfg_path, "r") as f:
                 user_cfg = json.load(f)
             tp_dist = user_cfg.get("tp_distributions", {})
-            saved = tp_dist.get(str(n_tps))
-            if saved and len(saved) == n_tps and sum(saved) == 100:
-                user_pcts = [p / 100.0 for p in saved]
+            if tp_dist:
+                # user_config.json owns TP settings — .env is ignored
+                user_config_has_tp = True
+                saved = tp_dist.get(str(n_tps))
+                if saved and len(saved) == n_tps and sum(saved) == 100:
+                    user_pcts = [p / 100.0 for p in saved]
     except Exception:
         pass
 
     if user_pcts:
         for i, tp in enumerate(take_profits):
             tp.close_pct = user_pcts[i]
-    else:
+    elif not user_config_has_tp:
+        # Only fall back to .env if user has NEVER saved from the app
         env_pcts = _load_env_tp_dist(n_tps)
         if env_pcts and len(env_pcts) == n_tps and sum(env_pcts) > 0:
             for i, tp in enumerate(take_profits):
                 tp.close_pct = env_pcts[i]
         else:
-            # Fallback: equal distribution
             each = 1.0 / n_tps
             for tp in take_profits:
                 tp.close_pct = each
+    else:
+        # user_config.json exists but missing this TP count — equal split
+        each = 1.0 / n_tps
+        for tp in take_profits:
+            tp.close_pct = each
 
     # Ensure exact 1.0 total (absorb rounding into last TP)
     actual_total = sum(tp.close_pct for tp in take_profits)

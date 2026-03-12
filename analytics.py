@@ -622,8 +622,6 @@ class AnalyticsMixin:
             events = filtered_events
 
             total_pnl = sum(_net(e) for e in events)
-            if abs(total_pnl) < 1:
-                continue
             last_ts = max(e.get("timestamp", 0) for e in events)
             result.append({"sym": sym, "pnl": total_pnl, "timestamp": last_ts,
                            "market_address": market, "is_long": is_long})

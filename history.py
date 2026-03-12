@@ -931,8 +931,6 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
                 continue
             total_pnl = sum(_net(e) for e in events)
             total_size = sum(e.get("size_delta_usd", 0) for e in events)
-            if abs(total_pnl) < 1:
-                continue
 
             events_sorted = sorted(events, key=lambda e: e.get("timestamp", 0))
             first_event = events_sorted[0]
