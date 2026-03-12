@@ -425,6 +425,11 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
 
     try:
         data = [asdict(t) for t in trade_history]
+        for d in data:
+            if d.get("tp_details") is None:
+                d["tp_details"] = []
+            if d.get("unfilled_targets") is None:
+                d["unfilled_targets"] = []
         atomic_json_write(TRADE_HISTORY_FILE, data)
     except Exception as e:
         logger.error(f"Failed to save trade history: {e}", exc_info=True)

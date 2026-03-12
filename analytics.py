@@ -70,9 +70,9 @@ class TradeRecord:
     wallet_id: int = 0  # 0 = unknown (legacy records), 1-4 = wallet
     exchange: str = "gmx"  # "gmx" or "bitunix"
     tp_hits: int = 0  # number of TP orders hit before close
-    tp_details: list = None  # list of {"price": float, "pct": float, "pnl": float}
+    tp_details: list = field(default_factory=list)  # [{"price": float, "pct": float, "pnl": float}]
     sl_details: dict = None  # {"price": float, "pct": float, "pnl": float}
-    unfilled_targets: list = None  # list of {"price": float} — TP orders that never hit
+    unfilled_targets: list = field(default_factory=list)  # [{"price": float}] — TP orders that never hit
 
 
 class AnalyticsMixin:
@@ -371,7 +371,7 @@ class AnalyticsMixin:
                 sl_details = {"price": sl_fill, "pct": sl_pct, "pnl": sl_pnl}
 
         # Detect unfilled targets: compare position's TP levels vs filled TPs
-        unfilled_targets = None
+        unfilled_targets = []
         all_tp_levels = getattr(pos_obj, 'take_profits', None) or []
         if all_tp_levels:
             filled_prices = set()
@@ -442,6 +442,11 @@ class AnalyticsMixin:
         """Persist trade history to disk as JSON (atomic write with backup)."""
         try:
             data = [asdict(t) for t in self.trade_history]
+            for d in data:
+                if d.get("tp_details") is None:
+                    d["tp_details"] = []
+                if d.get("unfilled_targets") is None:
+                    d["unfilled_targets"] = []
             atomic_json_write(TRADE_HISTORY_FILE, data)
         except Exception as e:
             logger.error(f"CRITICAL: Failed to save trade history: {e}", exc_info=True)
@@ -1002,9 +1007,9 @@ class AnalyticsMixin:
         def _card_h(trade):
             """Calculate dynamic card height based on TP/SL/unfilled lines."""
             base = PAD * 2 + 4 * 5  # header + pnl + size + entry + date
-            tp_count = len(trade.get("tp_details", []))
+            tp_count = len(trade.get("tp_details") or [])
             sl_count = 1 if trade.get("sl_details") else 0
-            unfilled_count = len(trade.get("unfilled_targets", []))
+            unfilled_count = len(trade.get("unfilled_targets") or [])
             return base + TP_LINE_H * (tp_count + sl_count + unfilled_count)
 
         i = 0
@@ -1089,7 +1094,7 @@ class AnalyticsMixin:
                     cy += 4
 
                 # Target lines (with green checkmark)
-                tp_dets = t.get("tp_details", [])
+                tp_dets = t.get("tp_details") or []
                 for j, tp in enumerate(tp_dets, 1):
                     pdf.set_xy(cx, cy)
                     pdf.set_font("ZapfDingbats", "", 6)
@@ -1125,7 +1130,7 @@ class AnalyticsMixin:
                     cy += TP_LINE_H
 
                 # Unfilled targets (red X)
-                unfilled = t.get("unfilled_targets", [])
+                unfilled = t.get("unfilled_targets") or []
                 tp_count = len(tp_dets)
                 for k, uf in enumerate(unfilled, tp_count + 1):
                     pdf.set_xy(cx, cy)

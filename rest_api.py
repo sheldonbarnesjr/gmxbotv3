@@ -62,6 +62,7 @@ def _load_user_config() -> dict:
 
 def _save_user_config(data: dict):
     """Save persistent user config overrides."""
+    data["last_updated"] = datetime.utcnow().isoformat() + "Z"
     atomic_json_write(USER_CONFIG_FILE, data)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1880,6 +1881,11 @@ async def trade_stats(
 async def trades_pdf(token: str = Depends(verify_api_key)):
     """Generate and return a PDF trade history report."""
     trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    for t in trades:
+        if t.get("tp_details") is None:
+            t["tp_details"] = []
+        if t.get("unfilled_targets") is None:
+            t["unfilled_targets"] = []
     trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
 
     if not trades:
@@ -2013,9 +2019,9 @@ def _generate_trade_pdf(trades: list) -> str:
 
     def _card_h(trade):
         base = PAD * 2 + 4 * 5
-        tp_count = len(trade.get("tp_details", []))
+        tp_count = len(trade.get("tp_details") or [])
         sl_count = 1 if trade.get("sl_details") else 0
-        unfilled_count = len(trade.get("unfilled_targets", []))
+        unfilled_count = len(trade.get("unfilled_targets") or [])
         return base + TP_LINE_H * (tp_count + sl_count + unfilled_count)
 
     i = 0
@@ -2093,7 +2099,7 @@ def _generate_trade_pdf(trades: list) -> str:
                 cy += 4
 
             # TP targets
-            tp_dets = t.get("tp_details", [])
+            tp_dets = t.get("tp_details") or []
             for j, tp in enumerate(tp_dets, 1):
                 pdf.set_xy(cx, cy)
                 pdf.set_font("ZapfDingbats", "", 6)
@@ -2128,7 +2134,7 @@ def _generate_trade_pdf(trades: list) -> str:
                 cy += TP_LINE_H
 
             # Unfilled targets
-            unfilled = t.get("unfilled_targets", [])
+            unfilled = t.get("unfilled_targets") or []
             tp_count = len(tp_dets)
             for k, uf in enumerate(unfilled, tp_count + 1):
                 pdf.set_xy(cx, cy)
@@ -2686,6 +2692,7 @@ async def get_config(token: str = Depends(verify_api_key)):
             "sl_after_tp2": "none",
             "sl_trail_offset": 2,
         }),
+        "config_last_updated": user_cfg.get("last_updated"),
     }
 
 
@@ -2792,7 +2799,7 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
         user_cfg.update(updated)
         _save_user_config(user_cfg)
 
-    return {"success": True, "updated": updated}
+    return {"success": True, "updated": updated, "config_last_updated": user_cfg.get("last_updated")}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
