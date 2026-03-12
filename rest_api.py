@@ -450,6 +450,52 @@ async def _fetch_all_live_positions() -> dict:
                             saved = sv
                             break
 
+                    # Build take_profits from original TPs
+                    all_tps = [
+                        {"price": tp.get("price", 0), "percentage": _close_pct_to_100(tp.get("close_pct", tp.get("percentage", 0)))}
+                        for tp in saved.get("original_take_profits", [])
+                        if tp.get("price", 0) > 0
+                    ]
+
+                    # Query Bitunix directly for pending TP orders to determine
+                    # accurate tp_hits (avoids false hits from monitor bugs)
+                    bx_verified = []
+                    try:
+                        pending_orders = await asyncio.to_thread(
+                            bx_client.get_pending_tpsl_orders, bx_symbol_raw
+                        )
+                        # Pending TP prices for this specific position
+                        pending_tp_prices = set()
+                        for o in pending_orders:
+                            if o.get("positionId") == position_id:
+                                tp_price = float(o.get("tpPrice") or 0)
+                                if tp_price > 0:
+                                    pending_tp_prices.add(round(tp_price, 1))
+
+                        # TPs not in pending are hit — build verified_decreases from them
+                        for tp in all_tps:
+                            tp_price = tp.get("price", 0)
+                            if round(tp_price, 1) not in pending_tp_prices:
+                                tp_pct = tp.get("percentage", 0) / 100.0
+                                tp_size = saved.get("original_size_usd", size_usd) * tp_pct
+                                if entry_price > 0 and tp_size > 0:
+                                    if side == "LONG":
+                                        tp_pnl = (tp_price - entry_price) / entry_price * tp_size
+                                    else:
+                                        tp_pnl = (entry_price - tp_price) / entry_price * tp_size
+                                else:
+                                    tp_pnl = 0
+                                bx_verified.append({
+                                    "execution_price": tp_price,
+                                    "matched_tp_price": tp_price,
+                                    "size_delta_usd": tp_size,
+                                    "pnl_usd": tp_pnl,
+                                    "net_pnl_usd": tp_pnl,
+                                })
+                    except Exception as e:
+                        logger.debug(f"Bitunix pending TP query failed for {symbol}: {e}")
+                        bx_verified = saved.get("verified_decreases", [])
+
                     positions[pid] = {
                         "id": pid,
                         "symbol": symbol,
@@ -464,12 +510,8 @@ async def _fetch_all_live_positions() -> dict:
                         "unrealized_pnl": round(unrealized_pnl, 2),
                         "realized_pnl": saved.get("realized_pnl", 0),
                         "collateral_usd": round(margin, 2),
-                        "take_profits": [
-                            {"price": tp.get("price", 0), "percentage": _close_pct_to_100(tp.get("close_pct", tp.get("percentage", 0)))}
-                            for tp in saved.get("original_take_profits", [])
-                            if tp.get("price", 0) > 0
-                        ],
-                        "verified_decreases": saved.get("verified_decreases", []),
+                        "take_profits": all_tps,
+                        "verified_decreases": bx_verified,
                         "wallet_id": 1,
                         "exchange": "bitunix",
                         "market_addr": None,
@@ -1318,7 +1360,29 @@ def _format_position(pid: str, p: dict) -> dict:
     pnl_pct = (upnl / collateral * 100) if collateral > 0 else 0
     opened_at = p.get("opened_at", 0)
     duration_h = (time.time() - opened_at) / 3600 if opened_at > 0 else 0
-    tp_hits = len(p.get("verified_decreases", []))
+
+    # Match verified_decreases to TP prices to determine tp_hits and per-TP PnL.
+    # For Bitunix: verified_decreases are built from direct exchange query (accurate).
+    # For GMX: verified_decreases come from on-chain decrease events (accurate).
+    vds = p.get("verified_decreases", [])
+    vd_by_price = {}
+    for vd in vds:
+        vd_price = vd.get("matched_tp_price") or vd.get("execution_price", 0)
+        if vd_price > 0:
+            vd_by_price[round(vd_price, 1)] = vd
+
+    formatted_tps = []
+    tp_hits = 0
+    for tp in tps:
+        tp_price = tp.get("price", 0)
+        tp_entry = {"price": tp_price, "percentage": tp.get("percentage", 0)}
+        matched_vd = vd_by_price.get(round(tp_price, 1))
+        if matched_vd:
+            tp_hits += 1
+            tp_entry["realized_pnl"] = round(
+                matched_vd.get("net_pnl_usd", matched_vd.get("pnl_usd", 0)), 2
+            )
+        formatted_tps.append(tp_entry)
 
     return {
         "id": pid,
@@ -1333,10 +1397,7 @@ def _format_position(pid: str, p: dict) -> dict:
         "pnl_percentage": round(pnl_pct, 2),
         "collateral_usd": round(collateral, 2),
         "stop_loss": p.get("stop_loss"),
-        "take_profits": [
-            {"price": tp.get("price", 0), "percentage": tp.get("percentage", 0)}
-            for tp in tps
-        ],
+        "take_profits": formatted_tps,
         "is_open": p.get("is_open", True),
         "opened_at": opened_at,
         "duration_hours": round(duration_h, 2),
