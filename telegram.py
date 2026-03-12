@@ -2124,7 +2124,7 @@ class CoreTelegramMixin:
             open_positions=self.positions,
         )
         self.trade_history = all_trades
-        today_trades = [t for t in all_trades if t.closed_at >= today_cutoff and abs(t.pnl_usd) >= 1]
+        today_trades = [t for t in all_trades if t.closed_at >= today_cutoff]
 
         realized_pnl = sum(t.pnl_usd for t in today_trades)
         realized_count = len(today_trades)
@@ -2218,8 +2218,7 @@ class CoreTelegramMixin:
         ET = ZoneInfo("America/New_York")
         now = datetime.now(ET)
 
-        # Use fully-closed trades only (not partial TP hits)
-        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        trades = list(self.trade_history)
         lifetime_count = len(trades)
         lifetime_pnl = sum(t.pnl_usd for t in trades)
         lifetime_wins = sum(1 for t in trades if t.pnl_usd > 0)
@@ -2304,7 +2303,7 @@ class CoreTelegramMixin:
         )
         self.trade_history = all_trades
 
-        tagged = [t for t in all_trades if abs(t.pnl_usd) >= 1]
+        tagged = list(all_trades)
 
         lifetime_pnl = sum(t.pnl_usd for t in tagged)
         lifetime_wins = sum(1 for t in tagged if t.pnl_usd > 0)

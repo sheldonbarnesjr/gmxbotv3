@@ -90,8 +90,7 @@ class AnalyticsMixin:
         Returns:
             Dict with keys: win_rate, wins, losses, total, avg_win, avg_loss, pnl
         """
-        # Exclude dust trades (< $1 PnL)
-        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        trades = list(self.trade_history)
 
         if symbol:
             trades = [t for t in trades if t.symbol == symbol]
@@ -118,7 +117,7 @@ class AnalyticsMixin:
 
     def calculate_platform_stats(self, exchange: str = None) -> Dict[str, Any]:
         """Calculate performance stats optionally filtered by exchange platform."""
-        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        trades = list(self.trade_history)
         if exchange:
             trades = [t for t in trades if getattr(t, 'exchange', 'gmx') == exchange]
 
@@ -237,8 +236,7 @@ class AnalyticsMixin:
         )
         self.trade_history = all_trades
 
-        # Filter: exclude dust, apply symbol/n filters
-        trades = [t for t in all_trades if abs(t.pnl_usd) >= 1]
+        trades = list(all_trades)
         if symbol:
             trades = [t for t in trades if t.symbol == symbol.upper()]
         if n and n > 0:
@@ -535,7 +533,7 @@ class AnalyticsMixin:
         except Exception as e:
             self.logger.warning(f"Winrate rebuild failed: {e}")
 
-        trades = [t for t in self.trade_history if abs(t.pnl_usd) >= 1]
+        trades = list(self.trade_history)
 
         if symbol:
             trades = [t for t in trades if t.symbol == symbol.upper()]
@@ -761,7 +759,7 @@ class AnalyticsMixin:
         msg += "\n\n" + format_section("All Time", alltime_stats)
 
         # ── Bitunix platform breakdown (from internal trade history) ──
-        bx_trades = [t for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix' and abs(t.pnl_usd) >= 1]
+        bx_trades = [t for t in self.trade_history if getattr(t, 'exchange', 'gmx') == 'bitunix']
         bx_open = [p for p in self.positions.values() if p.is_open and getattr(p, 'exchange', 'gmx') == 'bitunix']
         if bx_trades or bx_open:
             bx_today = [t for t in bx_trades if t.closed_at >= today_cutoff]
@@ -900,8 +898,6 @@ class AnalyticsMixin:
                 "opened_at": t.opened_at,
             })
 
-        # Exclude dust trades (< $1 PnL), sort newest first
-        unified = [t for t in unified if abs(t["pnl_usd"]) >= 1]
         unified.sort(key=lambda x: x["timestamp"], reverse=True)
 
         # ── Time buckets ──

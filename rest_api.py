@@ -1764,7 +1764,6 @@ async def list_trades(
 ):
     """List trade history — matches iOS TradesListResponse."""
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
-    all_trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
 
     # Sort by closed_at descending (most recent first)
     all_trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
@@ -1794,7 +1793,7 @@ async def trade_stats(
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
 
     # Filter by symbol if provided
-    trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
+    trades = list(all_trades)
     if symbol:
         trades = [t for t in trades if t.get("symbol") == symbol]
 
@@ -1880,8 +1879,7 @@ async def trade_stats(
 @app.get("/api/v1/trades/pdf")
 async def trades_pdf(token: str = Depends(verify_api_key)):
     """Generate and return a PDF trade history report."""
-    all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
-    trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
+    trades = safe_json_read(TRADE_HISTORY_FILE, [])
     trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
 
     if not trades:
@@ -2743,6 +2741,11 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
     # Persist all changes to user_config.json (survives restart)
     if updated:
         user_cfg = _load_user_config()
+        # Merge TP distributions instead of replacing (so partial saves keep other counts)
+        if "tp_distributions" in updated:
+            existing_tp = user_cfg.get("tp_distributions", {})
+            existing_tp.update(updated["tp_distributions"])
+            updated["tp_distributions"] = existing_tp
         user_cfg.update(updated)
         _save_user_config(user_cfg)
 
