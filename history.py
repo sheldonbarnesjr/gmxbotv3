@@ -922,7 +922,7 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
             last_event = events_sorted[-1]
             entry_price = first_event.get("execution_price", 0)
 
-            exit_price = _fill_price(
+            exit_price = last_event.get("execution_price") or _fill_price(
                 entry_price, last_event.get("pnl_usd", 0),
                 last_event.get("size_delta_usd", 0), is_long
             )
@@ -942,7 +942,7 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
                 if e.get("order_type") == 5:
                     tp_size = e.get("size_delta_usd", 0)
                     tp_base = e.get("pnl_usd", 0)
-                    tp_fill = _fill_price(entry_price, tp_base, tp_size, is_long)
+                    tp_fill = e.get("execution_price") or _fill_price(entry_price, tp_base, tp_size, is_long)
                     tp_pnl = e.get("net_pnl_usd", tp_base)
                     pct_closed = (tp_size / total_size * 100) if total_size > 0 else 0
                     tp_details.append({"price": tp_fill, "pct": pct_closed, "pnl": tp_pnl})
@@ -953,8 +953,9 @@ def build_rich_trades(on_chain_events: list, created_orders: list,
             sl_details = None
             if sl_events:
                 sl_ev = sl_events[-1]
-                sl_fill = _fill_price(entry_price, sl_ev.get("pnl_usd", 0),
-                                      sl_ev.get("size_delta_usd", 0), is_long)
+                sl_fill = sl_ev.get("execution_price") or _fill_price(
+                    entry_price, sl_ev.get("pnl_usd", 0),
+                    sl_ev.get("size_delta_usd", 0), is_long)
                 sl_size = sum(e.get("size_delta_usd", 0) for e in sl_events)
                 sl_pnl = sum(_net(e) for e in sl_events)
                 sl_pct = (sl_size / total_size * 100) if total_size > 0 else 0
