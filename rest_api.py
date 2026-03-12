@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -327,11 +327,78 @@ async def _periodic_snapshot_task():
 
 
 _snapshot_bg_task = None
+_ws_broadcast_task = None
+_connected_ws_clients: list[WebSocket] = []
+
+
+async def _get_positions_payload() -> dict:
+    """Build the positions_update payload, reusing existing position logic."""
+    positions = safe_json_read(POSITIONS_FILE, {})
+
+    # Update current prices from Chainlink
+    for pid, p in positions.items():
+        if p.get("is_open"):
+            symbol = p.get("symbol", "")
+            price = await asyncio.to_thread(_get_chainlink_price, symbol)
+            if price:
+                p["current_price"] = price
+                side = p.get("side", "LONG")
+                entry = p.get("entry_price", 0)
+                size = p.get("size_usd", 0)
+                if entry > 0 and size > 0:
+                    if side == "LONG":
+                        p["unrealized_pnl"] = (price - entry) / entry * size
+                    else:
+                        p["unrealized_pnl"] = (entry - price) / entry * size
+
+    open_positions = [
+        _format_position(pid, p)
+        for pid, p in positions.items()
+        if p.get("is_open", False)
+    ]
+
+    total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions.values() if p.get("is_open"))
+    total_value = sum(p.get("size_usd", 0) for p in positions.values() if p.get("is_open"))
+
+    return {
+        "positions": open_positions,
+        "total_pnl": round(total_pnl, 2),
+        "total_value": round(total_value, 2),
+        "count": len(open_positions),
+    }
+
+
+async def _ws_broadcast_loop():
+    """Broadcast position updates to all connected WebSocket clients every 5 seconds."""
+    while True:
+        await asyncio.sleep(5)
+        if not _connected_ws_clients:
+            continue
+        try:
+            data = await _get_positions_payload()
+            msg = {"type": "positions_update", "data": data}
+            for client in _connected_ws_clients[:]:
+                try:
+                    await client.send_json(msg)
+                except Exception:
+                    try:
+                        _connected_ws_clients.remove(client)
+                    except ValueError:
+                        pass
+        except Exception as e:
+            logger.warning(f"WebSocket broadcast error: {e}")
+
+
+def _verify_ws_token(token: str) -> bool:
+    """Verify a WebSocket token against stored API keys."""
+    keys = _load_api_keys()
+    valid_keys = [k["key"] for k in keys]
+    return token in valid_keys
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_bg_task
+    global _snapshot_bg_task, _ws_broadcast_task
     _init_web3_and_accounts()
     # Generate initial API key if none exist
     keys = _load_api_keys()
@@ -343,16 +410,18 @@ async def lifespan(app: FastAPI):
         print(f"{'='*60}\n")
     # Backfill balance snapshots from trade history if sparse
     _backfill_snapshots_if_needed()
-    # Start background snapshot task
+    # Start background tasks
     _snapshot_bg_task = asyncio.create_task(_periodic_snapshot_task())
+    _ws_broadcast_task = asyncio.create_task(_ws_broadcast_loop())
     yield
     # Cleanup
-    if _snapshot_bg_task:
-        _snapshot_bg_task.cancel()
-        try:
-            await _snapshot_bg_task
-        except asyncio.CancelledError:
-            pass
+    for task in [_snapshot_bg_task, _ws_broadcast_task]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def _backfill_snapshots_if_needed():
@@ -427,6 +496,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WEBSOCKET — real-time position updates for iOS app
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.websocket("/api/v1/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
+    """WebSocket endpoint for live position updates."""
+    if not _verify_ws_token(token):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    _connected_ws_clients.append(websocket)
+    logger.info(f"WebSocket client connected ({len(_connected_ws_clients)} total)")
+
+    # Send current positions immediately on connect
+    try:
+        data = await _get_positions_payload()
+        await websocket.send_json({"type": "positions_update", "data": data})
+    except Exception:
+        pass
+
+    try:
+        while True:
+            # Keep alive — receive pings/messages from client
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        try:
+            _connected_ws_clients.remove(websocket)
+        except ValueError:
+            pass
+        logger.info(f"WebSocket client disconnected ({len(_connected_ws_clients)} total)")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
