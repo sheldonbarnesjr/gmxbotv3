@@ -625,6 +625,7 @@ def fetch_recent_position_decreases(
     market: str,
     is_long: bool,
     lookback_seconds: int = 600,
+    from_block_override: int = None,
 ) -> List[Dict[str, Any]]:
     """Fetch recent PositionDecrease events for a specific market+wallet.
 
@@ -633,16 +634,31 @@ def fetch_recent_position_decreases(
     Used by check_tp_hits to verify that a TP order disappearance
     corresponds to an actual keeper execution, not a cancellation.
 
+    Args:
+        from_block_override: If set, scan from this block instead of using
+            lookback_seconds. Used by high-water mark optimization to avoid
+            re-scanning already-processed blocks.
+
     Returns list of dicts with: size_delta_usd, execution_price, is_long,
-    market_address, timestamp, tx_hash.
+    market_address, timestamp, tx_hash, block_number.
     """
     emitter_addr = Web3.to_checksum_address(_EVENT_EMITTER)
     wallet_topic = "0x" + "0" * 24 + account.lower().replace("0x", "")
     market_lower = market.lower()
 
     current_block = w3.eth.block_number
-    lookback_blocks = lookback_seconds * _BLOCKS_PER_SECOND
-    from_block = max(0, current_block - int(lookback_blocks))
+    if from_block_override and from_block_override > 0:
+        from_block = min(from_block_override, current_block)
+    else:
+        lookback_blocks = lookback_seconds * _BLOCKS_PER_SECOND
+        from_block = max(0, current_block - int(lookback_blocks))
+
+    scan_range = current_block - from_block
+    source = "high-water mark" if from_block_override else f"{lookback_seconds}s lookback"
+    log.debug(
+        f"Event scan: blocks {from_block}-{current_block} range={scan_range} ({source}) "
+        f"for {account[:10]}...{market_lower[:10]}..."
+    )
 
     # Fetch trigger prices from OrderCreated events
     trigger_price_map, all_created_orders = _fetch_trigger_prices(w3, account, from_block, current_block)
@@ -826,6 +842,7 @@ def fetch_recent_position_decreases(
                     "timestamp": blk_ts,
                     "tx_hash": tx_hash,
                     "log_index": rlog.get("logIndex", 0),
+                    "block_number": block_num,
                     "order_type": order_type,  # 5=TP, 6=SL, 4=MarketDecrease, None=unknown
                 })
 

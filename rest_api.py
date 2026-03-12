@@ -26,7 +26,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, WebSocket, WebSocketDisconnect
@@ -37,6 +37,7 @@ from pydantic import BaseModel
 # ── Bot imports ──
 from config import load_config, ALLOWED_SYMBOLS, CHAINLINK_FEEDS, CHAINLINK_ABI
 from state_io import safe_json_read, atomic_json_write
+from shared_cache import write_positions_cache, write_prices_cache, write_balances_cache
 import app_notifications
 
 logger = logging.getLogger("GMXBot.rest_api")
@@ -51,6 +52,17 @@ BALANCE_SNAPSHOTS_FILE = "json/balance_snapshots.json"
 SIGNAL_STORE_FILE = "json/signal_store.json"
 API_KEYS_FILE = "json/api_keys.json"
 CHART_CONFIG_FILE = "json/chart_config.json"
+USER_CONFIG_FILE = "json/user_config.json"
+
+
+def _load_user_config() -> dict:
+    """Load persistent user config overrides (survives bot restart)."""
+    return safe_json_read(USER_CONFIG_FILE, {})
+
+
+def _save_user_config(data: dict):
+    """Save persistent user config overrides."""
+    atomic_json_write(USER_CONFIG_FILE, data)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Globals initialized at startup
@@ -91,6 +103,17 @@ def _init_web3_and_accounts():
     global cfg, w3, accounts, bx_client
 
     cfg = load_config()
+
+    # Apply persistent user config overrides (survives restart)
+    user_cfg = _load_user_config()
+    if "portfolio_pct" in user_cfg:
+        cfg.portfolio_pct = user_cfg["portfolio_pct"]
+    if "portfolio_fixed_usd" in user_cfg:
+        cfg.portfolio_fixed_usd = user_cfg["portfolio_fixed_usd"]
+    if "bitunix_portfolio_pct" in user_cfg:
+        cfg.bitunix_portfolio_pct = user_cfg["bitunix_portfolio_pct"]
+    if "bitunix_portfolio_fixed_usd" in user_cfg:
+        cfg.bitunix_portfolio_fixed_usd = user_cfg["bitunix_portfolio_fixed_usd"]
 
     from web3 import Web3
     w3 = Web3(Web3.HTTPProvider(cfg.rpc_url))
@@ -218,18 +241,23 @@ FALLBACK_RPCS = [
 ]
 
 
+_usdc_decimals: int = None  # USDC decimals are immutable (always 6), cached on first call
+
 def _get_usdc_balance(account) -> float:
     """Get USDC balance for an account, with RPC fallback."""
     from web3 import Web3
 
     def _try_fetch(web3_inst):
+        global _usdc_decimals
         token = web3_inst.eth.contract(
             address=Web3.to_checksum_address(cfg.collateral_token),
             abi=ERC20_ABI,
         )
-        decimals = token.functions.decimals().call()
+        if _usdc_decimals is None:
+            _usdc_decimals = token.functions.decimals().call()
+            logger.debug(f"USDC decimals cached: {_usdc_decimals} (RPC call)")
         balance_raw = token.functions.balanceOf(account.address).call()
-        return balance_raw / (10 ** decimals)
+        return balance_raw / (10 ** _usdc_decimals)
 
     # Try primary RPC
     try:
@@ -260,6 +288,8 @@ def _get_eth_balance(account) -> float:
         return 0.0
 
 
+_chainlink_decimals_cache: dict = {}  # {symbol: decimals} — immutable, cached forever
+
 def _get_chainlink_price(symbol: str) -> Optional[float]:
     """Fetch price from Chainlink oracle on Arbitrum."""
     feed_addr = CHAINLINK_FEEDS.get(symbol)
@@ -271,7 +301,10 @@ def _get_chainlink_price(symbol: str) -> Optional[float]:
             address=Web3.to_checksum_address(feed_addr),
             abi=CHAINLINK_ABI,
         )
-        decimals = contract.functions.decimals().call()
+        if symbol not in _chainlink_decimals_cache:
+            _chainlink_decimals_cache[symbol] = contract.functions.decimals().call()
+            logger.debug(f"Chainlink decimals cached: {symbol}={_chainlink_decimals_cache[symbol]} (RPC call)")
+        decimals = _chainlink_decimals_cache[symbol]
         _, answer, _, updated_at, _ = contract.functions.latestRoundData().call()
         price = answer / (10 ** decimals)
         return price
@@ -570,6 +603,18 @@ async def _fetch_all_live_positions() -> dict:
     _positions_fetch_errors = fetch_errors
     if positions:
         _positions_stale = copy.deepcopy(positions)  # save as last known good
+
+    # Write-through to shared cache for the bot process to consume
+    try:
+        # Group positions by wallet_id for efficient bot lookups
+        by_wallet = {}
+        for pid, p in positions.items():
+            wkey = str(p.get("wallet_id", 1))
+            by_wallet.setdefault(wkey, []).append(p)
+        write_positions_cache(by_wallet, now)
+    except Exception as e:
+        logger.debug(f"Shared positions cache write failed: {e}")
+
     return copy.deepcopy(positions)
 
 
@@ -634,6 +679,9 @@ async def _periodic_snapshot_task():
 _snapshot_bg_task = None
 _ws_broadcast_task = None
 _ws_notification_task = None
+_positions_refresh_task = None
+_price_cache_task = None
+_balance_cache_task = None
 _connected_ws_clients: list[WebSocket] = []
 _last_notification_seq: int = 0  # track last broadcast notification seq
 
@@ -819,11 +867,24 @@ async def _get_positions_payload() -> dict:
     """Build the positions_update payload, reusing existing position logic."""
     positions = await _fetch_all_live_positions()
 
-    # Update current prices from Chainlink (safe — positions is a deep copy)
+    # Fetch prices once per unique symbol (not per position) to avoid redundant RPC calls
+    symbols_needed = {p.get("symbol", "") for p in positions.values() if p.get("is_open") and p.get("symbol")}
+    open_count = sum(1 for p in positions.values() if p.get("is_open"))
+    fresh_prices = {}
+    for symbol in symbols_needed:
+        price = await asyncio.to_thread(_get_chainlink_price, symbol)
+        if price:
+            fresh_prices[symbol] = price
+    logger.debug(
+        f"Price dedup: {len(symbols_needed)} unique symbols for {open_count} open positions "
+        f"(saved {max(0, open_count - len(symbols_needed))} redundant Chainlink calls)"
+    )
+
+    # Apply cached prices to all positions
     for pid, p in positions.items():
         if p.get("is_open"):
             symbol = p.get("symbol", "")
-            price = await asyncio.to_thread(_get_chainlink_price, symbol)
+            price = fresh_prices.get(symbol)
             if price:
                 p["current_price"] = price
                 side = p.get("side", "LONG")
@@ -856,6 +917,66 @@ async def _get_positions_payload() -> dict:
         result["is_stale"] = bool(_positions_stale and not open_positions and _positions_fetch_errors)
 
     return result
+
+
+async def _positions_refresh_loop():
+    """Keep shared positions cache warm for the bot process, regardless of WebSocket clients.
+
+    The _ws_broadcast_loop skips work when no iOS clients are connected,
+    so this dedicated loop ensures the cache stays fresh 24/7.
+    The 5s in-memory TTL in _fetch_all_live_positions() prevents double-fetching
+    when both this loop and _ws_broadcast_loop run simultaneously.
+    """
+    while True:
+        await asyncio.sleep(5)
+        try:
+            await _fetch_all_live_positions()  # writes to shared cache as side effect
+        except Exception as e:
+            logger.debug(f"Positions refresh loop error: {e}")
+
+
+async def _price_cache_writer_loop():
+    """Write Chainlink prices to shared cache every 10s for the bot to consume."""
+    while True:
+        await asyncio.sleep(10)
+        try:
+            prices = {}
+            for symbol in ALLOWED_SYMBOLS:
+                price = await asyncio.to_thread(_get_chainlink_price, symbol)
+                if price is not None:
+                    prices[symbol] = price
+            if prices:
+                write_prices_cache(prices)
+        except Exception as e:
+            logger.debug(f"Price cache writer error: {e}")
+
+
+async def _balance_cache_writer_loop():
+    """Write wallet balances to shared cache every 30s for the bot to consume."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            balances = {"wallets": {}}
+            for wid, acct in accounts.items():
+                try:
+                    bal = await asyncio.to_thread(_get_usdc_balance, acct)
+                    balances["wallets"][str(wid)] = bal
+                except Exception as e:
+                    logger.debug(f"Balance fetch failed for wallet {wid}: {e}")
+            if bx_client:
+                try:
+                    from bitunix_executor import get_bitunix_balance
+                    balances["bitunix"] = await asyncio.to_thread(get_bitunix_balance, bx_client)
+                except Exception:
+                    pass
+            # Only write if we got at least one wallet balance — don't overwrite
+            # valid cache with empty data during RPC outages
+            if balances["wallets"]:
+                write_balances_cache(balances)
+            else:
+                logger.debug("Balance cache writer: all wallet fetches failed, keeping previous cache")
+        except Exception as e:
+            logger.debug(f"Balance cache writer error: {e}")
 
 
 async def _ws_broadcast_loop():
@@ -920,6 +1041,7 @@ def _verify_ws_token(token: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _snapshot_bg_task, _ws_broadcast_task, _ws_notification_task
+    global _positions_refresh_task, _price_cache_task, _balance_cache_task
     _init_web3_and_accounts()
     # Generate initial API key if none exist
     keys = _load_api_keys()
@@ -935,9 +1057,15 @@ async def lifespan(app: FastAPI):
     _snapshot_bg_task = asyncio.create_task(_periodic_snapshot_task())
     _ws_broadcast_task = asyncio.create_task(_ws_broadcast_loop())
     _ws_notification_task = asyncio.create_task(_ws_notification_broadcast_loop())
+    # Shared cache writers (keep cache warm for the bot process)
+    _positions_refresh_task = asyncio.create_task(_positions_refresh_loop())
+    _price_cache_task = asyncio.create_task(_price_cache_writer_loop())
+    _balance_cache_task = asyncio.create_task(_balance_cache_writer_loop())
+    logger.info("Shared cache writer loops started (positions/5s, prices/10s, balances/30s)")
     yield
     # Cleanup
-    for task in [_snapshot_bg_task, _ws_broadcast_task, _ws_notification_task]:
+    for task in [_snapshot_bg_task, _ws_broadcast_task, _ws_notification_task,
+                 _positions_refresh_task, _price_cache_task, _balance_cache_task]:
         if task:
             task.cancel()
             try:
@@ -1636,6 +1764,7 @@ async def list_trades(
 ):
     """List trade history — matches iOS TradesListResponse."""
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    all_trades = [t for t in all_trades if abs(t.get("pnl_usd", 0)) >= 1]
 
     # Sort by closed_at descending (most recent first)
     all_trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
@@ -2516,6 +2645,24 @@ async def list_notifications(
 @app.get("/api/v1/config")
 async def get_config(token: str = Depends(verify_api_key)):
     """Bot configuration (safe fields only — no private keys)."""
+    # Build TP distributions: user overrides first, then .env defaults
+    from open import _load_env_tp_dist
+    user_cfg = _load_user_config()
+    saved_tp = user_cfg.get("tp_distributions", {})
+    tp_distributions = {}
+    for n in range(2, 9):
+        key = str(n)
+        if key in saved_tp:
+            tp_distributions[key] = saved_tp[key]
+        else:
+            env_pcts = _load_env_tp_dist(n)
+            if env_pcts and sum(env_pcts) > 0:
+                tp_distributions[key] = [int(round(p * 100)) for p in env_pcts]
+            else:
+                tp_distributions[key] = [int(round(100 / n))] * n
+                # Fix rounding so it sums to 100
+                tp_distributions[key][-1] = 100 - sum(tp_distributions[key][:-1])
+
     return {
         "exchange_mode": cfg.exchange_mode,
         "min_leverage": cfg.min_leverage,
@@ -2532,6 +2679,7 @@ async def get_config(token: str = Depends(verify_api_key)):
         "network": cfg.network,
         "slippage_bps": cfg.slippage_bps,
         "allowed_symbols": list(ALLOWED_SYMBOLS),
+        "tp_distributions": tp_distributions,
     }
 
 
@@ -2540,6 +2688,7 @@ class ConfigUpdateRequest(BaseModel):
     portfolio_fixed_usd: Optional[float] = None
     bitunix_portfolio_pct: Optional[float] = None
     bitunix_portfolio_fixed_usd: Optional[float] = None
+    tp_distributions: Optional[Dict[str, List[int]]] = None
 
 
 @app.post("/api/v1/config/update")
@@ -2566,6 +2715,27 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
             raise HTTPException(status_code=400, detail="bitunix_portfolio_fixed_usd must be >= 0")
         cfg.bitunix_portfolio_fixed_usd = req.bitunix_portfolio_fixed_usd
         updated["bitunix_portfolio_fixed_usd"] = cfg.bitunix_portfolio_fixed_usd
+
+    # Validate and store TP distributions
+    if req.tp_distributions is not None:
+        for key, pcts in req.tp_distributions.items():
+            n = int(key)
+            if n < 2 or n > 8:
+                raise HTTPException(status_code=400, detail=f"TP count must be 2-8, got {key}")
+            if len(pcts) != n:
+                raise HTTPException(status_code=400, detail=f"TP split for count {key} has {len(pcts)} values, expected {n}")
+            if sum(pcts) != 100:
+                raise HTTPException(status_code=400, detail=f"TP split for count {key} sums to {sum(pcts)}, must equal 100")
+            if any(p < 0 for p in pcts):
+                raise HTTPException(status_code=400, detail=f"TP split values must be >= 0")
+        updated["tp_distributions"] = req.tp_distributions
+
+    # Persist all changes to user_config.json (survives restart)
+    if updated:
+        user_cfg = _load_user_config()
+        user_cfg.update(updated)
+        _save_user_config(user_cfg)
+
     return {"success": True, "updated": updated}
 
 

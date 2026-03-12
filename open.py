@@ -468,22 +468,39 @@ def apply_env_tp_pcts(take_profits: List[TakeProfit], trade_type: str,
                       swing_keyword_match: bool = False) -> List[TakeProfit]:
     """Apply env-configured TP percentage splits (TP_3_1, TP_4_1, etc.).
 
-    Reads TP_{n}_{i} from .env for the given TP count.
-    Falls back to equal distribution if not configured.
+    Checks user_config.json overrides first, then .env, then equal distribution.
     """
     n_tps = len(take_profits)
     if n_tps < 2:
         return take_profits
 
-    env_pcts = _load_env_tp_dist(n_tps)
-    if env_pcts and len(env_pcts) == n_tps and sum(env_pcts) > 0:
+    # Check persistent user config overrides first
+    user_pcts = None
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "json", "user_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r") as f:
+                user_cfg = json.load(f)
+            tp_dist = user_cfg.get("tp_distributions", {})
+            saved = tp_dist.get(str(n_tps))
+            if saved and len(saved) == n_tps and sum(saved) == 100:
+                user_pcts = [p / 100.0 for p in saved]
+    except Exception:
+        pass
+
+    if user_pcts:
         for i, tp in enumerate(take_profits):
-            tp.close_pct = env_pcts[i]
+            tp.close_pct = user_pcts[i]
     else:
-        # Fallback: equal distribution
-        each = 1.0 / n_tps
-        for tp in take_profits:
-            tp.close_pct = each
+        env_pcts = _load_env_tp_dist(n_tps)
+        if env_pcts and len(env_pcts) == n_tps and sum(env_pcts) > 0:
+            for i, tp in enumerate(take_profits):
+                tp.close_pct = env_pcts[i]
+        else:
+            # Fallback: equal distribution
+            each = 1.0 / n_tps
+            for tp in take_profits:
+                tp.close_pct = each
 
     # Ensure exact 1.0 total (absorb rounding into last TP)
     actual_total = sum(tp.close_pct for tp in take_profits)
@@ -1553,6 +1570,17 @@ def fetch_current_price(symbol: str, w3=None) -> float:
     Falls back to CoinGecko only if Chainlink is unavailable."""
 
     symbol_upper = symbol.upper()
+
+    # ── Try shared cache first (written by rest_api.py every 10s) ──
+    try:
+        from shared_cache import read_prices_cache
+        cached_prices = read_prices_cache(max_age_s=20.0)
+        if cached_prices and symbol_upper in cached_prices:
+            price = cached_prices[symbol_upper]
+            if price and price > 0:
+                return float(price)
+    except Exception:
+        pass  # shared cache unavailable, fall through to direct fetch
 
     # ── Primary: Chainlink on-chain price feed ──
     feed_addr = CHAINLINK_FEEDS.get(symbol_upper)

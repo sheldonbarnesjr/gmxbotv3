@@ -264,6 +264,8 @@ class AnalyticsMixin:
     async def _record_trade(self, pos_obj, exit_reason: str = "manual"):
         """Record a closed position as a trade in history.
 
+        Acquires _rebuild_lock to prevent race conditions with rebuild_all_trades().
+
         Fetches actual exit price and PnL from on-chain PositionDecrease
         events when available, falling back to internal data if the RPC
         call fails or no events are found.
@@ -272,6 +274,11 @@ class AnalyticsMixin:
             pos_obj: Position object with id, symbol, side, entry_price, size_usd, leverage, etc.
             exit_reason: Why the position closed ('manual', 'tp_hit', 'sl_triggered', 'liquidation_or_manual', 'override')
         """
+        from trade_rebuilder import _rebuild_lock
+        async with _rebuild_lock:
+            await self._record_trade_inner(pos_obj, exit_reason)
+
+    async def _record_trade_inner(self, pos_obj, exit_reason: str = "manual"):
         if pos_obj.closed_at is None:
             pos_obj.closed_at = time.time()
 

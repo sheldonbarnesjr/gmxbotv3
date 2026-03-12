@@ -52,6 +52,11 @@ class SLTPMixin:
     # Per-position asyncio locks to prevent concurrent state mutation
     _position_locks: Dict[str, asyncio.Lock] = {}
 
+    # High-water mark: last block scanned per wallet+market+direction.
+    # Avoids re-scanning ~2400 blocks every 5s — only scans new blocks.
+    # Resets on bot restart (empty dict → full lookback on first cycle).
+    _last_scanned_block: Dict[str, int] = {}
+
     def _get_pos_lock(self, pos_id: str) -> asyncio.Lock:
         """Return (creating if needed) an asyncio.Lock for the given position."""
         if pos_id not in self._position_locks:
@@ -109,10 +114,49 @@ class SLTPMixin:
 
                 # Step 1: Fetch PositionDecrease events with rate-limit retry
                 lookback = lookback_override or 600
+                hwm_key = f"{acct.address}:{pos.market_addr}:{is_long}"
+                last_block = self._last_scanned_block.get(hwm_key, 0)
+                # Use high-water mark for steady-state; full lookback on first scan or override
+                from_block_ovr = (last_block + 1) if (last_block and not lookback_override) else None
+                self.logger.debug(
+                    f"TP scan {pos.symbol} {pos.side}: hwm={last_block or 'none'} "
+                    f"from_block_override={from_block_ovr or 'full lookback'}"
+                )
                 decreases = await self._fetch_decreases_with_retry(
                     acct.address, pos.market_addr, is_long,
                     lookback_seconds=lookback,
+                    from_block_override=from_block_ovr,
                 )
+
+                # Update high-water mark only on SUCCESSFUL scan (not on fetch failure).
+                # None = fetch failed → don't advance hwm (would skip blocks and miss TP hits).
+                # []   = success, no results → advance hwm to current block.
+                # [..] = success, results → advance hwm to max block seen.
+                old_hwm = last_block
+                if decreases is not None:
+                    if decreases:
+                        max_blk = max(d.get("block_number", 0) for d in decreases)
+                        self._last_scanned_block[hwm_key] = max(last_block, max_blk)
+                        self.logger.debug(
+                            f"TP scan {pos.symbol}: {len(decreases)} decrease(s) found, "
+                            f"hwm {old_hwm}->{self._last_scanned_block[hwm_key]}"
+                        )
+                    else:
+                        # Successful scan, no results — advance hwm so we don't
+                        # re-scan the same range next cycle
+                        try:
+                            cur_block = self.w3.eth.block_number
+                            self._last_scanned_block[hwm_key] = cur_block
+                            self.logger.debug(
+                                f"TP scan {pos.symbol}: no decreases, hwm {old_hwm}->{cur_block}"
+                            )
+                        except Exception:
+                            pass
+                else:
+                    self.logger.debug(
+                        f"TP scan {pos.symbol}: fetch failed, hwm stays at {old_hwm} (will re-scan)"
+                    )
+
                 if not decreases:
                     continue
 
@@ -377,10 +421,10 @@ class SLTPMixin:
                             lookback_seconds=1800,  # 30-min lookback for stale check
                         )
                     except Exception:
-                        decreases = []
+                        decreases = None
 
                     verified = False
-                    for evt in decreases:
+                    for evt in (decreases or []):
                         event_key = f"{evt.get('tx_hash', '')}:{evt.get('log_index', 0)}"
                         if event_key in pos.processed_tx_hashes:
                             continue
@@ -457,8 +501,12 @@ class SLTPMixin:
         lookback_seconds: int = 600,
         max_retries: int = 3,
         base_delay: float = 5.0,
-    ) -> list:
+        from_block_override: int = None,
+    ) -> Optional[list]:
         """Fetch PositionDecrease events with retry on rate-limit errors.
+
+        Returns list of decrease dicts on success (may be empty),
+        or None on failure (all retries exhausted).
 
         On rate-limit / too-many-calls errors: waits with exponential
         backoff (5s, 10s, 20s) and retries up to max_retries times.
@@ -468,7 +516,7 @@ class SLTPMixin:
                 decreases = await asyncio.to_thread(
                     fetch_recent_position_decreases,
                     self.w3, wallet_address, market_addr,
-                    is_long, lookback_seconds,
+                    is_long, lookback_seconds, from_block_override,
                 )
                 return decreases
             except Exception as e:
@@ -494,8 +542,8 @@ class SLTPMixin:
                         self.logger.warning(
                             f"Failed to fetch position decreases: {e}"
                         )
-                    return []
-        return []
+                    return None
+        return None
 
     # ──────────────────────────────────────────────────────────────────────
     # Move SL after TP hits or manual command

@@ -322,6 +322,7 @@ CHAINLINK_ABI = [
      "inputs": [], "outputs": [{"type": "uint8"}]},
 ]
 _chainlink_decimals_cache_close: dict = {}
+_erc20_metadata_cache: dict = {}  # {address_lower: (decimals, symbol)} — immutable, cached forever
 
 # Cache of last successfully fetched prices, keyed by symbol_pair (uppercase).
 # Used as a final fallback when all price sources fail.
@@ -334,6 +335,18 @@ def fetch_current_price(symbol_pair: str, w3=None) -> float:
     Falls back to last-known cached price if all sources fail."""
 
     key = symbol_pair.upper()
+
+    # ── Try shared cache first (written by rest_api.py every 10s) ──
+    try:
+        from shared_cache import read_prices_cache
+        cached_prices = read_prices_cache(max_age_s=20.0)
+        if cached_prices and key in cached_prices:
+            price = cached_prices[key]
+            if price and price > 0:
+                _last_known_prices[key] = float(price)
+                return float(price)
+    except Exception:
+        pass  # shared cache unavailable, fall through to direct fetch
 
     # ── Primary: Chainlink on-chain ──
     feed_addr = CHAINLINK_FEEDS.get(key)
@@ -721,14 +734,21 @@ def fetch_positions(w3: Web3, wallet: str) -> List[GMXPosition]:
         size_tokens_raw = numbers[1]
         collateral_raw = numbers[2]
         
-        # Get collateral token info
-        try:
-            col_contract = w3.eth.contract(address=collateral_token, abi=ERC20_ABI)
-            col_dec = col_contract.functions.decimals().call()
-            col_sym = col_contract.functions.symbol().call()
-        except Exception:
-            col_dec = 6
-            col_sym = "USDC"
+        # Get collateral token info (cached — decimals and symbol are immutable)
+        addr_lower = collateral_token.lower() if isinstance(collateral_token, str) else collateral_token
+        if addr_lower not in _erc20_metadata_cache:
+            try:
+                col_contract = w3.eth.contract(address=collateral_token, abi=ERC20_ABI)
+                col_dec = col_contract.functions.decimals().call()
+                col_sym = col_contract.functions.symbol().call()
+                _erc20_metadata_cache[addr_lower] = (col_dec, col_sym)
+                log.debug(f"ERC20 metadata cached: {addr_lower[:10]}... → dec={col_dec} sym={col_sym} (RPC call)")
+            except Exception:
+                col_dec = 6
+                col_sym = "USDC"
+        else:
+            col_dec, col_sym = _erc20_metadata_cache[addr_lower]
+            log.debug(f"ERC20 metadata cache hit: {addr_lower[:10]}... → dec={col_dec} sym={col_sym}")
         
         collateral_amount = collateral_raw / (10 ** col_dec)
         leverage = size_usd / collateral_amount if collateral_amount > 0 else 0
@@ -888,16 +908,24 @@ def create_close_order(
             log.debug(f"   Close size USD: ${close_size_usd:.2f}")
             log.debug(f"   Size delta (scaled): {size_delta_usd}")
         
-        # Get collateral token decimals
-        try:
-            col_token = w3.eth.contract(address=position.collateral_token, abi=ERC20_ABI)
-            col_decimals = col_token.functions.decimals().call() if not dry_run else 6
-            col_symbol = col_token.functions.symbol().call() if not dry_run else "USDC"
-        except Exception as e:
-            col_decimals = 6  # USDC default
+        # Get collateral token decimals (cached — immutable values)
+        ct_lower = position.collateral_token.lower() if isinstance(position.collateral_token, str) else position.collateral_token
+        if ct_lower in _erc20_metadata_cache:
+            col_decimals, col_symbol = _erc20_metadata_cache[ct_lower]
+        elif dry_run:
+            col_decimals = 6
             col_symbol = "USDC"
-            if debug:
-                log.debug(f"⚠️ Failed to get collateral info, using defaults: {e}")
+        else:
+            try:
+                col_token = w3.eth.contract(address=position.collateral_token, abi=ERC20_ABI)
+                col_decimals = col_token.functions.decimals().call()
+                col_symbol = col_token.functions.symbol().call()
+                _erc20_metadata_cache[ct_lower] = (col_decimals, col_symbol)
+            except Exception as e:
+                col_decimals = 6
+                col_symbol = "USDC"
+                if debug:
+                    log.debug(f"⚠️ Failed to get collateral info, using defaults: {e}")
         
         close_collateral = position.collateral_amount * percentage
         # For full close (100%), set collateral delta to 0 — the protocol

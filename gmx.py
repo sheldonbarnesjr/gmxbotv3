@@ -124,6 +124,28 @@ from bitunix_executor import (
 )
 from bitunix_monitor import BitunixMonitorMixin
 
+class _CachedPosition:
+    """Lightweight wrapper around a cached position dict from shared_cache.
+
+    Provides the same .market and .is_long attributes that GMXPosition has,
+    so check_pending_fills and check_position_closed can use cached data
+    with the same matching logic as direct chain fetches.
+    """
+    __slots__ = ("market", "is_long", "size_usd", "collateral_amount",
+                 "unrealized_pnl", "entry_price", "current_price", "leverage", "symbol")
+
+    def __init__(self, d: dict):
+        self.market = d.get("market_addr", "") or ""
+        self.is_long = d.get("side", "").upper() == "LONG"
+        self.size_usd = d.get("size_usd", 0)
+        self.collateral_amount = d.get("collateral_usd", 0)
+        self.unrealized_pnl = d.get("unrealized_pnl", 0)
+        self.entry_price = d.get("entry_price", 0)
+        self.current_price = d.get("current_price", 0)
+        self.leverage = d.get("leverage", 0)
+        self.symbol = d.get("symbol", "")
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATA STRUCTURES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2865,6 +2887,32 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             f"{self.health_stats['errors']} errors"
         )
 
+    async def _get_wallet_positions(self, wallet_id: int) -> list:
+        """Get on-chain positions for a wallet: shared cache first, direct RPC fallback.
+
+        The shared cache is written by rest_api.py every 5s. If the cache is
+        fresh (<10s old), we use it to avoid redundant RPC calls. If stale or
+        missing, we fall back to a direct chain fetch.
+
+        Safety: Callers that take ACTION when a position is NOT found (e.g.
+        check_position_closed marking a position closed) MUST verify with
+        direct RPC before acting. The cache is trusted for "position exists"
+        but NOT for "position is gone".
+        """
+        try:
+            from shared_cache import read_positions_cache
+            cached = read_positions_cache(max_age_s=10.0)
+            if cached and str(wallet_id) in cached:
+                # Cache has data for this wallet — reconstruct lightweight position objects
+                cached_list = cached[str(wallet_id)]
+                return [_CachedPosition(p) for p in cached_list]
+        except Exception:
+            pass  # shared cache unavailable, fall through
+
+        # Fallback: direct chain fetch
+        acct = self._get_account(wallet_id)
+        return await asyncio.to_thread(chain_fetch_positions, self.w3, acct.address)
+
     async def tp_monitor_loop(self):
         """Monitor open positions for TP hits and SL adjustments."""
         while True:
@@ -2880,71 +2928,86 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
     async def check_pending_fills(self):
         """Check if any pending limit orders have been filled on-chain."""
+        # Group pending positions by wallet to avoid redundant fetches
+        pending_by_wallet = {}
         for pos_id, pos in list(self.positions.items()):
             if not pos.pending_fill or not pos.is_open:
                 continue
             if not pos.market_addr:
                 continue
+            pending_by_wallet.setdefault(pos.wallet_id, []).append((pos_id, pos))
 
+        # Fetch once per wallet, then check all positions against that result
+        for wallet_id, wallet_positions in pending_by_wallet.items():
             try:
-                acct = self._get_account(pos.wallet_id)
-                chain_pos = await asyncio.to_thread(
-                    chain_fetch_positions, self.w3, acct.address
-                )
-                found = any(p.market.lower() == pos.market_addr.lower() and p.is_long == (pos.side == "LONG") for p in chain_pos)
-
-                if found:
-                    self.logger.info(f"{pos.symbol} {pos.side} limit order FILLED on-chain")
-                    pos.pending_fill = False
-                else:
-                    # Still pending — guard against None pending_fill_since
-                    if pos.pending_fill_since is None:
-                        pos.pending_fill_since = time.time()
-                    elapsed = time.time() - pos.pending_fill_since
-                    if elapsed > 300:  # 5 min timeout
-                        self.logger.warning(f"{pos.symbol} {pos.side} limit order still pending after 5m — cancelling on-chain")
-                        # Cancel the stale limit order on-chain
-                        try:
-                            exchange = self.w3.eth.contract(
-                                address=Web3.to_checksum_address(self.cfg.exchange_router),
-                                abi=EXCHANGE_ROUTER_ABI,
-                            )
-                            await asyncio.to_thread(
-                                cancel_orders_for_market,
-                                self.w3, acct, exchange, pos.market_addr, self.cfg.dry_run,
-                            )
-                            self.logger.info(f"Cancelled stale limit orders for {pos.symbol}")
-                        except Exception as ce:
-                            self.logger.warning(f"Failed to cancel stale orders for {pos.symbol}: {ce}")
-                        pos.pending_fill = False
-                        pos.is_open = False
-                        del self.positions[pos_id]
-                        await self.notify(
-                            f"⚠️ {pos.symbol} {pos.side} limit order expired after 5m — cancelled"
-                        )
+                chain_pos = await self._get_wallet_positions(wallet_id)
             except Exception as e:
-                self.logger.debug(f"Failed to check pending fill for {pos.symbol}: {e}")
+                self.logger.debug(f"Failed to fetch positions for wallet {wallet_id}: {e}")
+                continue
+
+            for pos_id, pos in wallet_positions:
+                try:
+                    found = any(p.market.lower() == pos.market_addr.lower() and p.is_long == (pos.side == "LONG") for p in chain_pos)
+
+                    if found:
+                        self.logger.info(f"{pos.symbol} {pos.side} limit order FILLED on-chain")
+                        pos.pending_fill = False
+                    else:
+                        # Still pending — guard against None pending_fill_since
+                        if pos.pending_fill_since is None:
+                            pos.pending_fill_since = time.time()
+                        elapsed = time.time() - pos.pending_fill_since
+                        if elapsed > 300:  # 5 min timeout
+                            self.logger.warning(f"{pos.symbol} {pos.side} limit order still pending after 5m — cancelling on-chain")
+                            # Cancel the stale limit order on-chain
+                            try:
+                                acct = self._get_account(pos.wallet_id)
+                                exchange = self.w3.eth.contract(
+                                    address=Web3.to_checksum_address(self.cfg.exchange_router),
+                                    abi=EXCHANGE_ROUTER_ABI,
+                                )
+                                await asyncio.to_thread(
+                                    cancel_orders_for_market,
+                                    self.w3, acct, exchange, pos.market_addr, self.cfg.dry_run,
+                                )
+                                self.logger.info(f"Cancelled stale limit orders for {pos.symbol}")
+                            except Exception as ce:
+                                self.logger.warning(f"Failed to cancel stale orders for {pos.symbol}: {ce}")
+                            pos.pending_fill = False
+                            pos.is_open = False
+                            del self.positions[pos_id]
+                            await self.notify(
+                                f"⚠️ {pos.symbol} {pos.side} limit order expired after 5m — cancelled"
+                            )
+                except Exception as e:
+                    self.logger.debug(f"Failed to check pending fill for {pos.symbol}: {e}")
 
     async def check_position_closed(self):
         """Check if any open positions have been closed on-chain (SL/TP hit, liquidation, etc.)."""
+        # Group eligible positions by wallet to avoid redundant chain fetches
+        eligible_by_wallet = {}
         for pos_id, pos in list(self.positions.items()):
             if not pos.is_open or pos.pending_fill:
                 continue
             if not pos.market_addr:
                 continue
-            # Skip Bitunix positions — they are monitored separately
             if getattr(pos, 'exchange', 'gmx') == 'bitunix':
                 continue
-            # Guard: if closed_at is already set, another coroutine beat us
             if pos.closed_at is not None:
                 continue
+            eligible_by_wallet.setdefault(pos.wallet_id, []).append((pos_id, pos))
 
+        # Fetch once per wallet, then check all positions against that result
+        for wallet_id, wallet_positions in eligible_by_wallet.items():
             try:
-                acct = self._get_account(pos.wallet_id)
-                chain_pos = await asyncio.to_thread(
-                    chain_fetch_positions, self.w3, acct.address
-                )
+                chain_pos = await self._get_wallet_positions(wallet_id)
+            except Exception as e:
+                self.logger.debug(f"Failed to fetch positions for wallet {wallet_id}: {e}")
+                continue
 
+            acct = self._get_account(wallet_id)
+            for pos_id, pos in wallet_positions:
+              try:
                 # Re-check is_open after the await — another coroutine (e.g.
                 # handle_close_confirmation) may have closed this position
                 # while we were fetching chain state.
@@ -2962,8 +3025,8 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     self._position_missing_count.pop(pos_id, None)
                     continue
 
-                # Position not found on-chain — require 2 consecutive misses
-                # to guard against stale RPC returning empty results.
+                # Position not found — require 2 consecutive misses
+                # to guard against stale cache/RPC returning empty results.
                 miss_count = self._position_missing_count.get(pos_id, 0) + 1
                 self._position_missing_count[pos_id] = miss_count
 
@@ -2974,7 +3037,33 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     )
                     continue
 
-                # 2nd consecutive miss — position is genuinely closed
+                # 2nd consecutive miss — verify with direct RPC before acting
+                # (bypasses cache to ensure we're not acting on stale data)
+                try:
+                    direct_pos = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    still_there = any(
+                        p.market.lower() == pos.market_addr.lower()
+                        and p.is_long == (pos.side == "LONG")
+                        for p in direct_pos
+                    )
+                    if still_there:
+                        # Cache was wrong — position still exists. Reset miss counter.
+                        self._position_missing_count.pop(pos_id, None)
+                        self.logger.info(
+                            f"{pos.symbol} {pos.side} [W{pos.wallet_id}] "
+                            f"direct RPC confirms position still open — cache was stale"
+                        )
+                        continue
+                except Exception as rpc_err:
+                    # RPC failed — don't act on uncertain data, retry next cycle
+                    self.logger.warning(
+                        f"Direct RPC verification failed for {pos.symbol}: {rpc_err} — skipping"
+                    )
+                    continue
+
+                # Confirmed closed by both cache misses AND direct RPC
                 self._position_missing_count.pop(pos_id, None)
                 self.logger.info(f"{pos.symbol} {pos.side} [W{pos.wallet_id}] position closed on-chain (confirmed)")
 
@@ -3194,7 +3283,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     except Exception as me:
                         self.logger.warning(f"[MIRROR] Failed to auto-close Bitunix: {me}")
 
-            except Exception as e:
+              except Exception as e:
                 self.logger.debug(f"Failed to check position close for {pos.symbol}: {e}")
 
 

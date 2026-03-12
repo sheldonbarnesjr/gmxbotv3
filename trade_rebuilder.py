@@ -109,8 +109,13 @@ async def _fetch_and_merge_onchain(w3, wallets: List[Tuple[int, Any]]) -> Tuple[
 # Bitunix closed-trade fetch
 # ─────────────────────────────────────────────────────────────────────
 
-async def _fetch_bitunix_trades(bitunix_client, open_position_ids: set = None) -> list:
-    """Fetch closed Bitunix positions from API, return list of TradeRecord."""
+async def _fetch_bitunix_trades(bitunix_client, open_position_ids: set = None) -> tuple:
+    """Fetch closed Bitunix positions from API.
+
+    Returns:
+        (trades: list[TradeRecord], success: bool) — success=False means API failed,
+        success=True means API responded (even if 0 trades returned).
+    """
     from analytics import TradeRecord
 
     try:
@@ -123,7 +128,7 @@ async def _fetch_bitunix_trades(bitunix_client, open_position_ids: set = None) -
         logger.info(f"Bitunix API: {len(positions)} closed positions, {len(tpsl)} TP/SL orders")
     except Exception as e:
         logger.warning(f"Failed to fetch Bitunix trade history: {e}")
-        return []
+        return [], False
 
     start_ts = _parse_start_ts()
     trades = []
@@ -280,7 +285,7 @@ async def _fetch_bitunix_trades(bitunix_client, open_position_ids: set = None) -
             continue
 
     logger.info(f"Parsed {len(trades)} Bitunix trade(s) from API (after date filter)")
-    return trades
+    return trades, True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -378,12 +383,44 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
                     open_bx_position_ids.add(str(bx_id))
 
     bx_count = 0
+    bx_success = False
     if bitunix_client:
-        bx_trades = await _fetch_bitunix_trades(bitunix_client, open_bx_position_ids)
+        bx_trades, bx_success = await _fetch_bitunix_trades(bitunix_client, open_bx_position_ids)
         trade_history.extend(bx_trades)
         bx_count = len(bx_trades)
 
-    # Step 6: Sort and persist
+    # Step 6: Preserve existing trades that couldn't be re-fetched
+    #   - Bitunix trades when Bitunix API failed (not just 0 results)
+    #   - Live-recorded trades (UUID IDs, not "rebuild_" or "bx_" prefixed)
+    fresh_keys = {(t.exchange, t.symbol, t.side, int(t.opened_at)) for t in trade_history}
+    fresh_ids = {t.id for t in trade_history}
+    preserved = 0
+
+    existing_data = safe_json_read(TRADE_HISTORY_FILE, default=[])
+    if existing_data:
+        valid_fields = {f.name for f in fields(TradeRecord)}
+        for record in existing_data:
+            rec_id = record.get("id", "")
+            if rec_id in fresh_ids:
+                continue
+            rec_key = (record.get("exchange", ""), record.get("symbol", ""),
+                       record.get("side", ""), int(record.get("opened_at", 0)))
+            if rec_key in fresh_keys:
+                continue  # Same trade re-fetched under a different ID
+
+            is_bitunix = record.get("exchange") == "bitunix"
+            bitunix_api_failed = bitunix_client is None or not bx_success
+            is_live_recorded = not rec_id.startswith("rebuild_") and not rec_id.startswith("bx_")
+
+            if (is_bitunix and bitunix_api_failed) or is_live_recorded:
+                try:
+                    filtered = {k: v for k, v in record.items() if k in valid_fields}
+                    trade_history.append(TradeRecord(**filtered))
+                    preserved += 1
+                except Exception as e:
+                    logger.warning(f"Skipping preserved trade {rec_id}: {e}")
+
+    # Step 7: Sort and persist
     trade_history.sort(key=lambda t: t.closed_at)
 
     try:
@@ -392,7 +429,7 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
     except Exception as e:
         logger.error(f"Failed to save trade history: {e}", exc_info=True)
 
-    logger.info(f"Rebuild complete: {gmx_count} GMX + {bx_count} Bitunix trade(s)")
+    logger.info(f"Rebuild complete: {gmx_count} GMX + {bx_count} Bitunix + {preserved} preserved trade(s)")
     return trade_history
 
 

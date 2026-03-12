@@ -167,6 +167,18 @@ class WalletMixin:
     async def _get_combined_usdc(self) -> float:
         """Get combined FREE USDC balance across all wallets (not deployed).
         All wallets act as one pool for sizing trades."""
+        # Try shared cache first (written by rest_api.py every 30s)
+        try:
+            from shared_cache import read_balances_cache
+            cached = read_balances_cache(max_age_s=45.0)
+            if cached and cached.get("wallets"):
+                total = sum(cached["wallets"].values())
+                if total > 0:
+                    return total
+        except Exception:
+            pass
+
+        # Fallback: direct ERC20 balance calls
         total_usdc = 0.0
         all_wallets = [acct for _, acct in self._all_wallets()]
         for acct in all_wallets:
@@ -183,22 +195,37 @@ class WalletMixin:
         This gives the true account value including capital locked in open positions.
         Used for position sizing so trades are portfolio_pct of TOTAL balance, not just free USDC.
         """
-        # Free USDC across all wallets
+        # Free USDC across all wallets (uses balance cache if fresh)
         free_usdc = await self._get_combined_usdc()
 
         # Deployed collateral + PnL from on-chain positions
         deployed_value = 0.0
-        all_wallets = [acct for _, acct in self._all_wallets()]
-        for acct in all_wallets:
-            try:
-                positions = await asyncio.to_thread(
-                    chain_fetch_positions, self.w3, acct.address
-                )
-                for pos in positions:
-                    # Each position's value = collateral + unrealized PnL
-                    deployed_value += pos.collateral_amount + pos.unrealized_pnl
-            except Exception as e:
-                self.logger.debug(f"Could not fetch positions for {acct.address[:10]}: {e}")
+
+        # Try shared positions cache first (written by rest_api.py every 5s)
+        used_cache = False
+        try:
+            from shared_cache import read_positions_cache
+            cached = read_positions_cache(max_age_s=10.0)
+            if cached:
+                for wkey, positions_list in cached.items():
+                    for p in positions_list:
+                        deployed_value += p.get("collateral_usd", 0) + p.get("unrealized_pnl", 0)
+                used_cache = True
+        except Exception:
+            pass
+
+        if not used_cache:
+            # Fallback: direct chain fetch per wallet
+            all_wallets = [acct for _, acct in self._all_wallets()]
+            for acct in all_wallets:
+                try:
+                    positions = await asyncio.to_thread(
+                        chain_fetch_positions, self.w3, acct.address
+                    )
+                    for pos in positions:
+                        deployed_value += pos.collateral_amount + pos.unrealized_pnl
+                except Exception as e:
+                    self.logger.debug(f"Could not fetch positions for {acct.address[:10]}: {e}")
 
         total = free_usdc + deployed_value
         self.logger.debug(
