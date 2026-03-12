@@ -2693,6 +2693,7 @@ class TrailingSLConfig(BaseModel):
     sl_after_tp1: Optional[str] = None
     sl_after_tp2: Optional[str] = None
     sl_trail_offset: Optional[int] = None
+    sl_rules: Optional[List[str]] = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2753,6 +2754,14 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
     # Validate and store trailing SL config
     if req.trailing_sl is not None:
         tsl = {}
+        # New per-TP rules format
+        if req.trailing_sl.sl_rules is not None:
+            valid_prefixes = ("none", "entry")
+            for i, rule in enumerate(req.trailing_sl.sl_rules):
+                if rule not in valid_prefixes and not (rule.startswith("tp") and rule[2:].isdigit()):
+                    raise HTTPException(status_code=400, detail=f"Invalid sl_rule '{rule}' at index {i}")
+            tsl["sl_rules"] = req.trailing_sl.sl_rules
+        # Legacy format
         if req.trailing_sl.sl_after_tp1 is not None:
             if req.trailing_sl.sl_after_tp1 not in ("entry", "none"):
                 raise HTTPException(status_code=400, detail="sl_after_tp1 must be 'entry' or 'none'")

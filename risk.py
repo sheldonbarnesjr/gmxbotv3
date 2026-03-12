@@ -338,6 +338,24 @@ def _load_trailing_sl_config() -> dict:
     return {}
 
 
+def _apply_sl_rule(rule: str, entry_price: float, sorted_tps: list) -> Tuple[Optional[float], Optional[str]]:
+    """Apply a single SL rule string and return (price, label)."""
+    def _tp_price(idx):
+        tp = sorted_tps[idx]
+        return tp.price if hasattr(tp, "price") else tp
+
+    if rule == "entry":
+        return entry_price, "Entry"
+    if rule.startswith("tp") and rule[2:].isdigit():
+        tp_num = int(rule[2:])  # "tp1" → 1
+        idx = tp_num - 1       # 0-based index
+        if 0 <= idx < len(sorted_tps):
+            return _tp_price(idx), f"Target {tp_num}"
+        return entry_price, "Entry"
+    # "none" or unknown
+    return None, None
+
+
 def determine_new_sl_target(
     tp_hits_count: int,
     entry_price: float,
@@ -346,14 +364,32 @@ def determine_new_sl_target(
 ) -> Tuple[Optional[float], Optional[str]]:
     """Determine where SL should move after TP hit(s).
 
-    Reads trailing SL config from user_config.json:
-      sl_after_tp1: "entry" | "none"          (default: "entry")
-      sl_after_tp2: "entry" | "tp1" | "none"  (default: "none")
-      sl_trail_offset: int                     (default: 2, trail N levels back from TP3+)
+    Reads trailing SL config from user_config.json.
+    Supports two formats:
+      - sl_rules: ["entry", "none", "tp1", ...]  (per-TP array, index 0 = after TP1)
+      - Legacy: sl_after_tp1, sl_after_tp2, sl_trail_offset
 
     Returns (new_sl_price, sl_label), or (None, None) if no move needed.
     """
+    if tp_hits_count <= 0:
+        return None, None
+
+    # All TPs hit → position fully closed, no SL move needed
+    if tp_hits_count >= len(sorted_tps):
+        return None, None
+
     tsl_cfg = _load_trailing_sl_config()
+    sl_rules = tsl_cfg.get("sl_rules")
+
+    if sl_rules and isinstance(sl_rules, list):
+        # New per-TP format: index 0 = after TP1 hit
+        rule_idx = tp_hits_count - 1
+        if rule_idx < len(sl_rules):
+            return _apply_sl_rule(sl_rules[rule_idx], entry_price, sorted_tps)
+        # Beyond configured rules — no move
+        return None, None
+
+    # Legacy format fallback
     sl_after_tp1 = tsl_cfg.get("sl_after_tp1", "entry")
     sl_after_tp2 = tsl_cfg.get("sl_after_tp2", "none")
     trail_offset = tsl_cfg.get("sl_trail_offset", 2)
@@ -362,20 +398,11 @@ def determine_new_sl_target(
         tp = sorted_tps[idx]
         return tp.price if hasattr(tp, "price") else tp
 
-    if tp_hits_count <= 0:
-        return None, None
-
-    # All TPs hit → position fully closed, no SL move needed
-    if tp_hits_count >= len(sorted_tps):
-        return None, None
-
-    # TP1 hit
     if tp_hits_count == 1:
         if sl_after_tp1 == "entry":
             return entry_price, "Entry"
         return None, None
 
-    # TP2 hit
     if tp_hits_count == 2:
         if sl_after_tp2 == "entry":
             return entry_price, "Entry"
@@ -384,7 +411,7 @@ def determine_new_sl_target(
         return None, None
 
     # TP3+ hit → trail N levels back
-    trail_idx = tp_hits_count - (trail_offset + 1)  # e.g. offset=2: TP3→idx 0 (TP1)
+    trail_idx = tp_hits_count - (trail_offset + 1)
     if 0 <= trail_idx < len(sorted_tps):
         return _tp_price(trail_idx), f"Target {trail_idx + 1}"
 
