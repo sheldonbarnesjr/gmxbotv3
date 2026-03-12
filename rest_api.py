@@ -211,20 +211,44 @@ UNISWAP_V3_ABI = [
 ]
 
 
+FALLBACK_RPCS = [
+    "https://rpc.ankr.com/arbitrum",
+    "https://arbitrum.drpc.org",
+    "https://1rpc.io/arb",
+]
+
+
 def _get_usdc_balance(account) -> float:
-    """Get USDC balance for an account."""
-    try:
-        from web3 import Web3
-        token = w3.eth.contract(
+    """Get USDC balance for an account, with RPC fallback."""
+    from web3 import Web3
+
+    def _try_fetch(web3_inst):
+        token = web3_inst.eth.contract(
             address=Web3.to_checksum_address(cfg.collateral_token),
             abi=ERC20_ABI,
         )
         decimals = token.functions.decimals().call()
         balance_raw = token.functions.balanceOf(account.address).call()
         return balance_raw / (10 ** decimals)
+
+    # Try primary RPC
+    try:
+        return _try_fetch(w3)
     except Exception as e:
-        logger.error(f"Error getting USDC balance for {account.address[:10]}: {e}")
-        return 0.0
+        logger.warning(f"Primary RPC failed for {account.address[:10]}: {e}")
+
+    # Try fallback RPCs
+    for rpc_url in FALLBACK_RPCS:
+        try:
+            fallback_w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
+            balance = _try_fetch(fallback_w3)
+            logger.info(f"Fallback RPC {rpc_url} succeeded for {account.address[:10]}")
+            return balance
+        except Exception:
+            continue
+
+    logger.error(f"All RPCs failed for {account.address[:10]}")
+    return 0.0
 
 
 def _get_eth_balance(account) -> float:
