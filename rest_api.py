@@ -1820,10 +1820,10 @@ async def change_position_strategy(
             state_key = None  # fall through to generic match
 
     if not state_key and exchange == "bitunix":
-        # Bitunix: try matching by bitunix_position_id first
+        # Bitunix: try matching by bitunix_position_id first (exact match)
         for key, val in pos_state.items():
             bid = val.get("bitunix_position_id", "")
-            if bid and position_id.endswith(bid):
+            if bid and position_id == f"bx_{bid}":
                 state_key = key
                 saved = val
                 break
@@ -1843,11 +1843,10 @@ async def change_position_strategy(
     if not original_tps:
         raise HTTPException(status_code=400, detail="No take profit data found for this position")
 
-    # Count TP hits from verified_decreases
+    # Count TP hits from verified_decreases (clamp to TP count to prevent IndexError)
     vds = saved.get("verified_decreases", [])
-    tp_hits_count = len(vds)
-
     n_tps = len(original_tps)
+    tp_hits_count = min(len(vds), n_tps)
     tp_count_key = str(n_tps)
 
     # 3. Look up distribution for this position's TP count
@@ -1885,11 +1884,10 @@ async def change_position_strategy(
     new_sl_price = None
     sl_rule_label = None
     if tp_hits_count > 0 and tp_hits_count < n_tps:
-        rule_idx = tp_hits_count - 1
-        if rule_idx < len(req.sl_rules):
-            new_sl_price, sl_rule_label = _apply_sl_rule(
-                req.sl_rules[rule_idx], entry_price, sorted_tp_prices
-            )
+        rule_idx = min(tp_hits_count - 1, len(req.sl_rules) - 1)  # Clamp to last rule
+        new_sl_price, sl_rule_label = _apply_sl_rule(
+            req.sl_rules[rule_idx], entry_price, sorted_tp_prices
+        )
 
     # Build response TPs (convert to 0-100 scale for iOS)
     response_tps = []
