@@ -116,6 +116,8 @@ def _init_web3_and_accounts():
         cfg.bitunix_portfolio_pct = user_cfg["bitunix_portfolio_pct"]
     if "bitunix_portfolio_fixed_usd" in user_cfg:
         cfg.bitunix_portfolio_fixed_usd = user_cfg["bitunix_portfolio_fixed_usd"]
+    if "exchange_mode" in user_cfg and user_cfg["exchange_mode"] in ("gmx", "bitunix", "mirror"):
+        cfg.exchange_mode = user_cfg["exchange_mode"]
 
     from web3 import Web3
     w3 = Web3(Web3.HTTPProvider(cfg.rpc_url))
@@ -3142,6 +3144,7 @@ class ConfigUpdateRequest(BaseModel):
     tp_distributions: Optional[Dict[str, List[int]]] = None
     max_tp_count: Optional[int] = None
     trailing_sl: Optional[TrailingSLConfig] = None
+    exchange_mode: Optional[str] = None
 
 
 @app.post("/api/v1/config/update")
@@ -3218,6 +3221,16 @@ async def update_config(req: ConfigUpdateRequest, token: str = Depends(verify_ap
             existing_tsl = user_cfg_current.get("trailing_sl", {})
             existing_tsl.update(tsl)
             updated["trailing_sl"] = existing_tsl
+
+    # Validate and apply exchange mode
+    if req.exchange_mode is not None:
+        valid_modes = ("gmx", "bitunix", "mirror")
+        if req.exchange_mode not in valid_modes:
+            raise HTTPException(status_code=400, detail=f"exchange_mode must be one of: {', '.join(valid_modes)}")
+        if req.exchange_mode in ("bitunix", "mirror") and bx_client is None:
+            raise HTTPException(status_code=400, detail=f"Cannot switch to {req.exchange_mode}: Bitunix API credentials not configured")
+        cfg.exchange_mode = req.exchange_mode
+        updated["exchange_mode"] = req.exchange_mode
 
     # Persist all changes to user_config.json (survives restart)
     if updated:
