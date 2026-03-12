@@ -392,8 +392,12 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
     # Step 6: Preserve existing trades that couldn't be re-fetched
     #   - Bitunix trades when Bitunix API failed (not just 0 results)
     #   - Live-recorded trades (UUID IDs, not "rebuild_" or "bx_" prefixed)
+    #   - Also: enrich fresh Bitunix trades with cached TP/SL data when the
+    #     Bitunix TP/SL history API no longer returns the orders
     fresh_keys = {(t.exchange, t.symbol, t.side, int(t.opened_at)) for t in trade_history}
     fresh_ids = {t.id for t in trade_history}
+    # Build lookup for fresh trades by ID so we can enrich them from cache
+    fresh_by_id = {t.id: t for t in trade_history}
     preserved = 0
 
     existing_data = safe_json_read(TRADE_HISTORY_FILE, default=[])
@@ -401,8 +405,21 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
         valid_fields = {f.name for f in fields(TradeRecord)}
         for record in existing_data:
             rec_id = record.get("id", "")
+
+            # If a fresh trade exists with same ID but lost TP/SL detail,
+            # restore the cached TP/SL data onto the fresh trade
             if rec_id in fresh_ids:
+                cached_tp = record.get("tp_details") or []
+                fresh_t = fresh_by_id.get(rec_id)
+                if fresh_t and cached_tp and not fresh_t.tp_details:
+                    fresh_t.tp_details = cached_tp
+                    fresh_t.tp_hits = record.get("tp_hits", len(cached_tp))
+                    fresh_t.sl_details = record.get("sl_details") or fresh_t.sl_details
+                    fresh_t.unfilled_targets = record.get("unfilled_targets") or fresh_t.unfilled_targets
+                    fresh_t.exit_reason = record.get("exit_reason", fresh_t.exit_reason)
+                    logger.info(f"Enriched fresh trade {rec_id} with cached TP/SL data ({len(cached_tp)} TPs)")
                 continue
+
             rec_key = (record.get("exchange", ""), record.get("symbol", ""),
                        record.get("side", ""), int(record.get("opened_at", 0)))
             if rec_key in fresh_keys:

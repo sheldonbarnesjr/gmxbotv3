@@ -361,10 +361,12 @@ def determine_new_sl_target(
     entry_price: float,
     sorted_tps: list,
     leverage: float = 10.0,
+    override_sl_rules: list = None,
 ) -> Tuple[Optional[float], Optional[str]]:
     """Determine where SL should move after TP hit(s).
 
-    Reads trailing SL config from user_config.json.
+    Reads trailing SL config from user_config.json (or uses override_sl_rules
+    if provided, for per-position strategy overrides).
     Supports two formats:
       - sl_rules: ["entry", "none", "tp1", ...]  (per-TP array, index 0 = after TP1)
       - Legacy: sl_after_tp1, sl_after_tp2, sl_trail_offset
@@ -378,8 +380,13 @@ def determine_new_sl_target(
     if tp_hits_count >= len(sorted_tps):
         return None, None
 
-    tsl_cfg = _load_trailing_sl_config()
-    sl_rules = tsl_cfg.get("sl_rules")
+    # Use per-position override if provided, otherwise load global config
+    tsl_cfg = {}
+    if override_sl_rules is not None:
+        sl_rules = override_sl_rules
+    else:
+        tsl_cfg = _load_trailing_sl_config()
+        sl_rules = tsl_cfg.get("sl_rules")
 
     if sl_rules and isinstance(sl_rules, list):
         # New per-TP format: index 0 = after TP1 hit
@@ -389,7 +396,7 @@ def determine_new_sl_target(
         # Beyond configured rules — no move
         return None, None
 
-    # Legacy format fallback
+    # Legacy format fallback (only when using global config, not per-position override)
     sl_after_tp1 = tsl_cfg.get("sl_after_tp1", "entry")
     sl_after_tp2 = tsl_cfg.get("sl_after_tp2", "none")
     trail_offset = tsl_cfg.get("sl_trail_offset", 2)

@@ -1709,6 +1709,296 @@ async def close_position(position_id: str, token: str = Depends(verify_api_key))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CHANGE STRATEGY ON OPEN POSITION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ChangeStrategyRequest(BaseModel):
+    tp_distributions: Dict[str, List[int]]  # e.g. {"3": [50, 30, 20], "4": [40, 30, 20, 10]}
+    sl_rules: List[str]                      # e.g. ["entry", "none", "tp1", "tp2"]
+    preview_only: bool = False
+
+
+def _redistribute_tp_pcts(
+    original_tps: list,
+    tp_hits_count: int,
+    new_distribution: list,
+) -> list:
+    """Redistribute TP close percentages for unhit TPs based on a new distribution.
+
+    Hit TPs keep their original close_pct (already executed).
+    Remaining position % is divided among unhit TPs using ratios from new_distribution.
+
+    Args:
+        original_tps: list of {"price": float, "close_pct": float} (0-1 scale)
+        tp_hits_count: number of TPs already hit
+        new_distribution: list of ints summing to 100 (e.g. [40, 30, 20, 10])
+
+    Returns: updated list of {"price": float, "close_pct": float}
+    """
+    n_total = len(original_tps)
+    if len(new_distribution) != n_total:
+        return None  # caller should handle mismatch
+
+    # Sum of close_pct for already-hit TPs (fraction of position already closed)
+    hit_pct_sum = sum(original_tps[i].get("close_pct", 0) for i in range(tp_hits_count))
+    remaining_pct = 1.0 - hit_pct_sum
+
+    if remaining_pct <= 0:
+        # All position already closed via TPs, nothing to redistribute
+        return [dict(tp) for tp in original_tps]
+
+    # Get the unhit portion of the new distribution
+    unhit_dist = new_distribution[tp_hits_count:]
+    unhit_dist_sum = sum(unhit_dist)
+    if unhit_dist_sum <= 0:
+        return None
+
+    result = []
+    for i, tp in enumerate(original_tps):
+        if i < tp_hits_count:
+            result.append(dict(tp))  # keep hit TPs as-is
+        else:
+            # Scale this TP's new distribution to fill the remaining position
+            new_pct = (unhit_dist[i - tp_hits_count] / unhit_dist_sum) * remaining_pct
+            result.append({"price": tp["price"], "close_pct": round(new_pct, 6)})
+
+    return result
+
+
+@app.post("/api/v1/positions/{position_id}/strategy")
+async def change_position_strategy(
+    position_id: str,
+    req: ChangeStrategyRequest,
+    token: str = Depends(verify_api_key),
+):
+    """Change TP distribution and SL rules for an existing open position.
+
+    Recalculates TP close percentages and SL based on the new strategy.
+    For GMX: cancels and recreates on-chain TP/SL orders.
+    For Bitunix: updates position_state.json only (bot monitors prices internally).
+
+    Set preview_only=true to see what would change without executing.
+    """
+    # 1. Validate position exists and is open
+    positions = await _fetch_all_live_positions()
+    if position_id not in positions:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    p = positions[position_id]
+    if not p.get("is_open"):
+        raise HTTPException(status_code=400, detail="Position is not open")
+
+    exchange = p.get("exchange", "gmx")
+    symbol = p.get("symbol", "")
+    side = p.get("side", "LONG")
+    is_long = side == "LONG"
+    entry_price = p.get("entry_price", 0)
+
+    # 2. Load position state for original TPs and tp_hits
+    pos_state = safe_json_read(POSITION_STATE_FILE, {})
+
+    # Find the matching state key
+    state_key = None
+    saved = {}
+    for key, val in pos_state.items():
+        # Match by symbol + side + exchange
+        s_sym = val.get("symbol", "")
+        s_side = val.get("side", "")
+        s_exchange = val.get("exchange", "gmx")
+        if (s_sym == symbol and s_side == side and s_exchange == exchange):
+            state_key = key
+            saved = val
+            break
+
+    if not state_key:
+        # Try matching by position_id format
+        for key, val in pos_state.items():
+            if position_id.startswith(f"{exchange}_") and key.endswith(f":{side}"):
+                state_key = key
+                saved = val
+                break
+
+    original_tps = saved.get("original_take_profits", [])
+    if not original_tps:
+        raise HTTPException(status_code=400, detail="No take profit data found for this position")
+
+    # Count TP hits from verified_decreases
+    vds = saved.get("verified_decreases", [])
+    tp_hits_count = len(vds)
+
+    n_tps = len(original_tps)
+    tp_count_key = str(n_tps)
+
+    # 3. Look up distribution for this position's TP count
+    if tp_count_key not in req.tp_distributions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No distribution provided for {n_tps} TPs (need key '{tp_count_key}')"
+        )
+
+    new_dist = req.tp_distributions[tp_count_key]
+    if len(new_dist) != n_tps:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Distribution for key '{tp_count_key}' has {len(new_dist)} values, expected {n_tps}"
+        )
+    if sum(new_dist) != 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Distribution must sum to 100, got {sum(new_dist)}"
+        )
+
+    # 4. Redistribute TP close percentages
+    new_tps = _redistribute_tp_pcts(original_tps, tp_hits_count, [d / 100.0 for d in new_dist])
+    if new_tps is None:
+        raise HTTPException(status_code=400, detail="Failed to redistribute TP percentages")
+
+    # 5. Compute new SL price from sl_rules
+    sorted_tp_prices = sorted(
+        [tp["price"] for tp in original_tps],
+        reverse=(side == "SHORT"),
+    )
+
+    from risk import _apply_sl_rule
+
+    new_sl_price = None
+    sl_rule_label = None
+    if tp_hits_count > 0 and tp_hits_count < n_tps:
+        rule_idx = tp_hits_count - 1
+        if rule_idx < len(req.sl_rules):
+            new_sl_price, sl_rule_label = _apply_sl_rule(
+                req.sl_rules[rule_idx], entry_price, sorted_tp_prices
+            )
+
+    # Build response TPs (convert to 0-100 scale for iOS)
+    response_tps = []
+    for tp in new_tps:
+        response_tps.append({
+            "price": tp["price"],
+            "percentage": round(tp["close_pct"] * 100, 1),
+        })
+
+    # 6. Preview mode — return without executing
+    if req.preview_only:
+        return {
+            "success": True,
+            "message": "Preview — no changes made",
+            "new_take_profits": response_tps,
+            "new_stop_loss": new_sl_price,
+            "sl_rule_label": sl_rule_label,
+            "tx_count": 0,
+        }
+
+    # 7. Execute strategy change
+    tx_count = 0
+
+    if exchange == "gmx":
+        # GMX: cancel and recreate on-chain TP/SL orders
+        wid = p.get("wallet_id", 1)
+        acct = accounts.get(wid)
+        if not acct:
+            raise HTTPException(status_code=500, detail=f"Wallet {wid} not configured")
+
+        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
+        if not market_addr:
+            raise HTTPException(status_code=500, detail=f"No market address for {symbol}")
+
+        try:
+            from open import (
+                cancel_orders_for_market,
+                create_tp_order,
+                create_sl_order,
+                TakeProfit,
+                EXCHANGE_ROUTER_ABI,
+            )
+            from web3 import Web3
+
+            exchange_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(cfg.exchange_router),
+                abi=EXCHANGE_ROUTER_ABI,
+            )
+
+            # Cancel all existing TP/SL orders for this market
+            cancelled = await asyncio.to_thread(
+                cancel_orders_for_market,
+                w3, acct, exchange_contract,
+                Web3.to_checksum_address(market_addr),
+                False,  # dry_run=False
+            )
+            tx_count += 1 if cancelled > 0 else 0
+            logger.info(f"Strategy change: cancelled {cancelled} orders for {symbol} {side}")
+
+            # Recreate TP orders for unhit TPs
+            size_usd = p.get("size_usd", 0)
+            collateral_usd = p.get("collateral_usd", 0)
+            if collateral_usd <= 0:
+                leverage = p.get("leverage", 1)
+                collateral_usd = size_usd / leverage if leverage > 0 else size_usd
+
+            for i, tp in enumerate(new_tps):
+                if i < tp_hits_count:
+                    continue  # skip already-hit TPs
+                tp_obj = TakeProfit(price=tp["price"], close_pct=tp["close_pct"])
+                await asyncio.to_thread(
+                    create_tp_order,
+                    w3, acct, exchange_contract,
+                    acct.address,
+                    Web3.to_checksum_address(market_addr),
+                    Web3.to_checksum_address(cfg.collateral_token),
+                    Web3.to_checksum_address(cfg.order_vault),
+                    tp_obj, size_usd, collateral_usd,
+                    symbol, is_long,
+                    cfg.slippage_bps,
+                    cfg.execution_fee_wei,
+                    False,  # dry_run=False
+                )
+                tx_count += 1
+
+            # Recreate SL order
+            sl_price_to_set = new_sl_price if new_sl_price else saved.get("stop_loss")
+            if sl_price_to_set:
+                await asyncio.to_thread(
+                    create_sl_order,
+                    w3, acct, exchange_contract,
+                    acct.address,
+                    Web3.to_checksum_address(market_addr),
+                    Web3.to_checksum_address(cfg.collateral_token),
+                    Web3.to_checksum_address(cfg.order_vault),
+                    sl_price_to_set, size_usd,
+                    symbol, is_long,
+                    cfg.slippage_bps,
+                    cfg.execution_fee_wei,
+                    False,  # dry_run=False
+                )
+                tx_count += 1
+
+        except Exception as e:
+            logger.error(f"Failed to change strategy for {position_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"On-chain order update failed: {e}")
+
+    # 8. Update position_state.json with new TPs and per-position SL rules
+    pos_state = safe_json_read(POSITION_STATE_FILE, {})
+    if state_key and state_key in pos_state:
+        pos_state[state_key]["original_take_profits"] = new_tps
+        pos_state[state_key]["position_sl_rules"] = req.sl_rules
+        if new_sl_price:
+            pos_state[state_key]["stop_loss"] = new_sl_price
+            pos_state[state_key]["sl_move_label"] = sl_rule_label
+        atomic_json_write(POSITION_STATE_FILE, pos_state)
+
+    _invalidate_positions_cache()
+
+    return {
+        "success": True,
+        "message": f"Strategy updated for {symbol} {side}" + (f" ({tx_count} on-chain txs)" if tx_count > 0 else ""),
+        "new_take_profits": response_tps,
+        "new_stop_loss": new_sl_price if new_sl_price else saved.get("stop_loss"),
+        "sl_rule_label": sl_rule_label,
+        "tx_count": tx_count,
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TRADES (history)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2243,38 +2533,45 @@ async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
     # ── Validate address ──
     addr = req.to_address.strip()
     if not Web3.is_address(addr):
-        raise HTTPException(status_code=400, detail="Invalid Arbitrum address.")
+        return {"success": False, "message": "Invalid Arbitrum address.", "tx_hash": None}
     destination = Web3.to_checksum_address(addr)
+
+    # ── Block withdrawals to own bot wallets ──
+    bot_addresses = {acct.address.lower() for acct in accounts.values()}
+    if destination.lower() in bot_addresses:
+        return {"success": False, "message": "Cannot withdraw to a bot wallet address.", "tx_hash": None}
 
     # ── Validate amount ──
     if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than 0.")
+        return {"success": False, "message": "Amount must be greater than 0.", "tx_hash": None}
     if req.amount < 1:
-        raise HTTPException(status_code=400, detail="Minimum withdrawal is $1.")
-
-    # ── Check combined balance ──
-    combined = 0.0
-    for wid, acct in accounts.items():
-        combined += _get_usdc_balance(acct)
-    if combined < req.amount:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient balance. Combined USDC: ${combined:,.2f}, requested: ${req.amount:,.2f}",
-        )
+        return {"success": False, "message": "Minimum withdrawal is $1.", "tx_hash": None}
 
     # ── Use W1 as the sending wallet ──
     if 1 not in accounts:
-        raise HTTPException(status_code=500, detail="Primary wallet (W1) not configured.")
+        return {"success": False, "message": "Primary wallet (W1) not configured.", "tx_hash": None}
     acct = accounts[1]
 
     try:
-        # Check W1 balance; consolidate from other wallets if needed
-        w1_balance = _get_usdc_balance(acct)
+        # ── Check combined balance ──
+        combined = 0.0
+        for wid, wallet_acct in accounts.items():
+            combined += await asyncio.to_thread(_get_usdc_balance, wallet_acct)
+        if combined < req.amount:
+            return {
+                "success": False,
+                "message": f"Insufficient balance. Combined USDC: ${combined:,.2f}, requested: ${req.amount:,.2f}",
+                "tx_hash": None,
+            }
+
+        # ── Consolidate to W1 if needed ──
+        w1_balance = await asyncio.to_thread(_get_usdc_balance, acct)
         if w1_balance < req.amount:
             logger.info(f"Withdraw: W1 has ${w1_balance:.2f}, need ${req.amount:.2f} — consolidating...")
-            # Transfer from other wallets to W1
+            still_needed = req.amount - w1_balance
+
             for wid in sorted(accounts.keys()):
-                if wid == 1:
+                if wid == 1 or still_needed <= 0:
                     continue
                 other_acct = accounts[wid]
                 other_bal_raw, other_bal, decimals = await asyncio.to_thread(
@@ -2282,10 +2579,15 @@ async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
                 )
                 if other_bal < 1:
                     continue
+
+                # Only pull what we need, not the entire wallet balance
+                pull_amount = min(other_bal, still_needed)
+                pull_raw = round(pull_amount * (10 ** decimals))
+
                 transfer_data = w3.eth.contract(
                     address=Web3.to_checksum_address(cfg.collateral_token),
                     abi=ERC20_ABI,
-                ).encode_abi("transfer", [acct.address, other_bal_raw])
+                ).encode_abi("transfer", [acct.address, pull_raw])
                 tx_h = await asyncio.to_thread(
                     _api_send_tx, cfg.collateral_token, transfer_data, 0, other_acct
                 )
@@ -2293,10 +2595,11 @@ async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
                 if receipt.get("status") != 1:
                     logger.warning(f"Consolidation from W{wid} failed")
                 else:
-                    logger.info(f"Consolidated ${other_bal:.2f} from W{wid} to W1")
+                    still_needed -= pull_amount
+                    logger.info(f"Consolidated ${pull_amount:.2f} from W{wid} to W1")
 
-            # Re-check W1 balance
-            w1_balance = _get_usdc_balance(acct)
+            # Re-check W1 balance after consolidation
+            w1_balance = await asyncio.to_thread(_get_usdc_balance, acct)
             if w1_balance < req.amount:
                 return {
                     "success": False,
@@ -2337,8 +2640,6 @@ async def withdraw(req: WithdrawRequest, token: str = Depends(verify_api_key)):
             "tx_hash": tx_hash,
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Withdraw failed: {e}\n{traceback.format_exc()}")
         return {

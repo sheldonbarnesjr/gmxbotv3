@@ -585,9 +585,17 @@ class SLTPMixin:
                     key=lambda tp: tp.price,
                     reverse=(pos.side == "SHORT")
                 )
+                # Check for per-position SL rules (set by strategy change)
+                override_sl_rules = None
+                if pos.market_addr:
+                    state_key = f"{pos.wallet_id}:{pos.market_addr.lower()}:{pos.side}"
+                    pos_state = self._load_position_state()
+                    saved = pos_state.get(state_key, {})
+                    override_sl_rules = saved.get("position_sl_rules")
                 new_sl_price, sl_label = determine_new_sl_target(
                     pos.tp_hits_count, pos.entry_price, sorted_tps,
                     leverage=pos.leverage,
+                    override_sl_rules=override_sl_rules,
                 )
 
             # None means no SL move needed for this TP hit (e.g. TP2 → stay at Entry)
