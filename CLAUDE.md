@@ -15,7 +15,7 @@ A **production trading bot** for GMX V2 (Arbitrum) + Bitunix Futures. It listens
 
 0. **Verify Xcode builds** — After ANY change to Swift files or `project.pbxproj`, run the Xcode build command below and fix all errors before considering the task done:
    ```bash
-   xcodebuild -project /Users/sheldon-anariebarnes/Desktop/Folders/multiply/Multiply/Multiply.xcodeproj -scheme Multiply -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' build 2>&1 | tail -30
+   xcodebuild -project /Users/sheldon-anariebarnes/Desktop/Folders/multiply/Multiply/Multiply.xcodeproj -scheme Multiply -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' build 2>&1 | tail -30
    ```
    If the build fails, read the errors, fix them, and rebuild until it succeeds. A task is NOT complete until the build passes.
 1. **Cross-project compatibility** — Changes must also work with the **multiply/** folder and the **mltply** app.

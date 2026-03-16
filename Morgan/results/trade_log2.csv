@@ -1,0 +1,2 @@
+ticker,entry_date,exit_date,entry_price,exit_price,stop_price,shares,position_value,risk_amount,pnl,pnl_pct,r_multiple,holding_days,exit_reason,partial_sold,partial_pnl,market_regime
+CELH,2021-01-05,2021-01-25,16.28,20.95,15.72,1786.99,29085.6,1000.0,7834.79,26.94,7.83,20,10sma_close,True,1149.93,BULL

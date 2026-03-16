@@ -635,45 +635,7 @@ class SLTPMixin:
             )
             wallet = Web3.to_checksum_address(acct.address)
 
-            # 1. Cancel existing SL orders for this market
-            # Re-fetch orders fresh to get accurate keys (avoids stale key misalignment)
             market_lower = pos.market_addr.lower() if pos.market_addr else ""
-            cancelled = 0
-            for cleanup_round in range(3):
-                fresh_orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
-                all_sl_orders = [
-                    o for o in fresh_orders
-                    if o["market"].lower() == market_lower
-                    and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
-                ]
-                keyless = [o for o in all_sl_orders if not o.get("key_hex")]
-                if keyless:
-                    self.logger.warning(
-                        f"{pos.symbol}: {len(keyless)} SL order(s) missing key_hex — "
-                        f"cannot cancel. May leave orphaned SL on-chain."
-                    )
-                    await self.notify(
-                        f"⚠️ {pos.symbol} {pos.side} [W{pos.wallet_id}]: "
-                        f"{len(keyless)} SL order(s) missing key_hex — "
-                        f"cannot cancel old SL. Skipping new SL placement to prevent double SL execution."
-                    )
-                    return
-                sl_orders = [o for o in all_sl_orders if o.get("key_hex")]
-                if not sl_orders:
-                    break
-                for sl_order in sl_orders:
-                    try:
-                        key_bytes = bytes.fromhex(sl_order["key_hex"])
-                        data = exchange.encode_abi("cancelOrder", [key_bytes])
-                        tx = _open_mod.build_tx(self.w3, wallet, exchange.address, data, value=0)
-                        txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=cfg.dry_run)
-                        if not cfg.dry_run:
-                            _open_mod.wait_receipt(self.w3, txh)
-                        cancelled += 1
-                        self.logger.info(f"Cancelled old SL order for {pos.symbol}: {txh}")
-                    except Exception as e:
-                        self.logger.warning(f"Cancel SL failed for {pos.symbol}: {e}")
-                await asyncio.sleep(2)
 
             order_vault = Web3.to_checksum_address(cfg.order_vault)
             collateral_token = Web3.to_checksum_address(cfg.collateral_token)
@@ -698,7 +660,7 @@ class SLTPMixin:
                 self._position_locks.pop(pos.id, None)
                 return
 
-            # 2. Create new SL order at new price (with retry)
+            # 1. Create new SL order FIRST (so position is never unprotected)
             MAX_SL_ATTEMPTS = 3
             SL_RETRY_DELAY = 5  # seconds
             new_sl_txh = None
@@ -788,40 +750,43 @@ class SLTPMixin:
                     f"Failed to move SL to {sl_label} (${new_sl_price:,.2f}) "
                     f"after {MAX_SL_ATTEMPTS} attempts\n"
                     f"Error: {last_sl_error}\n"
-                    f"Old SL cancelled ({cancelled}). Queued for automatic retry."
+                    f"Old SL still active (not cancelled). Queued for automatic retry."
                 )
                 return
 
-            # 3. Post-creation duplicate check: verify only 1 SL remains
+            # 2. New SL created successfully — now cancel OLD SL orders
+            # Position is protected by the new SL, safe to clean up old ones
             await asyncio.sleep(1)
+            cancelled = 0
             try:
                 verify_orders = await asyncio.to_thread(fetch_open_orders, self.w3, acct.address)
-                remaining_sls = [
+                all_sls = [
                     o for o in verify_orders
                     if o["market"].lower() == market_lower
                     and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
                     and o.get("key_hex")
                 ]
-                if len(remaining_sls) > 1:
-                    self.logger.warning(
-                        f"{pos.symbol}: {len(remaining_sls)} SL orders after move — "
-                        f"cleaning up {len(remaining_sls) - 1} stale order(s)"
+                if len(all_sls) > 1:
+                    self.logger.info(
+                        f"{pos.symbol}: {len(all_sls)} SL orders on-chain — "
+                        f"cancelling {len(all_sls) - 1} old order(s)"
                     )
                     # Keep the newest (highest updated_at_block), cancel others
-                    remaining_sls.sort(key=lambda o: o.get("updated_at_block", 0))
-                    for stale_sl in remaining_sls[:-1]:
+                    all_sls.sort(key=lambda o: o.get("updated_at_block", 0))
+                    for old_sl in all_sls[:-1]:
                         try:
-                            key_bytes = bytes.fromhex(stale_sl["key_hex"])
+                            key_bytes = bytes.fromhex(old_sl["key_hex"])
                             data = exchange.encode_abi("cancelOrder", [key_bytes])
                             tx = _open_mod.build_tx(self.w3, wallet, exchange.address, data, value=0)
                             txh = _open_mod.sign_send(self.w3, acct, tx, dry_run=cfg.dry_run)
                             if not cfg.dry_run:
                                 _open_mod.wait_receipt(self.w3, txh)
-                            self.logger.info(f"Cleaned up stale SL: {txh}")
+                            cancelled += 1
+                            self.logger.info(f"Cancelled old SL order for {pos.symbol}: {txh}")
                         except Exception as e:
-                            self.logger.warning(f"Failed to clean up stale SL: {e}")
+                            self.logger.warning(f"Cancel old SL failed for {pos.symbol}: {e}")
             except Exception as e:
-                self.logger.debug(f"Post-creation SL verify failed: {e}")
+                self.logger.debug(f"Post-creation SL cleanup failed: {e}")
 
             # 4. Update in-memory state
             old_sl = pos.stop_loss

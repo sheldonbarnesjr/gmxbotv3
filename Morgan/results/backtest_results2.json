@@ -1,0 +1,54 @@
+{
+  "summary": {
+    "total_trades": 1,
+    "winners": 1,
+    "losers": 0,
+    "win_rate": 100.0,
+    "avg_winner_r": 7.83,
+    "avg_loser_r": 0,
+    "best_trade_r": 7.83,
+    "worst_trade_r": 7.83,
+    "profit_factor": Infinity,
+    "total_return_pct": 7.8,
+    "cagr": 1.3,
+    "max_drawdown_pct": 0,
+    "sharpe_ratio": 0.0,
+    "sortino_ratio": 0.0,
+    "avg_holding_days": 20.0,
+    "total_pnl": 7834.79,
+    "ending_capital": 107834.79,
+    "trades_per_year": 0.2,
+    "trades_in_bull": 1,
+    "trades_in_bear": 0,
+    "win_rate_bull": 100.0,
+    "win_rate_bear": 0.0,
+    "pnl_bull": 7834.79,
+    "pnl_bear": 0
+  },
+  "params": {
+    "starting_capital": 100000,
+    "start_date": "2019-01-01",
+    "end_date": "2024-12-31"
+  },
+  "trades": [
+    {
+      "ticker": "CELH",
+      "entry_date": "2021-01-05",
+      "entry_price": 16.28,
+      "stop_price": 15.72,
+      "shares": 1786.99,
+      "position_value": 29085.6,
+      "risk_amount": 1000.0,
+      "exit_date": "2021-01-25",
+      "exit_price": 20.95,
+      "pnl": 7834.79,
+      "pnl_pct": 26.94,
+      "r_multiple": 7.83,
+      "holding_days": 20,
+      "exit_reason": "10sma_close",
+      "partial_sold": true,
+      "partial_pnl": 1149.93,
+      "market_regime": "BULL"
+    }
+  ]
+}

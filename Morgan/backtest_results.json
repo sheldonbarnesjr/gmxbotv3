@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "total_trades": 0,
+    "winners": 0,
+    "losers": 0,
+    "win_rate": 0.0,
+    "avg_winner_r": 0.0,
+    "avg_loser_r": 0.0,
+    "best_trade_r": 0.0,
+    "worst_trade_r": 0.0,
+    "profit_factor": 0.0,
+    "total_return_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "sharpe_ratio": 0.0,
+    "avg_holding_days": 0.0,
+    "total_pnl": 0.0,
+    "ending_capital": 100000,
+    "trades_in_bull": 0,
+    "trades_in_bear": 0,
+    "win_rate_bull": 0.0,
+    "win_rate_bear": 0.0
+  },
+  "params": {
+    "starting_capital": 100000,
+    "risk_per_trade": 0.01,
+    "max_position_pct": 0.4,
+    "start_date": "2023-01-01",
+    "end_date": "2025-12-31",
+    "partial_sell_pct": 0.2,
+    "partial_sell_threshold": 5.0
+  },
+  "trades": []
+}

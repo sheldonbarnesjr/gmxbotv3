@@ -905,11 +905,24 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                     pos.original_size_usd = saved.get("original_size_usd", pos.size_usd)
                     pos.processed_tx_hashes = set(saved.get("processed_tx_hashes", []))
                     pos.verified_decreases = saved.get("verified_decreases", [])
-                    if saved.get("opened_at"):
-                        pos.opened_at = saved["opened_at"]
+                    saved_opened = saved.get("opened_at", 0)
+                    saved_entry = saved.get("entry_price", 0)
+                    # Validate saved state belongs to this position:
+                    # If entry prices differ by >1%, state is stale from a previous position
+                    if saved_opened and saved_entry and pos.entry_price > 0:
+                        if abs(saved_entry - pos.entry_price) / pos.entry_price < 0.01:
+                            pos.opened_at = saved_opened
+                        else:
+                            self.logger.info(
+                                f"Sync: {symbol} saved entry ${saved_entry:,.2f} != on-chain "
+                                f"${pos.entry_price:,.2f} — stale state, using current time"
+                            )
+                            pos.opened_at = time.time()
+                    elif saved_opened:
+                        pos.opened_at = saved_opened
                     else:
-                        # opened_at missing from old state format — assume at least 30 days
-                        pos.opened_at = time.time() - 30 * 86400
+                        # opened_at missing — use current time rather than a fake old date
+                        pos.opened_at = time.time()
                     if saved.get("entry_price"):
                         pos.entry_price = saved["entry_price"]
                     if saved.get("leverage"):
