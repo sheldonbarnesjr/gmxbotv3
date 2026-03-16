@@ -394,7 +394,28 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
     #   - Live-recorded trades (UUID IDs, not "rebuild_" or "bx_" prefixed)
     #   - Also: enrich fresh Bitunix trades with cached TP/SL data when the
     #     Bitunix TP/SL history API no longer returns the orders
-    fresh_keys = {(t.exchange, t.symbol, t.side, int(t.opened_at)) for t in trade_history}
+    #
+    # IMPORTANT: Use fuzzy timestamp matching (120s tolerance) because:
+    #   - Live-recorded opened_at comes from time.time() in the bot
+    #   - Rebuilt opened_at comes from on-chain events or exchange API
+    #   - These can differ by seconds (Bitunix) or massively (GMX on-chain
+    #     opened_at goes back to actual position open, not bot tracking start)
+    #   Also match on closed_at as secondary key since positions closing at
+    #   the same time for the same symbol/side are the same trade.
+    TIMESTAMP_TOLERANCE = 120  # seconds
+
+    def _matches_fresh(rec_exchange, rec_symbol, rec_side, rec_opened, rec_closed):
+        """Check if a cached record matches any fresh trade within tolerance."""
+        for ft in trade_history:
+            if ft.exchange == rec_exchange and ft.symbol == rec_symbol and ft.side == rec_side:
+                # Match by opened_at (fuzzy)
+                if abs(int(ft.opened_at) - int(rec_opened)) < TIMESTAMP_TOLERANCE:
+                    return True
+                # Match by closed_at (fuzzy) — positions closing at same time = same trade
+                if rec_closed > 0 and abs(int(ft.closed_at) - int(rec_closed)) < TIMESTAMP_TOLERANCE:
+                    return True
+        return False
+
     fresh_ids = {t.id for t in trade_history}
     # Build lookup for fresh trades by ID so we can enrich them from cache
     fresh_by_id = {t.id: t for t in trade_history}
@@ -420,12 +441,16 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
                     logger.info(f"Enriched fresh trade {rec_id} with cached TP/SL data ({len(cached_tp)} TPs)")
                 continue
 
-            rec_key = (record.get("exchange", ""), record.get("symbol", ""),
-                       record.get("side", ""), int(record.get("opened_at", 0)))
-            if rec_key in fresh_keys:
+            # Fuzzy match: same exchange/symbol/side and close timestamps within tolerance
+            rec_exchange = record.get("exchange", "")
+            rec_symbol = record.get("symbol", "")
+            rec_side = record.get("side", "")
+            rec_opened = record.get("opened_at", 0)
+            rec_closed = record.get("closed_at", 0)
+            if _matches_fresh(rec_exchange, rec_symbol, rec_side, rec_opened, rec_closed):
                 continue  # Same trade re-fetched under a different ID
 
-            is_bitunix = record.get("exchange") == "bitunix"
+            is_bitunix = rec_exchange == "bitunix"
             bitunix_api_failed = bitunix_client is None or not bx_success
             is_live_recorded = not rec_id.startswith("rebuild_") and not rec_id.startswith("bx_")
 
@@ -436,6 +461,35 @@ async def _rebuild_all_trades_inner(w3, wallets, markets, bitunix_client, open_p
                     preserved += 1
                 except Exception as e:
                     logger.warning(f"Skipping preserved trade {rec_id}: {e}")
+
+    # Step 6b: Final dedup — remove any remaining duplicates by
+    # (exchange, symbol, side) with fuzzy opened_at OR closed_at matching.
+    # When duplicates exist, prefer trades with better TP/SL data.
+    deduped = []
+    for t in trade_history:
+        is_dup = False
+        for existing in deduped:
+            if (existing.exchange == t.exchange and existing.symbol == t.symbol
+                    and existing.side == t.side):
+                opened_match = abs(int(existing.opened_at) - int(t.opened_at)) < TIMESTAMP_TOLERANCE
+                closed_match = (int(t.closed_at) > 0 and int(existing.closed_at) > 0
+                                and abs(int(existing.closed_at) - int(t.closed_at)) < TIMESTAMP_TOLERANCE)
+                if opened_match or closed_match:
+                    # Duplicate found — keep the one with better data
+                    existing_has_detail = bool(existing.tp_details or existing.sl_details)
+                    new_has_detail = bool(t.tp_details or t.sl_details)
+                    if new_has_detail and not existing_has_detail:
+                        # Replace existing with this better version
+                        deduped.remove(existing)
+                        deduped.append(t)
+                    is_dup = True
+                    break
+        if not is_dup:
+            deduped.append(t)
+
+    if len(deduped) < len(trade_history):
+        logger.info(f"Dedup: removed {len(trade_history) - len(deduped)} duplicate trade(s)")
+    trade_history = deduped
 
     # Step 7: Sort and persist
     trade_history.sort(key=lambda t: t.closed_at)

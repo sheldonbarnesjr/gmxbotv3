@@ -422,3 +422,42 @@ def determine_new_sl_target(
         return _tp_price(trail_idx), f"Target {trail_idx + 1}"
 
     return entry_price, "Entry"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SL ↔ loss-% conversion (for slider UI)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def compute_sl_from_loss_pct(
+    side: str, entry_price: float, leverage: float, loss_pct: float
+) -> float:
+    """Convert a % loss (of collateral) into an SL trigger price.
+
+    Args:
+        side: "LONG" or "SHORT"
+        entry_price: Position entry price
+        leverage: Position leverage
+        loss_pct: Desired max loss as % of collateral (0–100)
+
+    Returns:
+        Stop-loss trigger price
+    """
+    if side == "LONG":
+        return entry_price * (1 - (loss_pct / 100) / leverage)
+    return entry_price * (1 + (loss_pct / 100) / leverage)
+
+
+def compute_loss_pct_from_sl(
+    side: str, entry_price: float, leverage: float, sl_price: float
+) -> float:
+    """Convert an SL trigger price into a % loss of collateral.
+
+    Returns:
+        Loss as a percentage of collateral (positive = loss, negative = profit).
+    """
+    if entry_price <= 0 or leverage <= 0:
+        return 0.0
+    if side == "LONG":
+        return ((entry_price - sl_price) / entry_price) * leverage * 100
+    return ((sl_price - entry_price) / entry_price) * leverage * 100

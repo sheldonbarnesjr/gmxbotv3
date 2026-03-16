@@ -177,6 +177,22 @@ class FailedOrder:
 
 
 @dataclass
+class FailedSignal:
+    """A signal whose open execution failed (RPC/network error) and needs retry."""
+    signal: 'Signal'
+    size_usd: float
+    collateral_usd: float
+    wallet_id: int
+    acct_address: str        # to re-resolve the Account
+    attempts: int = 0
+    max_attempts: int = 30   # 30 attempts × 30s = 15 minutes
+    last_attempt: float = 0.0
+    error: str = ""
+    created_at: float = field(default_factory=time.time)
+    signal_id: Optional[str] = None
+
+
+@dataclass
 class Position:
     id: str
     symbol: str
@@ -300,6 +316,9 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         # Retry queue for failed TP/SL order placements
         self.failed_order_queue: List[FailedOrder] = []
+
+        # Retry queue for failed signal opens (RPC/network errors)
+        self.failed_signal_queue: List[FailedSignal] = []
 
         # Signal store — persistent archive of all parsed signals
         self.signal_store = SignalStore()
@@ -1542,11 +1561,12 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
     # ──────────────────────────────────────────────────────────────────────
 
     async def order_retry_loop(self):
-        """Background loop that retries failed TP/SL placements every 30 seconds."""
+        """Background loop that retries failed TP/SL placements and failed signal opens every 30 seconds."""
         while True:
             try:
                 await asyncio.sleep(30)
                 await self.process_retry_queue()
+                await self.process_signal_retry_queue()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1701,6 +1721,84 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
 
         self.failed_order_queue = still_pending
         self._save_failed_orders()
+
+    async def process_signal_retry_queue(self):
+        """Retry failed signal executions (RPC/network errors on open).
+
+        Retries every 30s for up to 15 minutes. Drops the signal if:
+          - The position is already open (manual retry or duplicate)
+          - 15 minutes have elapsed since the first failure
+        """
+        if not self.failed_signal_queue:
+            return
+
+        still_pending: List[FailedSignal] = []
+
+        for fs in self.failed_signal_queue:
+            # Expire after 15 minutes
+            if time.time() - fs.created_at > 900:
+                self.logger.warning(
+                    f"Signal retry expired: {fs.signal.symbol} {fs.signal.side} "
+                    f"after {fs.attempts} attempts"
+                )
+                await self.notify(
+                    f"❌ {fs.signal.symbol} {fs.signal.side} retry EXPIRED "
+                    f"after 15 min ({fs.attempts} attempts).\n"
+                    f"Last error: {fs.error}\n"
+                    f"Use /lastsignal to try manually."
+                )
+                continue
+
+            # Check if position already opened (manual retry or duplicate)
+            already_open = any(
+                p.is_open and p.symbol == fs.signal.symbol
+                and p.side == fs.signal.side and p.wallet_id == fs.wallet_id
+                for p in self.positions.values()
+            )
+            if already_open:
+                self.logger.info(
+                    f"Signal retry: {fs.signal.symbol} {fs.signal.side} "
+                    f"already open on W{fs.wallet_id}, dropping from queue"
+                )
+                continue
+
+            fs.attempts += 1
+            fs.last_attempt = time.time()
+
+            try:
+                acct = self._get_account(fs.wallet_id)
+                position, order_type = await self._execute_open_gmx(
+                    fs.signal, fs.size_usd, acct,
+                    collateral_usd=fs.collateral_usd,
+                    wallet_id=fs.wallet_id,
+                    _is_retry=True,
+                )
+                if position:
+                    if fs.signal_id:
+                        position.signal_id = fs.signal_id
+                    self.positions[position.id] = position
+                    self._save_position_state()
+                    self.logger.info(
+                        f"Signal retry SUCCESS: {fs.signal.symbol} {fs.signal.side} "
+                        f"on attempt {fs.attempts}"
+                    )
+                    await self.notify(
+                        f"✅ {fs.signal.symbol} {fs.signal.side} opened on retry "
+                        f"(attempt {fs.attempts})"
+                    )
+                    continue  # success — don't re-queue
+                else:
+                    # Returned None without raising — keep in queue for next cycle
+                    still_pending.append(fs)
+            except Exception as e:
+                fs.error = str(e)
+                self.logger.warning(
+                    f"Signal retry attempt {fs.attempts} failed for "
+                    f"{fs.signal.symbol}: {e}"
+                )
+                still_pending.append(fs)
+
+        self.failed_signal_queue = still_pending
 
     async def _resync_tp_orders(self, chat_id: int):
         """Cancel and re-place all TP orders with proportional collateral withdrawal.
@@ -2471,7 +2569,7 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
             await self.notify(f"[BITUNIX] Failed to open {signal.symbol} {signal.side}: {e}")
             return None, None
 
-    async def _execute_open_gmx(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None, wallet_id: int = 1) -> tuple:
+    async def _execute_open_gmx(self, signal: Signal, size_usd: float, acct: Account = None, collateral_usd: float = None, wallet_id: int = 1, _is_retry: bool = False) -> tuple:
         """Execute a full open signal on-chain: MarketIncrease/LimitIncrease + TPs + SL.
 
         Returns (Position, order_type) where order_type is "market" or "limit", or (None, None) on failure."""
@@ -2672,14 +2770,48 @@ class GMXBot(NotificationsMixin, SLTPMixin, WalletMixin, PriceFeedsMixin, Analyt
                 return None, None
             except (ConnectionError, TimeoutError, OSError) as e:
                 self.logger.error(f"RPC error opening {signal.symbol}: {e}")
-                await self.notify(
-                    f"❌ RPC ERROR opening {signal.symbol} {signal.side}: {e}\n"
-                    f"Network issue — signal was NOT executed. Try /lastsignal to retry."
-                )
+                if not _is_retry:
+                    failed = FailedSignal(
+                        signal=signal,
+                        size_usd=size_usd,
+                        collateral_usd=collateral_usd or (size_usd / signal.leverage if signal.leverage else size_usd),
+                        wallet_id=wallet_id,
+                        acct_address=acct.address,
+                        error=str(e),
+                        signal_id=getattr(signal, '_signal_id', None),
+                    )
+                    self.failed_signal_queue.append(failed)
+                    await self.notify(
+                        f"⚠️ RPC ERROR opening {signal.symbol} {signal.side}: {e}\n"
+                        f"Auto-retrying for up to 15 minutes (every 30s)."
+                    )
+                else:
+                    self.logger.warning(f"Retry attempt failed for {signal.symbol}: {e}")
                 return None, None
             except Exception as e:
-                self.logger.error(f"Failed to execute open: {e}\n{traceback.format_exc()}")
-                await self.notify(f"❌ Failed to open {signal.symbol} {signal.side}: {e}")
+                err_str = str(e).lower()
+                is_rpc_error = any(kw in err_str for kw in ["429", "too many requests", "rate limit", "502", "503", "connection", "timeout"])
+                if is_rpc_error and not _is_retry:
+                    self.logger.error(f"RPC/network error opening {signal.symbol}: {e}")
+                    failed = FailedSignal(
+                        signal=signal,
+                        size_usd=size_usd,
+                        collateral_usd=collateral_usd or (size_usd / signal.leverage if signal.leverage else size_usd),
+                        wallet_id=wallet_id,
+                        acct_address=acct.address,
+                        error=str(e),
+                        signal_id=getattr(signal, '_signal_id', None),
+                    )
+                    self.failed_signal_queue.append(failed)
+                    await self.notify(
+                        f"⚠️ RPC ERROR opening {signal.symbol} {signal.side}: {e}\n"
+                        f"Auto-retrying for up to 15 minutes (every 30s)."
+                    )
+                elif is_rpc_error and _is_retry:
+                    self.logger.warning(f"Retry attempt failed for {signal.symbol}: {e}")
+                else:
+                    self.logger.error(f"Failed to execute open: {e}\n{traceback.format_exc()}")
+                    await self.notify(f"❌ Failed to open {signal.symbol} {signal.side}: {e}")
                 return None, None
 
         except Exception as e:

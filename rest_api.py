@@ -1546,6 +1546,54 @@ def _format_position(pid: str, p: dict) -> dict:
             )
         formatted_tps.append(tp_entry)
 
+    # ── SL slider metadata ──────────────────────────────────────────────
+    from risk import compute_loss_pct_from_sl
+
+    sl_price = p.get("stop_loss")
+    exchange = p.get("exchange", "gmx")
+    max_loss_pct = 90.0
+
+    current_loss_pct = None
+    if sl_price and entry > 0 and leverage > 0:
+        current_loss_pct = round(
+            compute_loss_pct_from_sl(side, entry, leverage, sl_price), 2
+        )
+
+    # Liquidation price estimate (~100% collateral loss)
+    if leverage > 0:
+        if side == "LONG":
+            liq_price = entry * (1 - 1.0 / leverage)
+        else:
+            liq_price = entry * (1 + 1.0 / leverage)
+    else:
+        liq_price = 0
+
+    ref_points = [
+        {"label": "Entry", "loss_pct": 0.0, "price": round(entry, 2)},
+    ]
+    if current_loss_pct is not None and sl_price:
+        ref_points.append(
+            {"label": "Current SL", "loss_pct": current_loss_pct, "price": round(sl_price, 2)}
+        )
+    for idx, tp_entry_item in enumerate(formatted_tps):
+        tp_p = tp_entry_item.get("price", 0)
+        if tp_p > 0 and entry > 0 and leverage > 0:
+            tp_loss = round(compute_loss_pct_from_sl(side, entry, leverage, tp_p), 2)
+            ref_points.append(
+                {"label": f"TP{idx + 1}", "loss_pct": tp_loss, "price": round(tp_p, 2)}
+            )
+    ref_points.append(
+        {"label": "Liquidation", "loss_pct": 100.0, "price": round(liq_price, 2)}
+    )
+
+    sl_slider = {
+        "current_loss_pct": current_loss_pct,
+        "max_loss_pct": max_loss_pct,
+        "liq_price": round(liq_price, 2),
+        "estimated_tx_cost_usd": 1.0 if exchange == "gmx" else 0.0,
+        "reference_points": ref_points,
+    }
+
     return {
         "id": pid,
         "symbol": p.get("symbol", ""),
@@ -1566,6 +1614,7 @@ def _format_position(pid: str, p: dict) -> dict:
         "tp_hits": tp_hits,
         "wallet_id": p.get("wallet_id", 1),
         "exchange": p.get("exchange", "gmx"),
+        "sl_slider": sl_slider,
     }
 
 
@@ -1767,6 +1816,50 @@ def _redistribute_tp_pcts(
     return result
 
 
+def _find_position_state_key(
+    pos_state: dict, position_id: str, p: dict
+) -> tuple:
+    """Find the position_state.json key for a given position.
+
+    Returns (state_key, saved_dict) or (None, {}) if not found.
+    """
+    exchange = p.get("exchange", "gmx")
+    symbol = p.get("symbol", "")
+    side = p.get("side", "LONG")
+
+    state_key = None
+    saved = {}
+
+    if exchange == "gmx":
+        wid = p.get("wallet_id", 1)
+        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
+        if market_addr:
+            state_key = f"{wid}:{market_addr.lower()}:{side}"
+            saved = pos_state.get(state_key, {})
+        if not saved:
+            state_key = None
+
+    if not state_key and exchange == "bitunix":
+        for key, val in pos_state.items():
+            bid = val.get("bitunix_position_id", "")
+            if bid and position_id == f"bx_{bid}":
+                state_key = key
+                saved = val
+                break
+
+    if not state_key:
+        for key, val in pos_state.items():
+            s_sym = val.get("symbol", "")
+            s_side = val.get("side", "")
+            s_exchange = val.get("exchange", "gmx")
+            if s_sym == symbol and s_side == side and s_exchange == exchange:
+                state_key = key
+                saved = val
+                break
+
+    return state_key, saved
+
+
 @app.post("/api/v1/positions/{position_id}/strategy")
 async def change_position_strategy(
     position_id: str,
@@ -1806,42 +1899,17 @@ async def change_position_strategy(
 
     # 2. Load position state for original TPs and tp_hits
     pos_state = safe_json_read(POSITION_STATE_FILE, {})
-
-    # Find the matching state key — use exact key format when possible
-    state_key = None
-    saved = {}
-
-    if exchange == "gmx":
-        # GMX: construct exact state key from wallet_id:market_addr:side
-        wid = p.get("wallet_id", 1)
-        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
-        if market_addr:
-            state_key = f"{wid}:{market_addr.lower()}:{side}"
-            saved = pos_state.get(state_key, {})
-        if not saved:
-            state_key = None  # fall through to generic match
-
-    if not state_key and exchange == "bitunix":
-        # Bitunix: try matching by bitunix_position_id first (exact match)
-        for key, val in pos_state.items():
-            bid = val.get("bitunix_position_id", "")
-            if bid and position_id == f"bx_{bid}":
-                state_key = key
-                saved = val
-                break
-
-    if not state_key:
-        # Fallback: match by symbol + side + exchange
-        for key, val in pos_state.items():
-            s_sym = val.get("symbol", "")
-            s_side = val.get("side", "")
-            s_exchange = val.get("exchange", "gmx")
-            if (s_sym == symbol and s_side == side and s_exchange == exchange):
-                state_key = key
-                saved = val
-                break
+    state_key, saved = _find_position_state_key(pos_state, position_id, p)
 
     original_tps = saved.get("original_take_profits", [])
+    if not original_tps:
+        # Fallback: build from live position take_profits (percentage 0-100 → close_pct 0-1)
+        live_tps = p.get("take_profits", [])
+        if live_tps:
+            original_tps = [
+                {"price": tp["price"], "close_pct": tp.get("percentage", 0) / 100.0}
+                for tp in live_tps if tp.get("price", 0) > 0
+            ]
     if not original_tps:
         raise HTTPException(status_code=400, detail="No take profit data found for this position")
 
@@ -2027,6 +2095,227 @@ async def change_position_strategy(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MOVE STOP LOSS (slider)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class MoveSLRequest(BaseModel):
+    loss_pct: float          # 0.0–90.0 (% of collateral)
+    preview_only: bool = True  # default to preview for safety
+
+
+@app.post("/api/v1/positions/{position_id}/sl")
+async def move_position_sl(
+    position_id: str,
+    req: MoveSLRequest,
+    token: str = Depends(verify_api_key),
+):
+    """Move stop loss for an open position using a % loss of collateral.
+
+    Set preview_only=true (default) to see the computed SL price without executing.
+    """
+    from risk import compute_sl_from_loss_pct, compute_loss_pct_from_sl
+
+    MAX_LOSS_PCT = 90.0
+
+    # 1. Validate position
+    positions = await _fetch_all_live_positions()
+    if position_id not in positions:
+        raise HTTPException(status_code=404, detail="Position not found")
+
+    p = positions[position_id]
+    if not p.get("is_open"):
+        raise HTTPException(status_code=400, detail="Position is not open")
+
+    side = p.get("side", "LONG")
+    entry = p.get("entry_price", 0)
+    leverage = p.get("leverage", 1)
+    size_usd = p.get("size_usd", 0)
+    collateral = p.get("collateral_usd", 0)
+    if collateral <= 0:
+        collateral = size_usd / leverage if leverage > 0 else size_usd
+    exchange = p.get("exchange", "gmx")
+    symbol = p.get("symbol", "")
+    is_long = side == "LONG"
+
+    # 2. Validate loss_pct
+    if req.loss_pct < 0:
+        raise HTTPException(status_code=400, detail="loss_pct cannot be negative")
+    if req.loss_pct > MAX_LOSS_PCT:
+        raise HTTPException(
+            status_code=422,
+            detail=f"loss_pct {req.loss_pct} exceeds max {MAX_LOSS_PCT} (liquidation risk)",
+        )
+
+    # 3. Compute new SL price
+    new_sl = compute_sl_from_loss_pct(side, entry, leverage, req.loss_pct)
+
+    # 4. Validate SL won't trigger immediately
+    current_price = p.get("current_price", 0)
+    if is_long and new_sl >= current_price:
+        raise HTTPException(
+            status_code=422,
+            detail=f"SL ${new_sl:,.2f} >= current price ${current_price:,.2f} — would trigger immediately",
+        )
+    if not is_long and new_sl <= current_price:
+        raise HTTPException(
+            status_code=422,
+            detail=f"SL ${new_sl:,.2f} <= current price ${current_price:,.2f} — would trigger immediately",
+        )
+
+    # 5. Compute old loss_pct
+    old_sl = p.get("stop_loss")
+    old_loss_pct = None
+    if old_sl and entry > 0 and leverage > 0:
+        old_loss_pct = round(compute_loss_pct_from_sl(side, entry, leverage, old_sl), 2)
+
+    estimated_loss_usd = round(-(collateral * req.loss_pct / 100), 2)
+    tx_cost = 1.0 if exchange == "gmx" else 0.0
+
+    # 6. Preview mode
+    if req.preview_only:
+        return {
+            "success": True,
+            "preview": True,
+            "position_id": position_id,
+            "old_sl_price": old_sl,
+            "new_sl_price": round(new_sl, 2),
+            "old_loss_pct": old_loss_pct,
+            "new_loss_pct": round(req.loss_pct, 2),
+            "estimated_loss_usd": estimated_loss_usd,
+            "collateral_usd": round(collateral, 2),
+            "exchange": exchange,
+            "tx_cost_usd": tx_cost,
+            "message": f"Preview: SL would move to ${new_sl:,.2f} ({req.loss_pct:.1f}% max loss)",
+        }
+
+    # 7. Execute SL move
+    if exchange == "gmx":
+        wid = p.get("wallet_id", 1)
+        acct = accounts.get(wid)
+        if not acct:
+            raise HTTPException(status_code=500, detail=f"Wallet {wid} not configured")
+
+        market_addr = p.get("market_addr") or cfg.markets.get(symbol, "")
+        if not market_addr:
+            raise HTTPException(status_code=500, detail=f"No market address for {symbol}")
+
+        try:
+            from open import (
+                cancel_orders_for_market,
+                create_sl_order,
+                EXCHANGE_ROUTER_ABI,
+                ORDER_TYPE_STOP_LOSS_DECREASE,
+            )
+            from web3 import Web3
+            import open as _open_mod
+
+            exchange_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(cfg.exchange_router),
+                abi=EXCHANGE_ROUTER_ABI,
+            )
+
+            # Cancel existing SL orders for this market
+            fresh_orders = await asyncio.to_thread(
+                _open_mod.fetch_open_orders, w3, acct.address
+            )
+            market_lower = market_addr.lower()
+            sl_orders = [
+                o for o in fresh_orders
+                if o["market"].lower() == market_lower
+                and o.get("is_long") == is_long
+                and o["order_type"] == ORDER_TYPE_STOP_LOSS_DECREASE
+                and o.get("key_hex")
+            ]
+            for sl_order in sl_orders:
+                key_bytes = bytes.fromhex(sl_order["key_hex"])
+                data = exchange_contract.encode_abi("cancelOrder", [key_bytes])
+                tx = _open_mod.build_tx(
+                    w3, Web3.to_checksum_address(acct.address),
+                    exchange_contract.address, data, value=0,
+                )
+                txh = _open_mod.sign_send(w3, acct, tx, dry_run=False)
+                _open_mod.wait_receipt(w3, txh)
+
+            # Create new SL order
+            await asyncio.to_thread(
+                create_sl_order,
+                w3, acct, exchange_contract,
+                acct.address,
+                Web3.to_checksum_address(market_addr),
+                Web3.to_checksum_address(cfg.collateral_token),
+                Web3.to_checksum_address(cfg.order_vault),
+                new_sl, size_usd,
+                symbol, is_long,
+                cfg.slippage_bps,
+                cfg.execution_fee_wei,
+                False,  # dry_run
+            )
+        except Exception as e:
+            logger.error(f"Failed to move SL for {position_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"On-chain SL update failed: {e}")
+
+    elif exchange == "bitunix":
+        if not bx_client:
+            raise HTTPException(status_code=500, detail="Bitunix client not configured")
+
+        from bitunix_executor import to_bitunix_symbol
+
+        bitunix_sym = to_bitunix_symbol(symbol)
+
+        # Extract Bitunix position_id from pid format: "bx_{positionId}"
+        bx_position_id = position_id.replace("bx_", "", 1) if position_id.startswith("bx_") else ""
+        if not bx_position_id:
+            raise HTTPException(status_code=500, detail="Cannot determine Bitunix position ID")
+
+        try:
+            try:
+                await asyncio.to_thread(
+                    bx_client.modify_position_tpsl,
+                    symbol=bitunix_sym,
+                    position_id=bx_position_id,
+                    sl_price=str(new_sl),
+                )
+            except RuntimeError:
+                await asyncio.to_thread(
+                    bx_client.place_position_tpsl,
+                    symbol=bitunix_sym,
+                    position_id=bx_position_id,
+                    sl_price=str(new_sl),
+                )
+        except Exception as e:
+            logger.error(f"Failed to move SL for {position_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Bitunix SL update failed: {e}")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported exchange: {exchange}")
+
+    # 8. Update position_state.json
+    pos_state = safe_json_read(POSITION_STATE_FILE, {})
+    state_key, saved = _find_position_state_key(pos_state, position_id, p)
+    if state_key and state_key in pos_state:
+        pos_state[state_key]["stop_loss"] = new_sl
+        pos_state[state_key]["sl_move_label"] = f"Slider ({req.loss_pct:.1f}%)"
+        atomic_json_write(POSITION_STATE_FILE, pos_state)
+
+    _invalidate_positions_cache()
+
+    return {
+        "success": True,
+        "preview": False,
+        "position_id": position_id,
+        "old_sl_price": old_sl,
+        "new_sl_price": round(new_sl, 2),
+        "old_loss_pct": old_loss_pct,
+        "new_loss_pct": round(req.loss_pct, 2),
+        "estimated_loss_usd": estimated_loss_usd,
+        "collateral_usd": round(collateral, 2),
+        "exchange": exchange,
+        "tx_cost_usd": tx_cost,
+        "message": f"SL moved to ${new_sl:,.2f} ({req.loss_pct:.1f}% max loss)",
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TRADES (history)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2076,6 +2365,40 @@ def _format_trade(t: dict) -> dict:
     }
 
 
+def _deduplicate_trades(trades: list, tolerance: int = 120) -> list:
+    """Remove duplicate trades by (exchange, symbol, side) with fuzzy timestamp matching.
+
+    Two trades are considered duplicates if they share exchange/symbol/side AND
+    either opened_at or closed_at are within `tolerance` seconds.
+
+    When duplicates are found, prefer trades with TP/SL detail over bare ones.
+    """
+    deduped = []
+    for t in trades:
+        is_dup = False
+        t_opened = int(t.get("opened_at", 0))
+        t_closed = int(t.get("closed_at", 0))
+        for i, existing in enumerate(deduped):
+            if (existing.get("exchange", "") == t.get("exchange", "")
+                    and existing.get("symbol", "") == t.get("symbol", "")
+                    and existing.get("side", "") == t.get("side", "")):
+                e_opened = int(existing.get("opened_at", 0))
+                e_closed = int(existing.get("closed_at", 0))
+                opened_match = abs(e_opened - t_opened) < tolerance
+                closed_match = t_closed > 0 and e_closed > 0 and abs(e_closed - t_closed) < tolerance
+                if opened_match or closed_match:
+                    # Duplicate — keep the one with better data
+                    new_has_detail = bool(t.get("tp_details") or t.get("sl_details"))
+                    existing_has_detail = bool(existing.get("tp_details") or existing.get("sl_details"))
+                    if new_has_detail and not existing_has_detail:
+                        deduped[i] = t
+                    is_dup = True
+                    break
+        if not is_dup:
+            deduped.append(t)
+    return deduped
+
+
 @app.get("/api/v1/trades")
 async def list_trades(
     page: int = Query(1, ge=1),
@@ -2084,6 +2407,9 @@ async def list_trades(
 ):
     """List trade history — matches iOS TradesListResponse."""
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
+
+    # Deduplicate: same exchange/symbol/side closing within 120s = same trade
+    all_trades = _deduplicate_trades(all_trades)
 
     # Sort by closed_at descending (most recent first)
     all_trades.sort(key=lambda t: t.get("closed_at", 0), reverse=True)
@@ -2111,6 +2437,9 @@ async def trade_stats(
     Optional period filter: 24h, 7d, 30d, 90d, ytd, 365d, all
     """
     all_trades = safe_json_read(TRADE_HISTORY_FILE, [])
+
+    # Deduplicate before computing stats
+    all_trades = _deduplicate_trades(all_trades)
 
     # Filter by symbol if provided
     trades = list(all_trades)
@@ -2200,6 +2529,7 @@ async def trade_stats(
 async def trades_pdf(token: str = Depends(verify_api_key)):
     """Generate and return a PDF trade history report."""
     trades = safe_json_read(TRADE_HISTORY_FILE, [])
+    trades = _deduplicate_trades(trades)
     for t in trades:
         if t.get("tp_details") is None:
             t["tp_details"] = []
@@ -3109,9 +3439,9 @@ async def get_config(token: str = Depends(verify_api_key)):
         "max_position_usd": cfg.max_position_usd,
         "min_position_usd": cfg.min_position_usd,
         "portfolio_pct": cfg.portfolio_pct,
-        "portfolio_fixed_usd": getattr(cfg, "portfolio_fixed_usd", 0),
+        "portfolio_fixed_usd": cfg.portfolio_fixed_usd,
         "bitunix_portfolio_pct": cfg.bitunix_portfolio_pct,
-        "bitunix_portfolio_fixed_usd": getattr(cfg, "bitunix_portfolio_fixed_usd", 0),
+        "bitunix_portfolio_fixed_usd": cfg.bitunix_portfolio_fixed_usd,
         "require_sl": cfg.require_sl,
         "require_tp": cfg.require_tp,
         "dry_run": cfg.dry_run,
