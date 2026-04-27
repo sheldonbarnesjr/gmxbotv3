@@ -1,957 +1,376 @@
-# Phase 2.5 — Detailed Step-by-Step Audit (2026-04-27)
+# Phase 2 — Step-by-Step
 
-**Audit closeout state:** 4 of 51 audit findings touched Phase 2.5 (M22 MetaDD shift, H14 SOFT_KILL_VARIANTS, H15 MANDATORY_VARIANTS reason, H16 baseline TUNE/EVAL). All shipped 2026-04-26.
-
-**What Phase 2.5 produces:** 21 distinct portfolio variants from 864 frozen Phase 2 strategy packages. Per-cell selector cuts ~702 strategies (94% reduction from legacy 11,232) into Phase 3 holdout. Frozen output drives Phase 3 position sizing + 33,696 holdout runs.
-
-**Wall-clock estimate:** ~1.5–2.5 days end-to-end (parallel-safe by cell + by philosophy).
-
-**Goal of this document:** for each Phase 2.5 step, the user can audit (1) what the code does, (2) why each guard exists, (3) what fixes shipped, (4) what could still be improved, BEFORE Phase 2.5 production launches.
+Phase 2 consumes the frozen Phase 1 signal libraries and trains an 11-model machine-learning ensemble on top of them. Walk-forward cross-validation uses `N_SPLITS=8`, `PURGE_BARS=72`, `EMBARGO_BARS=24` throughout. The ensemble feeds a MetaCombiner that emits a single approval score per trade, which then drives a decision-layer search over score-blending, skip rules, and confidence-bucket boundaries. A size and concurrency overlay multiplies those schemes against replacement-mode and exit-stage axes to produce 72 frozen variants per philosophy. Across the 12 philosophies this yields **864 frozen strategies**, packaged with a master handoff manifest for Phase 3 holdout validation. The chain is orchestrated by `slurm/phase2/p2_master_launcher.sh`, which submits the full SLURM dependency graph and exits.
 
 ---
 
-## Table of Contents
-- [Pipeline Map](#pipeline-map)
-- [Step 0 — Inputs from Phase 2](#step-0--inputs-from-phase-2)
-- [Step 1 — MetaDD Predictor (Student-t, walk-forward)](#step-1--metadd-predictor-student-t-walk-forward)
-- [Step 2 — HRP Construction (3 base + 5 LinUCB variants)](#step-2--hrp-construction-3-base--5-linucb-variants)
-- [Step 3 — LinUCB Contextual Bandit (18-dim, 6-regime)](#step-3--linucb-contextual-bandit-18-dim-6-regime)
-- [Step 4 — Neural Portfolio Optimizer (75-dim, two-stage)](#step-4--neural-portfolio-optimizer-75-dim-two-stage)
-- [Step 5 — Analytic Kelly + DD-Aware Haircut (variant_8 / 8b)](#step-5--analytic-kelly--dd-aware-haircut-variant_8--8b)
-- [Step 6 — MetaDD Overlay (10 pair artifacts)](#step-6--metadd-overlay-10-pair-artifacts)
-- [Step 7 — Baselines (4 dumb-but-honest, H16 TUNE/EVAL split)](#step-7--baselines-4-dumb-but-honest-h16-tuneeval-split)
-- [Step 8 — Asset Admission Gate](#step-8--asset-admission-gate)
-- [Step 9 — Variant Selection + Promotion Gates](#step-9--variant-selection--promotion-gates)
-- [Step 10 — Per-Cell Selector (468 cells, dynamic-K ≤ 3)](#step-10--per-cell-selector-468-cells-dynamic-k--3)
-- [Step 11 — GP Portfolio (variant_11, TODO #28)](#step-11--gp-portfolio-variant_11-todo-28)
-- [Step 12 — Phase 3 Handoff](#step-12--phase-3-handoff)
-- [Audit Closeout — 4 Findings Shipped](#audit-closeout--4-findings-shipped)
-- [Operational Follow-ups](#operational-follow-ups)
-
----
-
-## Pipeline Map
-
-### Directory inventory (`scripts/phases/phase_2_5/`)
-
-| Script | Purpose | Entry |
-|---|---|---|
-| `prompt_7f_metadd_predictor.py` | Walk-forward MetaDD calibration (dd_mu, dd_sigma, dd_nu, dd_q90, dd_q95) | `main()` L612 |
-| `prompt_7d_pysr_drawdown.py` | SymbolicRegression DD model | `main()` L867 |
-| `prompt_7f_gp_drawdown.py` | GP-evolved DD model | `main()` |
-| `prompt_7f_lgb_bootstrap_dd.py` | LightGBM bootstrap DD quantile | — |
-| `prompt_7f_xgb_quantile_dd.py` | XGBoost quantile DD predictor | — |
-| `prompt_7_metadd_overlay.py` | Apply MetaDD to 8 base → 8 pairs + 2 extras | `run()` L229 |
-| `prompt_7g_portfolio_baselines.py` | 4 dumb-but-honest baselines (H16 fix) | `main()` L295 |
-| `prompt_7h_asset_admission.py` | Per-asset whitelist post-Phase-2 | `main()` L174 |
-| `prompt_7i_gp_portfolio.py` | GP-evolved portfolio (variant_11 future) | `main()` L214 |
-| `prompt_7j_per_cell_selector.py` | **CORE:** 468-cell selector, dynamic-K ≤ 3 | `main()` L476 |
-| `select_phase3_candidates.py` | **CORE:** variant scoring + mandatory advance | `main()` L519 |
-| `freeze_phase25_artifacts.py` | Archive Phase 2.5 before Phase 3 | `main()` L70 |
-| `prompt_sizing_selection.py` | Position-sizing allocation | `main()` L255 |
-| `ab_validate_optimizer.py` | A/B test optimizers vs baselines (paired bootstrap) | `main()` L259 |
-| `ablation_runner.py` | Variant ablation (sensitivity to K, selectivity) | `main()` L234 |
-| `ablation_k_mode.py` | dynamic-K vs fixed-K per cell | `main()` L60 |
-| `ablation_per_cell_fixed_vs_dynamic.py` | fixed-K per-strategy vs per-cell | `main()` L56 |
-| `canonical_allocator_extensions.py` | Allocator optimization extensions (future) | — |
-
-HRP/LinUCB construction lives upstream in [prompt_7_portfolio_construction.py](scripts/phases/phase_2/prompt_7_portfolio_construction.py) (Phase 2 boundary).
-
-### Canonical execution order (12 stages)
-
-1. **MetaDD Predictor** — fit Student-t over 6 base DD models, walk-forward; emit `metadd_predictions.parquet`
-2. **HRP Construction** — Sharpe-distance clustering + Ledoit-Wolf cov bisection (in Phase 2 prompt_7)
-3. **LinUCB Bandit** — 18-dim context, walk-forward training, ±20% satellite adjustment
-4. **Neural Optimizer** — Stage 1 Ridge → Stage 2 SmallPortfolioNet; 75-dim input
-5. **Analytic Kelly** — Ledoit-Wolf shrunk cov + Kelly fraction (γ=4 quarter-Kelly)
-6. **MetaDD Overlay** — 10 pair artifacts via 8 modifier functions
-7. **Baselines** — 4 dumb-but-honest equal-weight portfolios (H16 TUNE/EVAL)
-8. **Asset Admission** — 22-asset whitelist (P25-Q-S8 ≥2-of-3 criteria)
-9. **Variant Selection** — composite score + 4 promotion gates
-10. **Per-Cell Selector** — 468 cells, dynamic-K ≤ 3, Holm m=468
-11. **GP Portfolio** — variant_11 (TODO #28, not yet integrated)
-12. **Phase 3 Handoff** — emit `phase3_deploy_manifest.json` + freeze artifacts
-
-### Variant registry (21 distinct variants)
-
-**Base variants (8) — `select_phase3_candidates.py:99-126`:**
-
-| ID | Type | Status |
-|---|---|---|
-| `variant_1_best_single` | Single highest-Sharpe strategy | **soft_kill** |
-| `variant_2_hrp_conservative` | HRP Core 60% (Lib 6,7) + Satellite 40% (Lib 2,8,9,11) | primary |
-| `variant_3_hrp_a_linucb` | HRP-A + LinUCB ±20% on satellite | **soft_kill** |
-| `variant_4_hrp_aggressive` | HRP Core 60% (Lib 1,2,5,3) + Satellite 40% (Lib 4,9,11,10) | primary |
-| `variant_5_hrp_b_linucb` | HRP-B + LinUCB ±20% on satellite | **soft_kill** |
-| `variant_6_50_50_blend` | 0.5×Conservative + 0.5×Aggressive | primary |
-| `variant_7_neural_optimizer` | NN-optimized weights (75-dim two-stage) | **soft_kill** |
-| `variant_8_kelly` | Analytic Kelly (Ledoit-Wolf cov + γ=4) | primary, **MANDATORY** |
-
-**MetaDD A/B pairs (8):**
-
-| ID | Modifier | Function |
-|---|---|---|
-| `variant_1b_best_single_metadd` | `_scale_by_q90` | Scale position size ↓ on dd_q90 spike |
-| `variant_2b_hrp_conservative_metadd` | `_flatten_by_sigma` | Spread cluster weights on high dd_sigma |
-| `variant_3b_hrp_a_linucb_metadd` | `_shrink_linucb_by_nu` | dd_nu as 17th LinUCB context |
-| `variant_4b_hrp_aggressive_metadd` | `_shift_toward_conservative` | Low dd_nu (fat tails) → shift toward A |
-| `variant_5b_hrp_b_linucb_metadd` | `_shrink_linucb_by_nu` | Same as 3b |
-| `variant_6b_50_50_blend_metadd` | `_adjust_ab_blend` | dd_nu adjusts A/B split |
-| `variant_7b_neural_metadd` | `_flatten_by_sigma` | Neural + dd_sigma flatten |
-| `variant_8b_kelly_metadd` | `_scale_kelly_by_sigma` | Kelly × inverse uncertainty |
-
-**MetaDD-only extras (2):**
-- `variant_9_dd_capped_neural` — `_cap_by_q90` with **M22 shift(1) fix**
-- `variant_10_portfolio_blender` — Inverse-uncertainty blend across 8 base variants
-
-**Future / experimental (3):**
-- `variant_7c_neural_linucb` — TODO #13 (LinUCB overlay on Neural)
-- `variant_8c_kelly_linucb` — TODO #13 (LinUCB overlay on Kelly)
-- `variant_11_gp_portfolio` — TODO #28 (GP-evolved formula)
-
-**Frozensets exported (H14 fix):**
-```python
-SOFT_KILL_VARIANTS = frozenset({"variant_1", "variant_3", "variant_5", "variant_7"})
-PRIMARY_VARIANTS  = frozenset({...all primaries...})
-MANDATORY_VARIANTS = ["variant_8_kelly"]  # only one (2026-04-14)
-```
-
-### Cell key structure
-
-```python
-Cell = (asset, philosophy)
-# 22 assets × 12 philosophies = 264 base cells
-# 468 cells when including additional sizing-method dimension OR per-philosophy variant-subset enumeration
-# Exact 468 derivation lives in select_dynamic_k logic at prompt_7j_per_cell_selector.py:236-265
-```
-
-PHASE3_USE_CELL_MANIFEST=True flag (per CLAUDE.md) cuts ~702 strategies into Phase 3 from legacy 11,232 (94% reduction).
-
-### Wall-time totals
-
-| Stage | Time |
-|---|---|
-| MetaDD calibration | 4-6h |
-| HRP+LinUCB (Phase 2 boundary) | ~60-120s |
-| Neural Optimizer | 6-12h |
-| Kelly | seconds (analytic) |
-| MetaDD Overlay | ~30 min |
-| Baselines | ~30 min |
-| Asset admission | ~10 min |
-| Variant selection | ~15 min |
-| Per-cell selector | 6-8h (parallelizable by cell) |
-| GP portfolio (when shipped) | ~6h |
-| **Total** | **~1.5-2.5 days** |
-
----
-
-## Step 0 — Inputs from Phase 2
+## Step 1 — prompt_1_dataset_build.py
 
-### What this step does
+This step builds the per-asset, per-philosophy ML training dataset that the entire ensemble consumes. It reads the frozen Phase 1 signal library for one cell, replays each rule against Phase 2 OHLCV bars, and emits a trade table augmented with feature-matrix columns aligned at signal-bar timestamps. It also emits a quarantine sidecar at `pipeline_state/phase_2/dataset_quarantine.json` so that downstream training excludes signals that fail the in-window PF guard.
 
-Step 0 documents the contract between Phase 2 and Phase 2.5. Phase 2.5 reads ONLY frozen Phase 2 outputs.
+It reads `pipeline_state/phase_1/frozen_libraries/{philosophy}/{asset}.json`, `OHLCV/phase2/{asset}.parquet`, and `features/phase2/{asset}.parquet`. It writes the canonical per-cell dataset to `features/phase2/datasets/{asset}_{philosophy}.parquet`, plus a per-cell metadata JSON. Trade-level columns kept include `signal_bar`, `fill_bar`, `exit_bar`, `entry_price`, `exit_price`, `direction`, `holding_bars`, `gross_pnl_pct`, `funding_cost`, `execution_cost`, `net_pnl_pct`, `signal_name`, `signal_family`, `signal_direction`, `signal_category`, `tp_pct_used`, `sl_pct_used`, `max_hold_used`. `exit_reason` is excluded — it is a circular target leak and the MC blocklist enforces this as a backstop.
 
-### Inputs from Phase 2
-
-| Input | Path | Schema |
-|---|---|---|
-| 864 frozen strategy packages | `configs/frozen/phase3_handoff/strategy_*_package.json` | `{variant_id, asset, philosophy, strategy_name, ...}` |
-| Phase 3 handoff manifest | `configs/frozen/phase3_handoff_manifest.json` | Master registry with `exit_config_shas` (Gap 6 SHA-pin) |
-| Per-philosophy OOS returns | `pipeline_state/phase_2_5/strategy_oos_returns.parquet` | wide: index=date, cols=strategy_id |
-| Base variant weights (8×) | `pipeline_state/phase_2_5/{variant_N}_weights.parquet` | index=date, cols=strategy_id |
-| Base variant returns (8×) | `pipeline_state/phase_2_5/{variant_N}_returns.parquet` | index=date, single col |
-| MetaCombiner predictions | `{philosophy}_cross_asset_metacombiner_predictions.parquet` | mc_mu/sigma/nu, mc_kelly_leverage, etc. |
-
-### Outputs to Phase 3
-
-| Output | Path | Schema |
-|---|---|---|
-| Advancing variants | `reports/phase2_5/phase3_candidate_variants.json` | `{advancing_variants: [...], scored_variants: {...}, composite_score_weights: {...}}` |
-| Per-cell selections | `configs/frozen/phase3_cell_selections.json` | `{cell_key: {winners: [...], p_value, n_combos}, ...}` |
-| Phase 3 deploy manifest | `configs/frozen/phase3_deploy_manifest.json` | Flat: `[{variant_id, asset, philosophy, ...}, ...]` |
-| Cell trade ledgers | `pipeline_state/phase_2_5/cell_*_trades.parquet` | Per-cell simulation ledger |
-| MetaDD predictions | `pipeline_state/phase_2_5/metadd_predictions.parquet` | Daily dd_mu/sigma/nu/q90/q95 |
-| Baseline comparison | `reports/portfolio_baselines/baselines_returns.parquet` | Dumb-but-honest baseline returns |
-| Asset whitelist | `configs/frozen/phase3_asset_whitelist.json` | 22-asset admission |
-
-### Open concerns
-1. **Phase 2 inputs depend on H21 re-emit** — feature stores carry the 1-bar lookahead leak in `tfm_fp_fr_corr_*` until Phase 0 re-emit completes. MetaCombiner trained on biased inputs would propagate bias into Phase 2.5.
-2. **bf4 chain dependency** — Phase 2.5 cannot run until Phase 2 production completes. Phase 1 BF chain currently ~T+2.5d; bigcaps add ~12-18h.
-
----
-
-## Step 1 — MetaDD Predictor (Student-t, walk-forward)
-
-**Script:** [scripts/phases/phase_2_5/prompt_7f_metadd_predictor.py](scripts/phases/phase_2_5/prompt_7f_metadd_predictor.py)
-
-### What this step does
-
-Trains a per-strategy 7-day max-drawdown forecaster combining 6 base predictors via Student-t MLP head. Outputs distributional drawdown estimates (mu, sigma, nu, q90, q95) used by all `_metadd` variants. Walk-forward chronological; fold 1 = NaN by construction.
-
-### Architecture
-
-**6 base DD predictors (upstream, fold-aware):**
-| Predictor | Outputs | File |
-|---|---|---|
-| PySR DD | q50, q90 | `prompt_7d_pysr_drawdown.py` |
-| NGBoost DD | mu, sigma | trained on vol features |
-| Vol baseline | mean/std (30-day window) | deterministic |
-| GP DD | q50, spread | `prompt_7f_gp_drawdown.py` |
-| XGB-Quantile DD | q10, q50, q90 | `prompt_7f_xgb_quantile_dd.py` |
-| LGB-Bootstrap DD | mu, sigma | `prompt_7f_lgb_bootstrap_dd.py` |
+This step runs as a per-asset SLURM array (`slurm/phase2/p2_dataset_build.sh`, `--array=0-21`). Every downstream training step keys off the parquet path written here, so the schema contract is load-bearing.
 
-**Student-t MLP head:**
-- Hidden: 16
-- LR: 3e-3
-- Epochs: 300
-- Patience: 30
-- ν floor: `STUDENT_NU_MIN = 2.5` (B3 fix 2026-04-16, ensures finite variance)
-- ν ceiling: `STUDENT_NU_MAX = 30.0`
-- ν init: 5.0 (moderate tails)
+## Step 2 — prompt_2_model_train.py + per-model trainers
 
-### Outputs (`metadd_predictions.parquet`)
+This step trains the gradient-boosting backbone of the ensemble and the auxiliary scorers. `prompt_2_model_train.py` handles the XGBoost head per fold. Companion trainers run alongside for the auxiliary models: `prompt_2b_timesfm_features.py` produces TimesFM forecast features and a per-cell calibration sidecar, `prompt_2c_lstm_classifier.py` trains an LSTM2 classifier with attention initialized from `models/pretrained/lstm_pretrained.pt` when shapes match, `prompt_2d_tft_scorer.py` trains a TFT scorer, `prompt_2e_cross_asset_scorer.py` produces cross-asset context scores, `prompt_2e_lightgbm.py` and `prompt_2f_catboost.py` train tree-based diversifiers, `prompt_2i_xgb_quantile.py` trains a quantile head, `prompt_2k_lgb_bootstrap.py` trains a bootstrapped LGB head, `prompt_2l_bnn_mc_dropout.py` trains a Bayesian MC-dropout head with `MC_SAMPLES=100`, and `prompt_2f_leverage_model.py` trains a regression head that predicts optimal leverage from the upstream quality scores.
 
-| Column | Meaning |
-|---|---|
-| `dd_mu` | Expected 7-day max drawdown |
-| `dd_sigma` | Uncertainty scale |
-| `dd_nu` | Tail shape (low → fat tails / crash risk) |
-| `dd_q90` | 90th percentile from Student-t CDF |
-| `dd_q95` | 95th percentile from Student-t CDF |
+Inputs are the per-cell dataset from Step 1. Outputs are per-fold checkpoints under `models/phase2/{asset}_{philosophy}_{component}_fold_{K}.pt|.json` and per-fold OOS prediction parquets that are stitched chronologically in Step 3. Each trainer respects the walk-forward purge and embargo, fits scalers and imputers on the train fold only, and writes via atomic-replace.
 
-### Calibration metric
-**Exceedance rate** = fraction of days where `realized_DD > predicted_q90`.
-Well-calibrated slope ≈ 1.0 (10% exceedance rate). Used by `select_phase3_candidates.py` as gating criterion (`CALIBRATION_SLOPE_RANGE = (0.75, 1.25)`).
+This step is the GPU-heavy core of Phase 2. It runs as `slurm/phase2/p2_models_train.sh` — a 22-asset array with `--gres=gpu:h100:1`, `--cpus-per-task=32`, `--mem=128G`, `--time=12:00:00`. Off-critical-path companions (`ngboost_train.sh`, ablation runners) fire on its completion.
 
-### Anti-leakage guards
-- Walk-forward chronological folds (fold 1 = NaN — insufficient training)
-- At day T: all inputs use data strictly before T; target = forward window T+1..T+7
-- Each base predictor enforces own fold-safe preprocessing
+## Step 3 — prompt_3_oos_assembly.py
 
-### Wall-time
-**4-6h** (468-cell walk-forward × 6 base models × MLP head training).
+This step stitches the per-fold OOS prediction tables from Step 2 into a unified per-asset table, then merges those into a cross-asset table per philosophy. It is the single source of truth for the ensemble's OOS predictions consumed by the MetaCombiner and the decision layer. It enforces OOS integrity — no duplicate timestamps, no chronological gaps, full metadata preservation across folds.
 
-### Open concerns
-1. **MetaDD calibration outside [0.75, 1.25] range** — variants flagged but still advance (gates in `select_phase3_candidates`)
-2. **PySR/GP DD models** are research-grade; verify they don't quietly fall back to vol baseline in production
-3. **Student-t initialization** at ν=5 may bias early-fold predictions toward Gaussian tails
+It reads `models/phase2/{asset}_{philosophy}_fold_predictions.parquet` for each component model and each of 5 OOS folds. It emits `pipeline_state/phase_2/oos_unified/{asset}_{philosophy}.parquet` in per-asset mode, and `pipeline_state/phase_2/oos_unified/{philosophy}_cross_asset.parquet` in `--merge` mode. Score-distribution and classification-vs-expected-PnL correlation stats are written alongside as integrity JSON.
 
----
+The per-asset run is invoked by the per-asset assembly array (`slurm/phase2/p2_assembly.sh`, `--array=0-21`). The cross-asset `--merge` invocation runs inside `slurm/phase2/p2_freeze.sh` once all 22 per-asset tasks succeed.
 
-## Step 2 — HRP Construction (3 base + 5 LinUCB variants)
+## Step 4 — prompt_3b_metacombiner.py
 
-**Script:** [scripts/phases/phase_2/prompt_7_portfolio_construction.py:598-697](scripts/phases/phase_2/prompt_7_portfolio_construction.py#L598-L697) (lives at Phase 2 boundary)
+This step trains the MetaCombiner — a small MLP (20 → 32 → 16 → 1, SmoothL1 loss, vol-scaled targets) that takes the unified ensemble outputs and emits one approval score per trade. It is the highest-leakage-risk component because it operates on already-OOS predictions across folds in a two-level walk-forward; fold 1 is intentionally NaN.
 
-### What this step does
+It reads the cross-asset OOS table from Step 3 and writes `models/phase2/metacombiner_{philosophy}_fold_{K}.pt`, plus a merged predictions parquet at `pipeline_state/phase_2/metacombiner/{philosophy}_predictions.parquet`. The clean training label is `net_pnl_pct_at_fixed_exit`. The MC INPUT BLOCKLIST enforces a substring match at training entry and rejects any column containing `rel_exit`, `selected_exit`, `exit_advantage`, `exit_dispersion`, `sigma_exit`, `dist_exit`, or `_shadow_`. A `ValueError` is raised before the first batch if any column matches; `exit_reason` is also blocked as defense in depth.
 
-Hierarchical Risk Parity (HRP) clusters strategies hierarchically based on risk-adjusted co-movement, then recursively bisects to equalize risk contribution within each cluster. More robust than mean-variance (no full covariance inversion).
+This step runs once per philosophy inside `p2_freeze.sh` after the per-asset cross-asset merge. The per-fold checkpoints and the merged-predictions parquet are the binding inputs for the decision layer at Step 5 and for exit-overlay bake-offs at Step 7.
 
-### HRP algorithm
+## Step 5 — prompt_4_decision_layer.py
 
-| Component | Implementation | Notes |
-|---|---|---|
-| Distance metric | Sharpe-series correlation (21-day rolling) | P2.5-1: risk-adjusted, not raw returns (lines 646-650) |
-| Linkage method | `config.HRP_LINKAGE_METHOD`, default "average" | v3.7 Tier A.5: switched single → average to reduce chaining (lines 653-656) |
-| Weight computation | Recursive bisection with Ledoit-Wolf shrunk cov | Cov only for bisection; distance for clustering |
-| NaN handling (R4) | Drops strategies with ≥20% NaN fraction pre-HRP | Prevents delisted assets from absorbing weight (lines 618-636) |
-| Stability filter | Bootstrap resampling: zeros strategies not in top-K ≥80% of resamples | Anti-overfit (`PORTFOLIO_TOP_K`, `PORTFOLIO_BOOTSTRAP_THRESHOLD`, lines 679-692) |
+This step searches over decision-layer schemes that turn MetaCombiner approval scores plus ensemble heads into a binary take-or-skip decision. It tests score-blending weights, skip rules, and confidence-bucket boundaries, retains the top three (`MAX_COMBINED_SCORING_SCHEMES=3`), and forwards all three to Step 6 with no selection or elimination.
 
-### HRP variants (7 base)
+It reads the MetaCombiner predictions parquet and the cross-asset OOS table for one philosophy. It writes `pipeline_state/phase_2/prompt_4_schemes_{philosophy}.json` containing the three frozen scheme specs plus per-scheme OOS metrics. A philosophy-agnostic fallback is written to `prompt_4_schemes.json`.
 
-| Variant | Type | Base structure |
-|---|---|---|
-| `variant_2_hrp_conservative` | Conservative | Core 60% (Lib 6,7) + Satellite 40% (Lib 2,8,9,11), static HRP |
-| `variant_3_hrp_a_linucb` | Conservative + LinUCB | Same + LinUCB ±20% on satellite only |
-| `variant_4_hrp_aggressive` | Aggressive | Core 60% (Lib 1,2,5,3) + Satellite 40% (Lib 4,9,11,10), static HRP |
-| `variant_5_hrp_b_linucb` | Aggressive + LinUCB | Same + LinUCB ±20% on satellite only |
-| `variant_6_50_50_blend` | Blend | 0.5×Conservative + 0.5×Aggressive |
-| `variant_7c_neural_linucb` | Future | LinUCB overlay on Neural (TODO #13) |
-| `variant_8c_kelly_linucb` | Future | LinUCB overlay on Kelly (TODO #13) |
+This step runs once per philosophy in `p2_freeze.sh`. The three schemes survive into Step 6 as the score-scheme axis of the 72-variant grid.
 
-### Inputs / outputs
+## Step 6 — prompt_5_overlay.py
 
-**Inputs:**
-- 1,296 strategy curves (72 variants × 18 libraries pre-prune; post-prune 864 = 12 phil × 72 var)
-- Returns matrix: (T, K), T ≈ 500-750 days
-- Regime contexts: (T, 18) constructed daily
+This step takes each of the three decision schemes and overlays the size, concurrency, replacement-mode, and exit-stage axes on top to produce 72 frozen variants per philosophy. The combinatorics are `3 score schemes × 3 size/concurrency overlays × replacement_mode × EXIT_STAGE_AXIS=[1, 2]`. Position sizing assumes $1,000 initial capital, compounding, with a $50,000 single-position cap; concurrency caps come from `CONCURRENCY_CAPS = [5, 8, 10, 15, 20, 25]`; `REPLACEMENT_MODES = ["close_at_market", "skip", "swap_by_expected_pnl"]`. Per-variant identity is `{variant_id}{_mode_suffix}{_stage_suffix}`.
 
-**Outputs:**
-- Per-variant weight matrices: (T, K), index=date, columns=strategy_id
-- Variant returns parquet (single-column daily returns)
-- Metadata JSON: Sharpe, max DD, Sortino, monthly win rate, turnover, stability score
+It reads the three schemes from Step 5 and emits one frozen-config JSON per variant under `configs/frozen/{philosophy}/{variant_id}.json`, plus a per-philosophy summary table at `pipeline_state/phase_2/prompt_5_variants_{philosophy}.parquet`. Each variant record carries `variant_id`, `scheme_label`, `risk_profile`, `exit_stage`, `replacement_mode_axis`, and a frozen-spec dict.
 
-### Wall-time
-~2-5 seconds for HRP weight computation across all strategies. Full Phase 2.5 HRP+LinUCB+core-satellite pipeline: ~60-120s.
+All 72 variants per philosophy proceed to Step 7. No variant is dropped here. Across 12 philosophies this materializes 864 frozen-spec JSONs, which Step 8 packages.
 
-### Open concerns
-1. **HRP stability filter threshold (80%)** — may be over-aggressive on short OOS samples
-2. **Linkage method choice (average)** — was single pre-v3.7 Tier A.5; document basis for switch
+## Step 7 — prompt_5b_robustness_audit.py + prompt_exit_selection.py + prompt_sizing_selection.py + prompt_2n_distribution_exit.py + check_timesfm_calibration_per_cell.py + tune_dist_exit_threshold.py + prompt_rl_sizing.py
 
----
+This step runs the robustness audit, the per-strategy fold-indexed exit selection, the sizing selection, the dist_exit threshold calibration, and the RL sizing fit. The robustness audit validates each variant under Hansen SPA and Holm-Bonferroni multiple-testing correction with stationary block-bootstrap p-values, where SPA p-values are reported but Holm is the binding filter. Per-strategy exit selection picks the best exit overlay from `CHALLENGERS = ["atr_scaled", "sigma_exit", "gp", "dist_exit"]` against the `fixed` baseline, fold-indexed via `selected_exit_by_fold[K]` using only folds 0..K-1. Sigma-exit is shadow-only.
 
-## Step 3 — LinUCB Contextual Bandit (18-dim, 6-regime)
+It reads the variant configs from Step 6 plus the MetaCombiner trade universe. It writes `configs/frozen/exit_selection.json`, `configs/frozen/sizing_selection.json`, `configs/frozen/dist_exit_thresholds.json`, `configs/frozen/timesfm_calibration_report.json`, `pipeline_state/phase_2/tfm_calibration_per_cell.json`, and per-variant audit JSONs under `pipeline_state/phase_2/audit/`.
 
-**Script:** [scripts/phases/phase_2/prompt_7_portfolio_construction.py:970-1181](scripts/phases/phase_2/prompt_7_portfolio_construction.py#L970-L1181)
+The TimesFM per-cell calibration sidecar grids on `(asset × direction × horizon × regime)` — 22 × 2 × 3 × 6 = 792 cells. It records Wilson 95% LCB on direction accuracy, calibration slope, coverage at 90% and 95%, plus a 4-tier pooled-fallback ladder at `n ≥ 80 / 200 / 350 / 600`. The dist_exit gate is deny-default — cells without a passing entry are ineligible. The fold-indexed `cells_by_fold` structure is what Phase 3 reads at execution time.
 
-### What this step does
+## Step 8 — prompt_6_assembly.py
 
-LinUCB contextual multi-armed bandit learns which library (arm) performs best under different market regimes (contexts). Combines exploitation + exploration via upper confidence bound. Daily 18-dim regime features drive ridge-regression model per library, producing UCB scores that adjust HRP satellite weights ±20%.
+This step is the final Phase 2 assembly. It runs once after every philosophy has completed Steps 1-7, verifies that all `NUM_PHILOSOPHIES × NUM_VARIANTS_PER_LIBRARY = 864` frozen-config JSONs exist, packages them into per-strategy bundles, and writes the master handoff manifest for Phase 3. No snapshot verification, no holdout data access, no tuning. A global Holm step aggregates exit, sizing, and MC-input p-values family-wide.
 
-### Anti-whipsaw constraints
-- 7-day minimum hold
-- 10% hysteresis (transition cost threshold)
-- Max 2 transitions/month
+It reads `configs/frozen/{philosophy}/{variant_id}.json` × 864, plus `configs/frozen/exit_selection.json`, `configs/frozen/sizing_selection.json`, `configs/frozen/dist_exit_thresholds.json`, the per-cell calibration sidecar, and the audit outputs. It writes the master manifest at `pipeline_state/phase_3/phase3_handoff_manifest.json` with per-strategy bundle paths, SHA pins, and chmod 0o444 on all packaged files. The manifest is the asset-whitelist-validated cell-deploy contract for Phase 3.
 
-### 18-dim context features (post 2026-04-24, was 16)
+This step runs at the tail of `p2_freeze.sh` and is gated by every prior step in the chain. Failure here aborts the chain before `p2_validate.sh` fires.
 
-| # | Feature | Source | Lag |
-|---|---|---|---|
-| 0-2 | Vol regime one-hot {high/mid/low} | 21-day rolling vol on agg portfolio returns | 1d |
-| 3-4 | Trend regime one-hot {bull/bear} | 21-day rolling avg return | 1d |
-| 5-6 | Correlation regime {high/low} | Pairwise rolling corr | 1d |
-| 7 | Market breadth | Frac strategies with positive return | 1d |
-| 8-11 | Phase 0 regime label one-hot (4 cols) | Phase 0 regime_label, daily mode | 1d |
-| 12-15 | LSTM encoder PCA (4 cols) | Phase 0 BTC LSTM encoder, z-scored | 1d |
-| 16-18 | Ensemble uncertainty (3 cols) | MetaCombiner: ensemble_sigma_z, epistemic_variance_ratio, calibration_drift | No lag |
+## Step 9 — p2_validate.sh
 
-**Total dim:** d = 8 + 4 + 4 + 2 = 18 (post 2026-04-24). `LINUCB_CONTEXT_DIM = 18` in config.
+This step is the final gate before Phase 2.5. It checks that all 864 frozen configs exist, that every component-model checkpoint is on disk, that MetaCombiner fold coverage is correct, that no Phase 3 data was accessed during Phase 2, that OOS prediction tables carry the ensemble columns the manifest claims, and that the Phase 3 handoff manifest is internally valid.
 
-**Variant 3b adds dd_nu as 17th feature** (overflow beyond 18-dim — order undefined).
+It reads the master manifest from Step 8 plus all referenced bundle files. It emits `pipeline_state/phase_2/p2_validate_report.json` with pass/fail per check. On failure, the chain stops and Phase 2.5 does not launch. On success, `slurm/phase2_5/p25_master_launcher.sh` is fired with `--dependency=afterok:$JID_VAL`.
 
-### 6-regime conditioning
+## Wall-clock estimate
 
-LinUCB does NOT train one bandit per regime. Single bandit with one A (d×d) + b (d-vector) per arm; regime labels are one-hot encoded as features (cols 8-11). Regime signal influences weights indirectly through ridge regression `θ = A⁻¹ b`.
+Per `p2_master_launcher.sh`: 8 nodes × 4 H100s ≈ ~9 days end-to-end. Per `launch_phase2.sh` (8-stage Quartz dependency variant): ~15 hours total across ~14,000 array tasks when the full critical path runs unblocked.
 
-**6 regimes** (Phase 0 labels): bull_trending, bear_trending, sideways, high_volatility, low_vol_compression, crash_capitulation (last 2 added 2026-04-24 Ship 2).
+# Phase 2.5 — Step-by-Step
 
-### Train/test split: walk-forward chronological
+Phase 2.5 turns the 864 frozen Phase 2 strategies (72 variants per philosophy times 12 philosophies) into deployable portfolio variants and a Phase 3 cell-selected manifest. The variant registry in `select_phase3_candidates.py` enumerates 20 portfolio variants total: 14 primary, 4 soft-kill diagnostic baselines (`variant_1`, `variant_3`, `variant_5`, `variant_7`), and 2 future-deferred LinUCB overlays (`variant_7c`, `variant_8c`); together with a small set of block-bootstrap baselines emitted by `prompt_7g_portfolio_baselines.py` the assembly stage routes the full deployment universe through a 468-cell `(asset, library)` per-cell selector that cuts roughly 94% of strategy-cell combinations down to about 702 entries when `PHASE3_USE_CELL_MANIFEST=True`.
 
-```
-Months 1–3 (90 days):  Train (minimum window)
-Month 4 (30 days):     Test (pick arm at T, reward = return[T-1])
-Month 5 (30 days):     Test
-...
-```
+## Step 1 — prompt_7_portfolio_construction.py (HRP base + LinUCB bandit)
 
-**Anti-leakage assertion** at lines 1173-1175: reward index (t-1) strictly precedes context index (t).
+The first portfolio stage builds the canonical HRP allocation across the 864 frozen strategies and overlays the LinUCB regime-adaptive bandit. HRP performs hierarchical clustering on the strategy correlation matrix, then distributes inverse-variance weight down the cluster tree so that highly correlated strategies share a single budget cell. The result is the conservative HRP-A book and an aggressive HRP-B book that lifts the leaf-cluster cap.
 
-### Outputs
-- Trained `LinUCBBandit` object with persisted A/b matrices, ctx_mean/ctx_std, ctx_dim
-- Daily satellite weight adjustments ±20%
+Inputs are the per-strategy `net_pnl_pct_at_fixed_exit` series from Phase 2 OOS folds and the regime label sidecar produced by `prompt_7b_regime_detector.py`. Outputs land in `pipeline_state/phase_2_5/` as `hrp_conservative_weights.parquet`, `hrp_aggressive_weights.parquet`, and `linucb_state.pkl`.
 
-### Wall-time
-~10-20 seconds for full walk-forward on 500-day dataset.
+The LinUCB layer runs as a satellite overlay on HRP. Context dimension is `LINUCB_CONTEXT_DIM=18` and the regime taxonomy uses `NUM_REGIMES=6`. Anti-whipsaw protection enforces a minimum hold-days window per arm and a transitions-per-window cap; bandit state is reset between training and serialization so the persisted pickle replays deterministically. The 50/50 blend variant averages HRP-A with HRP-B-plus-LinUCB to give a middle book.
 
-### Anti-leakage guards
-1. Phase 2 OOS data only (line 349-353)
-2. Causal regime lag (1 day on all features; lines 1540-1543, 1561-1567)
-3. LinUCB reward lag: reward = return[t-1], context = day T (lines 1173-1175)
-4. LSTM encoder leakage-safe (Phase 0 frozen, lines 1555-1560)
-5. Regime label lag: explicit 1-day forward-fill, no backfill (lines 185-195)
-6. Context normalization stats persisted for Phase 3 replication (lines 1589-1599)
-7. No Phase 3 contamination (header lines 20-21)
+## Step 2 — prompt_7c_portfolio_optimizer.py (Neural optimizer)
 
-### Open concerns
-1. **Regime feature store completeness** — fallback returns all zeros (silent degradation to 8-dim), not error
-2. **Variant 3b 17th feature** — dd_nu overflow ordering not formally documented
-3. **Walk-forward warm-up offset 21:** persist for Phase 3 replication; verify stored in artifact
+The neural portfolio optimizer ingests per-strategy expected-return and risk features alongside regime descriptors and emits a learned weight vector. Input dimension is `NEURAL_OPT_INPUT_DIM=103`, decomposed as `PORTFOLIO_TOP_K=75` strategy slots plus `N_REGIME_FEATURES=28` regime descriptors. The model is a bagged ensemble trained via stationary block bootstrap to respect serial dependence in returns.
 
----
+Inputs include `metacombiner_oos_predictions.parquet`, the regime feature panel, and the HRP weights from Step 1. Outputs are `neural_optimizer_weights.parquet`, an ensemble manifest JSON listing each bagged checkpoint, and a `neural_optimizer_state_dict.pt`. A state-dict shape check fires on load so that any input-dimension drift errors immediately rather than silently zero-padding.
 
-## Step 4 — Neural Portfolio Optimizer (75-dim, two-stage)
+The optimizer feeds variant_7 (`neural_optimizer`) and is consumed by the MetaDD overlay (variant_7b) and the inverse-uncertainty blender (variant_10). Output weights are normalized and clipped to the per-asset concurrency cap downstream.
 
-**Script:** [scripts/phases/phase_2/prompt_7c_portfolio_optimizer.py](scripts/phases/phase_2/prompt_7c_portfolio_optimizer.py) (1,200+ lines)
+## Step 3 — prompt_7e_kelly_portfolio.py (Kelly walk-forward)
 
-### What this step does
+Kelly-fraction portfolio sizing runs as a walk-forward routine producing variant_8. Each test month is fit on a trailing window with a one-month embargo separating training from the test month so that no within-month cross-fit signal leaks across the boundary. The per-strategy Kelly fraction is capped to a half-Kelly ceiling and projected onto the per-asset concurrency budget.
 
-Two-stage portfolio optimizer:
-- **Stage 1:** Ridge regression on 1,324 features (864 strategies + 28 regime features) → ranks strategies, selects top-75
-- **Stage 2:** SmallPortfolioNet MLP on 103 dims (75 selected strategies + 28 regime) → softmax weights
+Inputs are the Phase 2 strategy-level fold returns and the MC approval mask. Outputs are `variant_8_kelly_weights.parquet` and `variant_8_kelly_returns.parquet`, written to `pipeline_state/phase_2_5/` for downstream MetaDD pairing.
 
-Loss: utility-based Sharpe maximization with turnover/concentration/drift/bound penalties.
+The Kelly walker emits per-month weight vectors that the MetaDD overlay scales by inverse `(1 + dd_sigma)` to produce variant_8b. The `canonical_allocator_extensions.py` dispatcher provides additional Kelly-family routines (`variant_19_kelly_max`, `variant_20_kelly_r1r2`, `variant_22_half_kelly_eta`) for downstream baseline expansion.
 
-### Stage 1 input dims (1,324)
+## Step 4 — prompt_7f_metadd_predictor.py (Student-t MetaDD)
 
-- 864 strategy returns
-- 28 regime features:
-  - 4 base (vol_z, ret_z, corr, breadth)
-  - 15 LSTM encoder summaries (enc_pca_0-3, momentum_a/c/emb_6h/24h, agreement_ab/ac/bc, volatility_24/168)
-  - 6 regime one-hot (post Ship 2 + 2026-04-24)
-  - 3 market/portfolio (rv_24h_vs_168h_ratio, btc_dominance_trend_30d, portfolio_dd_depth, ensemble_sigma_mu_ratio, days_since_regime_transition)
+The MetaDD predictor produces forward drawdown forecasts with a Student-t head. For each portfolio day it emits five quantities: `dd_mu` (location), `dd_sigma` (scale), `dd_nu` (degrees-of-freedom shape proxy for tail thickness), and the `dd_q90` and `dd_q95` upper quantiles. Pre-committed thresholds in the overlay code mark `nu < 5.0` as fat-tail, `dd_sigma > 0.08` as high-uncertainty, and `dd_q90 > 0.05` as elevated crash risk.
 
-### Stage 2 input dims (103 = 75 + 28)
+Inputs are realized portfolio drawdown trajectories from each base variant's walk-forward returns plus the regime feature panel. The output is `metadd_predictions.parquet` with the five Student-t columns indexed by date.
 
-`NEURAL_OPT_INPUT_DIM = 75` (was 73 pre-2026-04-24)
+Companion drawdown-quantile heads (`prompt_7f_gp_drawdown.py`, `prompt_7f_lgb_bootstrap_dd.py`, `prompt_7f_xgb_quantile_dd.py`, `prompt_7d_pysr_drawdown.py`) provide model-diversity ensembles. The Student-t MetaDD is the canonical consumer for the overlay siblings.
 
-### Architecture (SmallPortfolioNet)
+## Step 5 — prompt_7_metadd_overlay.py (10 MetaDD pair artifacts)
 
-- 103 → 8 (hidden, config-controlled L0-L4) → 75 (softmax output)
-- ~1,730 parameters
-- Input dropout (B5, 2026-04-16): `NEURALOPT_DROPOUT=0.1`
-- Output modes:
-  - **PURE:** softmax on 75-dim
-  - **ADJUSTMENT:** tanh delta from HRP base, ±5%
+The MetaDD overlay replays each of the 8 base variants through a pre-committed modification rule and emits its `_metadd` twin, then adds two MetaDD-only variants (`variant_9_dd_capped_neural`, `variant_10_portfolio_blender`) for a total of 10 pair artifacts. The modification siblings are `_cap_by_q90` (cap each strategy weight at the `dd_q90` ceiling), `_scale_by_q90` (size by `1 - 2*dd_q90` when `dd_q90 > 0.05`), `_flatten_by_sigma` (push high-`dd_sigma` HRP-A weights toward equal), `_shrink_linucb_by_nu` (low `dd_nu` shrinks LinUCB satellite deltas), `_shift_toward_conservative` (low `dd_nu` shifts HRP-B mass toward HRP-A), `_adjust_ab_blend` (tilt the 50/50 ratio by `dd_nu`), `_scale_kelly_by_sigma`, `_scale_neural_by_sigma`, and `_inverse_uncertainty_blend` for variant_10.
 
-Alternative: AnchoredLinearPortfolioNet (`PORTFOLIO_OPTIMIZER_VARIANT` config flag).
+Inputs are `metadd_predictions.parquet` and each base variant's weight series. Outputs are 10 `<variant_id>_weights.parquet` and `<variant_id>_returns.parquet` pairs, with the floor `MIN_WEIGHT_SCALE=0.40` and the ceiling `MAX_BLEND_SHIFT=0.30` enforced inside the rule.
 
-### Loss function
+A walk-forward calibration gate flags every `_metadd` variant when the MetaDD calibration slope falls outside `[0.75, 1.25]`; flagged variants are still written but `select_phase3_candidates.py` filters them.
 
-```
-L = -Sharpe(w) + λ_turnover · E[turnover] + λ_concentration · concentration
-    + λ_drift · weight_drift + λ_bound · bound_hits
-```
+## Step 6 — prompt_7g_portfolio_baselines.py (12-variant block bootstrap)
 
-| Term | Weight |
-|---|---|
-| `λ_turnover` | 0.10 |
-| `λ_concentration` | 0.08 |
-| `λ_drift` | 0.06 |
-| `λ_bound` | 0.04 |
+The baseline stage emits 12 block-bootstrap reference allocations so the model-driven variants have honest non-trivial benchmarks. The block length is sampled from a stationary geometric distribution with mean tuned to the autocorrelation of daily returns, and weights are equal-weight, inverse-vol, mean-variance, risk-parity-notional (`variant_21`), and HERC (`variant_23`) flavors plus several cluster-tree perturbations.
 
-- Sharpe window: 30 trading days
-- Annualization: √365.25 (crypto trades 24/7)
+Inputs are the per-strategy daily return panel and the cluster tree from the HRP step. Outputs land in `pipeline_state/phase_2_5/baselines/` as one parquet per baseline variant.
 
-### Training procedure
+These baselines never get MetaDD twins — they exist to anchor SPA and Holm-Bonferroni gates and to reveal whether learned variants actually clear a non-trivial bootstrap floor.
 
-- Walk-forward: train months 1..K, predict month K+1, minimum 12 training months
-- AdamW, lr=1e-3, weight_decay=0.01 (L0; varies by REG_LEVEL)
-- Epochs: 200/300/400/500/600 (L0..L4)
-- Early stopping: patience=20
-- Batch size: 64
-- Recency weighting: exp(1) ≈ 2.7× recent vs oldest
+## Step 7 — prompt_7h_asset_admission.py (22-asset gate)
 
-### Weight constraints
+The asset admission gate enforces the canonical `PHASE2_ACTIVE_ASSETS` whitelist of 22 assets (13 crypto plus 9 stocks). Each asset must clear a 2-of-3 pass rule on `oos_sharpe`, `fold_win_rate`, and `worst_regime_sharpe`; failing this rule excludes the asset from per-cell selection.
 
-- Per-strategy floor: 0.1% (prevents zeroing)
-- Per-strategy cap: 5-8% (inference: 8% hard max)
-- Minimum 20 non-zero positions (else equal-weight fallback if >1,276 zeroed)
-- Renormalize after clamping
+Inputs are the per-asset OOS metric tables aggregated across philosophies. Output is `asset_admission_report.parquet` with one row per asset and pass/fail flags per metric, plus an `admitted_assets.json` consumed by the per-cell selector.
 
-### Dimension manifest sidecar
+The admission gate runs once per Phase 2.5 cycle and its output is consumed by `prompt_7j_per_cell_selector.py` and ultimately by the Phase 3 deploy manifest writer.
 
-Path: `prompt_7c_portfolio_optimizer.py` emits `.dim_manifest.json` alongside checkpoint.
+## Step 8 — prompt_7j_per_cell_selector.py (468-cell deploy manifest)
 
-```json
-{
-  "neural_opt_input_dim": 75,
-  "num_regimes": 6,
-  "timestamp": "2026-04-26T...",
-  "config_hash": "..."
-}
-```
+The per-cell selector flattens the deployment universe to a 468-cell `(asset, library)` matrix (22 admitted assets times approximately 12 libraries with a few asset-library pairs vacant). For each cell it picks the dominant `(portfolio_variant, strategy_variant, exit_stage, strategy_id)` based on per-cell OOS metrics, then writes the deploy manifest.
 
-**Helper:** `load_portfolio_optimizer_with_check()` hard-fails on dim mismatch when `STRICT_REGIME=1` (default). Prevents loading stale 4-regime artifact with new 6-regime context (silent garbage).
+Inputs are the variant returns and weights from Steps 1-6, the asset-admission JSON, and the Phase 2 strategy registry. Outputs are `phase3_deploy_manifest.parquet` with rows of schema `(asset, library, portfolio_variant, strategy_variant, exit_stage, strategy_id, schema_version)` and a companion `cells_by_fold` calibration sidecar.
 
-### Outputs
+When `PHASE3_USE_CELL_MANIFEST=True` the manifest cuts the universe by roughly 94% from the legacy 11,232-row cross product down to about 702 deployed strategies, and Phase 3 holdout reads the manifest as a deny-default whitelist.
 
-- `data/portfolio/phase2_5/variant_7_neural_optimizer_weights.parquet` (T × 864 daily weights, but only top-75 nonzero)
-- Diagnostic JSONs: fold-by-fold Sharpe, turnover, concentration
+## Step 9 — select_phase3_candidates.py (final variant filter)
 
-### Wall-time
-**~6-12h** per CLAUDE.md (walk-forward over 12+ months).
+The final selector reads `VARIANT_REGISTRY` and partitions variants into `PRIMARY_VARIANTS`, `SOFT_KILL_VARIANTS`, and `FUTURE_DEFERRED_VARIANTS`. Soft-kill variants ship for diagnostic comparison only and do not consume Phase 3 capacity quota; future-deferred entries (`variant_7c`, `variant_8c`) are excluded from enumeration entirely so the runner cannot accidentally try to score an unimplemented overlay.
 
-### Open concerns
-1. **Encoder summary feature availability** — Phase 0 LSTM retraining required for new assets
-2. **Regime feature completeness** — zero-fill on missing assets/phase
-3. **Recency weighting (exp(1))** — may over-weight recent regime; verify on adversarial hold-out
+Inputs are all `<variant_id>_returns.parquet` files plus the MetaDD calibration metadata. Output is `phase3_candidates.json` enumerating which variants enter holdout, with their status tag preserved for the assembly stage.
 
----
+The selector applies the MetaDD calibration gate to every `_metadd` variant: if `calibration_slope` is outside `[0.75, 1.25]` the variant is dropped from the primary bucket. A primary variant that fails the gate may not be replaced from the soft-kill bucket — the slot stays empty so Phase 3 reflects the actual MetaDD reliability.
 
-## Step 5 — Analytic Kelly + DD-Aware Haircut (variant_8 / 8b)
+Wall-clock estimate: 6-10 hours end-to-end on a single Hopper H100 node, dominated by the neural optimizer bagged ensemble fit (~2-3h) and the MetaDD predictor walk-forward (~2h); HRP, LinUCB, Kelly, baselines, admission, and per-cell selection together complete in under 2 hours.
 
-**Script:** [scripts/phases/phase_2/prompt_7e_kelly_portfolio.py](scripts/phases/phase_2/prompt_7e_kelly_portfolio.py) (650+ lines)
+# Phase 3 — Step-by-Step
 
-### What this step does
+Phase 3 runs the 864 frozen strategies (12 philosophies x 72 variants) on the
+untouched 2025 holdout slice. The phase performs no retraining and no
+threshold tuning; it executes the frozen logic against held-out OHLCV plus
+TimesFM features and reports raw metrics. Capital settings are
+`INITIAL_CAPITAL = $1,000`, single-position notional ceiling `$50,000`, and
+`MAX_LEVERAGE = 20`. The user inspects the resulting reports and decides
+whether to deploy.
 
-Computes per-strategy Kelly fraction from Phase 2 expectancy + Ledoit-Wolf shrunk covariance. variant_8 is a **mandatory baseline** — always advances to Phase 3 even if DD violates hard gate (H15 fix flags violation in `s.reason`).
+## Step 0 — validate_phase3_inputs.py
 
-### Formula
+This script is the pre-flight gate that runs before any holdout work begins.
+Its purpose is to fail fast when the handoff bundle is incomplete or
+contaminated, so a multi-day SLURM allocation does not burn slots on a bad
+input set. It executes between nine and fourteen named checks depending on
+which optional bundles are present in the run tree.
 
-```
-w_kelly = (1/γ) × Σ⁻¹ × μ
-```
+The script reads the Phase 2 and Phase 2.5 handoff packages, the per-asset
+feature stores under `features/phase3/`, the OHLCV mirrors under
+`OHLCV/phase3/`, frozen model directories, the snapshot manifest, the cell
+deploy manifest at `configs/frozen/phase3_handoff/phase3_handoff_manifest.json`,
+and the Phase 1 / Phase 2 experiment registries. It writes nothing; it emits
+pass/fail rows on stdout and exits non-zero on any failure.
 
-| Term | Definition |
-|---|---|
-| `μ` | Per-strategy expected daily returns (Phase 2 OOS realized mean OR MetaCombiner blend_mu if available) |
-| `Σ` | Ledoit-Wolf shrunk covariance (handles 864-strategy rank-deficiency) |
-| `γ` | Risk aversion = 4.0 (default → quarter-Kelly) |
+Verifications include the snapshot SHA digest, presence of all frozen model
+files (TimesFM, MetaCombiner, LinUCB, MetaDD, Neural optimizer), the 22-asset
+whitelist enforced against `PHASE2_ACTIVE_ASSETS`, the four dimensional regime
+columns (`regime_label_trend`, `regime_label_vol`, `regime_label_composite`,
+`regime_label_phase`) in every Phase 3 feature store, absence of any Phase 3
+contamination row in earlier-phase experiment registries, exit-config SHA
+pins matching the handoff manifest, cell-deploy manifest internal
+consistency, frozen-artifact read-only mode (`chmod 0o444`), and disk-space
+headroom. Any failure aborts the run before Step 1.
 
-### Kelly Bayesian shrinkage (H10 Phase 2 propagation)
+## Step 1 — generate_timesfm_phase3.py
 
-Flows from MetaCombiner (Phase 2 Step 4) via `mc_kelly_leverage`:
-```python
-# Phase 2 prompt_2f_kelly_params.py:72-100
-KELLY_DIVISOR_MC = 4.0
-KELLY_SHRINK_LAMBDA = 0.5
-KELLY_PRIOR = 0.25
+This step runs the frozen TimesFM foundation model in inference mode over
+the Phase 3 OHLCV window for every active asset. It exists because all
+downstream signal generation, ensemble blending, and TimesFM-accuracy
+auditing depend on the same TimesFM feature schema produced for Phase 1 and
+Phase 2; Phase 3 must compute the same columns from held-out data without
+touching the model weights.
 
-raw = (df["mc_kelly_leverage"] / KELLY_DIVISOR_MC).clip(0.01, 1.0)
-df["kelly_frac"] = (
-    KELLY_SHRINK_LAMBDA * raw + (1.0 - KELLY_SHRINK_LAMBDA) * KELLY_PRIOR
-).clip(0.01, 1.0)
-```
-Phase 2.5 Kelly variant consumes `kelly_frac` from MetaCombiner predictions (already shrunk).
+The script reads `OHLCV/phase3/{asset}.parquet` and the frozen TimesFM
+checkpoint, then writes `features/phase3/{asset}_timesfm.parquet`. Output
+columns include the multi-horizon direction signals
+`timesfm_4h_direction`, `timesfm_12h_direction`, `timesfm_24h_direction`,
+the cross-horizon agreement metric `timesfm_alignment_score`, and the full
+`tfm_q*_h*` quantile-band stack across the requested horizons.
 
-### Variant 8b (DD-aware haircut, 2026-04-16)
+Behavior is strictly causal: for bar N, the encoder consumes only
+`close[N - CTX .. N - 1]`, never bar N's own close. The output schema
+matches Phase 1 and Phase 2 column-for-column so feature-store readers
+downstream do not need version-aware loaders. The frozen weights are loaded
+read-only and never serialized back to disk.
 
-Two-stage haircut on top of vanilla Kelly:
+## Step 2 — prompt_1_holdout_run.py
 
-**Stage 1 (γ escalation):**
-```python
-ν_portfolio = min(dd_nu over active strategies)
-if ν_portfolio < KELLY_DD_NU_THRESHOLD (4.0):
-    γ_effective = γ × KELLY_DD_NU_MULTIPLIER (1.5)
-    # Re-solve Kelly with γ_effective → sixth-Kelly instead of quarter
-    w = (1/γ_effective) × Σ⁻¹ × μ
-```
+This is the main execution step. It runs all 864 frozen strategies on the
+2025 holdout, producing per-strategy trade ledgers, capped and uncapped
+equity curves, and the raw inputs every analysis script consumes. It is the
+single largest compute block in the phase.
 
-**Stage 2 (Q95 cap):**
-```python
-projected_dd_q95 = Σ |w_j| · dd_q95_j
-if projected_dd_q95 > KELLY_DD_Q95_CAP (0.25):
-    w *= (KELLY_DD_Q95_CAP / projected_dd_q95)  # Scale down
-```
+Inputs are the frozen strategy library at `pipeline_state/phase_2/frozen/`,
+the cell deploy manifest, the Phase 3 feature stores including the TimesFM
+columns from Step 1, and the Phase 3 OHLCV. Outputs land under
+`reports/phase3/{exit_variant}/strategy_{sid}_detail.json` together with a
+sibling parquet `strategy_{sid}_trades.parquet` carrying the full trade
+ledger for downstream regime breakdown.
 
-### Constraints
+For each strategy, the runner pulls the fold-indexed exit assignment via
+`selected_exit_by_fold[K]` so ES2 variants honor the same per-fold exit that
+was frozen at Phase 2 close. Per-asset concurrency caps cycle through
+`[5, 8, 10, 15, 20, 25]`. The simulator compounds equity from
+`INITIAL_CAPITAL = $1,000` while clamping any single-position notional at
+`$50,000`; both capped and uncapped equity series are emitted so leverage
+analysis can decompose the cap impact.
 
-- Max weight per strategy: 5% (`KELLY_W_MAX`)
-- Min nonzero positions: 20 (safety guardrail)
-- Minimum training window: 3 months
-- Walk-forward retrain: monthly
+## Step 3 — prompt_2_holdout_analysis.py
 
-### Mandatory baseline status
+This step performs the regime-conditioned breakdown on the strategy outputs
+from Step 2. Its purpose is to expose how each strategy behaves across
+distinct market regimes rather than reporting a single blended figure.
 
-Per `select_phase3_candidates.py:73`:
-```python
-MANDATORY_VARIANTS = ["variant_8_kelly"]  # Only one (2026-04-14)
-```
+It reads the per-strategy trade parquets and detail JSONs from
+`reports/phase3/{exit_variant}/`, joins them on entry timestamp to the four
+regime-label columns in the Phase 3 feature stores, and writes
+`reports/phase3/regime_analysis/regime_breakdown_{sid}.json` plus an
+aggregate roll-up.
 
-variant_1_best_single and variant_6_50_50_blend removed from mandatory list — must earn placement via composite score.
+The breakdown dimensions are trend, volatility, composite, and phase. For
+each strategy and each regime bucket the script computes trade count, win
+rate, profit factor, net PnL, and average holding bars. The aggregation
+step ranks strategies within each regime so downstream consumers can
+identify regime specialists versus all-weather performers.
 
-**H15 fix:** if variant_8_kelly's `max_dd > HARD_DD_GATE`, advances anyway with `DD_VIOLATION_FLAG` in reason string. Phase 3 reports this honestly.
+## Step 4 — prompt_3_ensemble_contribution.py
 
-### Wall-time
-**Seconds** (analytic, no optimization).
+This step runs the ensemble ablation, attributing realized PnL to each of
+the eleven component models inside MetaCombiner. It exists so the
+ensemble's holdout edge can be decomposed and the user can tell which
+components actually carry signal on out-of-sample data.
 
-### Open concerns
-1. **mc_kelly_leverage variance NaN** — fallback to fixed; Bayesian shrinkage 0.5 may undershrink on high-noise samples
-2. **γ escalation threshold (ν=4)** — not back-tested against multiple regimes
-3. **Q95 cap (0.25)** — global; per-asset adjustment may help
+It reads the strategy detail JSONs and trade parquets from Step 2 along
+with the frozen MetaCombiner checkpoint and component-model artifacts. It
+writes `reports/phase3/ensemble_summary.json` with per-component
+contribution weights and leave-one-out delta metrics.
 
----
+The script replays each trade through MetaCombiner with one component
+masked at a time. The delta in approval rate, hit rate, and net PnL is
+attributed to that component. Component contributions are reported raw;
+no thresholds are tuned and no components are dropped during Phase 3.
 
-## Step 6 — MetaDD Overlay (10 pair artifacts)
+## Step 5 — prompt_4_leverage_analysis.py
 
-**Script:** [scripts/phases/phase_2_5/prompt_7_metadd_overlay.py](scripts/phases/phase_2_5/prompt_7_metadd_overlay.py)
+This step quantifies how the `$50,000` single-position cap and the
+`MAX_LEVERAGE = 20` ceiling reshape strategy outcomes. It exists because
+the capped versus uncapped equity curves emitted by Step 2 must be
+reconciled into a single leverage-attribution table for the deployment
+report.
 
-### What this step does
+It reads both equity curves and the trade parquet for every strategy and
+writes `reports/phase3/leverage_summary.json`. The summary table reports
+per-strategy capped Sharpe, uncapped Sharpe, the dollar shortfall caused
+by the position cap, the count of trades that hit the cap, and the
+fraction of equity growth attributable to compounding under the cap.
 
-Single MetaDD predictor runs once (Step 1); each `_metadd` variant reads same `metadd_predictions.parquet` and applies a modifier function. A/B test: whether feeding dd_mu/sigma/nu improves walk-forward Sharpe.
+The metric set is fixed at the schema frozen at Phase 2 handoff. No
+strategies are filtered, re-ranked, or dropped. The output is a transparent
+attribution that the user reads alongside the regime breakdown.
 
-### 10 pair artifacts
+## Step 6 — prompt_5_model_agreement.py
 
-| Pair | Base | Modifier function | Logic |
-|---|---|---|---|
-| `variant_1b_best_single_metadd` | best_single | `_scale_by_q90` | Position size ↓ on dd_q90 spike |
-| `variant_2b_hrp_conservative_metadd` | hrp_conservative | `_flatten_by_sigma` | High dd_sigma → spread cluster weights |
-| `variant_3b_hrp_a_linucb_metadd` | hrp_a_linucb | `_shrink_linucb_by_nu` | dd_nu as 17th LinUCB context |
-| `variant_4b_hrp_aggressive_metadd` | hrp_aggressive | `_shift_toward_conservative` | Low dd_nu → shift toward A |
-| `variant_5b_hrp_b_linucb_metadd` | hrp_b_linucb | `_shrink_linucb_by_nu` | dd_nu as 17th LinUCB context |
-| `variant_6b_50_50_blend_metadd` | 50_50_blend | `_adjust_ab_blend` | dd_nu adjusts A/B split |
-| `variant_7b_neural_metadd` | neural_optimizer | `_flatten_by_sigma` | Neural × dd_sigma flatten |
-| `variant_8b_kelly_metadd` | kelly | `_scale_kelly_by_sigma` | Kelly × inverse uncertainty `1/(1+dd_sigma)` |
-| `variant_9_dd_capped_neural` | (none) | `_cap_by_q90` (M22) | Neural with drawdown q90 cap |
-| `variant_10_portfolio_blender` | (none) | `_inverse_uncertainty_blend` | Inverse-uncertainty blend across 8 base |
+This step measures cross-model agreement among the eleven MetaCombiner
+components on the holdout. Its purpose is to surface ensembles where
+agreement collapsed out-of-sample, an early-warning signal for regime
+shift even when realized PnL still looks acceptable.
 
-### M22 fix deep dive — `_cap_by_q90` defense-in-depth shift(1)
+The script reads the per-trade component prediction columns embedded in
+the Phase 3 detail JSONs and writes
+`reports/phase3/agreement_summary.json`. It computes pairwise prediction
+correlation, majority-vote rate, and the fraction of approvals where every
+component agreed in sign.
 
-**File:** [prompt_7_metadd_overlay.py:179-196](scripts/phases/phase_2_5/prompt_7_metadd_overlay.py#L179-L196)
+Agreement metrics are reported per strategy, per regime bucket, and per
+asset. The script does not reweight or recalibrate the ensemble; it only
+reports.
 
-```python
-def _cap_by_q90(weights: pd.DataFrame, metadd: pd.DataFrame) -> pd.DataFrame:
-    """9 dd_capped_neural: cap each strategy's weight at dd_q90 ceiling.
-    
-    2026-04-26 M22 fix: shift dd_q90 by 1 bar before reindex so day T's cap
-    uses dd_q90 from day T-1 only (causal). The caller upstream may already
-    enforce this contract; this is defense-in-depth.
-    """
-    dd_q90 = metadd["dd_q90"].shift(1).reindex(weights.index).fillna(0.20)
-    n = weights.shape[1]
-    cap = (dd_q90 / n * 3.0).clip(1.0 / n * 0.5, 1.0)
-    result = weights.copy()
-    for col in result.columns:
-        result[col] = result[col].clip(upper=cap)
-    row_sums = result.sum(axis=1).replace(0, 1)
-    return result.div(row_sums, axis=0)
-```
+## Step 7 — prompt_6_timesfm_accuracy.py
 
-**Why:** day T's drawdown cap uses yesterday's q90 only — prevents look-ahead. Default `fillna(0.20)` = 20% conservative cap on missing historical data.
+This step audits TimesFM's directional forecast accuracy on the holdout
+window. It exists to make sure the foundation-model signals carrying
+weight inside MetaCombiner actually predict the right direction at the
+horizons the ensemble consumes them.
 
-### Variant 10 (portfolio_blender) — BUG-BL-018 fix
+It reads the Phase 3 TimesFM feature parquets from Step 1 and the raw
+Phase 3 OHLCV. It writes `reports/phase3/timesfm_accuracy.json` with
+per-horizon hit rates, alignment chi-square statistics, and adjusted
+p-values.
 
-Original divided by total_inv → near-zero daily weights. Fixed: equal-weight average across variants (not per-variant uncertainty-weighted because all share single MetaDD model).
+Ground truth `actual_direction` is computed as
+`sign(close[fill_bar + H] - close[fill_bar])` from raw OHLCV, never from
+realized trade PnL, so the audit is untainted by exit overlays or sizing.
+Two independent Holm-Bonferroni passes run side by side: an alignment
+chi-square family of `m = 864` (one per strategy) and a direction-accuracy
+binomial family of `m = 2592` covering the three horizons `{4h, 12h, 24h}`
+across all strategies. Raw and adjusted p-values are reported; nothing is
+gated on them inside Phase 3.
 
-### Wall-time
-**~30 minutes** for all 10 overlays.
+## Step 8 — prompt_7_portfolio_holdout.py
 
-### Open concerns
-1. **Single MetaDD model shared by all `_metadd` variants** — they're A/B tests of overlay logic, not independent ensembles
-2. **`_shrink_linucb_by_nu` 17th feature ordering** — undocumented relative to standard 18-dim LinUCB context
+This step evaluates the 20 portfolio variants on the same frozen trade
+universe produced in Step 2. Its purpose is to compare allocator designs
+under identical entry, sizing, and cost assumptions so any performance
+delta is attributable to the allocator alone, not to upstream selection.
 
----
+The script reads the strategy trade parquets, the frozen portfolio
+artifacts under `data/portfolio/phase2_5/` (HRP weights, regime bandit,
+neural optimizer, MetaDD pair sidecars), and the variant registry. It
+writes per-variant outputs under `reports/phase3/portfolio_holdout/` and a
+roll-up across all 20 variants.
 
-## Step 7 — Baselines (4 dumb-but-honest, H16 TUNE/EVAL split)
+The 20 variants span HRP conservative and aggressive baselines, two LinUCB
+satellites, the 50/50 blend, the neural optimizer, the analytic Kelly
+portfolio, eight MetaDD-overlaid twins of those primaries, plus baseline
+and soft-kill diagnostics. The LinUCB context builder operates over an
+18-dimensional context vector across six regimes, and the bandit's
+anti-whipsaw state is reset on every overlay entry so prior in-sample
+adaptation cannot leak into the holdout decision sequence.
 
-**Script:** [scripts/phases/phase_2_5/prompt_7g_portfolio_baselines.py](scripts/phases/phase_2_5/prompt_7g_portfolio_baselines.py)
+## Step 9 — prompt_8_exit_comparison.py
 
-### What this step does
+This step compares the production exit overlays (`fixed`, `atr_scaled`,
+`dist_exit` plus the shadow-only `sigma_exit` channel) on the same MC
+trade universe. It exists so the relative merit of each overlay is
+visible without permitting any of them to influence MC training, which
+remains label-blind.
 
-4 dumb-but-honest baselines that optimizers must beat on paired bootstrap KILL_RULES. Optimizers losing still flow to Phase 3 for honest reporting (flagged `optimizer_justified=False`).
+It reads the per-strategy detail JSONs and trade parquets and writes
+`reports/phase3/exit_comparison/` with per-overlay aggregate metrics and
+per-strategy deltas against the `fixed` baseline. Realized PnL per overlay
+is recomputed on-the-fly from the bake-off; no per-overlay sidecar
+parquets are written.
 
-### 4 baselines (lines 118-149)
+The comparison preserves identical entries, identical MC approval, and
+identical execution costs across overlays so the only varying axis is the
+exit method. Exit selection itself respects the per-cell calibration gate
+and the fold-indexed `selected_exit_by_fold` assignment that was frozen at
+Phase 2 close.
 
-| Baseline | Selection rule |
-|---|---|
-| `best_single` | Highest OOS Sharpe single strategy |
-| `equal_weight_top5` | Equal weight across top-5 by Sharpe (TUNE-ranked) |
-| `equal_weight_top10` | Equal weight across top-10 by Sharpe (TUNE-ranked) |
-| `equal_weight_all` | All approved strategies (no selection) |
+## Wall-clock estimate
 
-### H16 fix — TUNE/EVAL split for top-N ranking
-
-```python
-def build_baselines(rets, approved):
-    n = len(rets)
-    split = n // 2
-    if split < 30:
-        warnings.warn("H16: only N bars — TUNE/EVAL split requires ≥60. "
-                      "Falling back to full-series ranking (in-sample bias).")
-        tune_rets = rets
-        eval_rets = rets
-    else:
-        tune_rets = rets.iloc[:split]
-        eval_rets = rets.iloc[split:]
-
-    # Rank on TUNE half
-    per_strat_sharpe = {s: _sharpe(tune_rets[s]) for s in present}
-    ranked = sorted(per_strat_sharpe, key=per_strat_sharpe.get, reverse=True)
-
-    return {
-        "portfolio_best_single": _ew(ranked[:1], eval_rets),
-        "portfolio_equal_weight_top5": _ew(ranked[:5], eval_rets),
-        "portfolio_equal_weight_top10": _ew(ranked[:10], eval_rets),
-        "portfolio_equal_weight_all": _ew(present, rets),  # No selection — full series
-    }
-```
-
-**Why H16:** previous behavior ranked on FULL OOS, then reported portfolio Sharpe of top-N — in-sample top-N selection inflates baseline performance and contaminates comparison vs optimizers.
-
-**Now:** rank on first 50% (TUNE), evaluate portfolio on second 50% (EVAL). `equal_weight_all` unaffected (no selection happens).
-
-### Wall-time
-**~30 min**.
-
-### Open concerns
-1. **Fallback when N<60 bars** — emits warning + reverts to in-sample ranking (rare but possible on short OOS)
-2. **Block bootstrap for paired test** — verify block size matches asset's BLOCK_SIZE per M19 fix
-
----
-
-## Step 8 — Asset Admission Gate
-
-**Script:** [scripts/phases/phase_2_5/prompt_7h_asset_admission.py](scripts/phases/phase_2_5/prompt_7h_asset_admission.py)
-
-### What this step does
-
-Drops assets if they fail ≥2 of 3 Phase 2 OOS criteria (P25-Q-S8 fix 2026-04-16, was AND→all fail, now OR-style ≥2-of-3).
-
-### 3 criteria (defaults)
-
-| Criterion | Threshold |
-|---|---|
-| `fold_win_rate` | < 0.50 |
-| `oos_sharpe` | < 0.50 |
-| `worst_regime_sharpe` | < 0.00 |
-
-Asset fails if **2 or more** criteria are below threshold.
-
-### Output
-
-`configs/frozen/phase3_asset_whitelist.json` — Phase 3 runner reads this before launching 33,696 holdout runs.
-
-### Wall-time
-**~10 min**.
-
-### Open concerns
-1. **Defaults are conservative** — may admit assets that look OK on aggregate but fail in specific regimes (regime check is min, not consistent)
-2. **No asset-specific override** — same thresholds for all 22 assets
-
----
-
-## Step 9 — Variant Selection + Promotion Gates
-
-**Script:** [scripts/phases/phase_2_5/select_phase3_candidates.py](scripts/phases/phase_2_5/select_phase3_candidates.py)
-
-### What this step does
-
-Scores all 21 variants, applies 4 promotion gates (with mandatory bypass for variant_8_kelly), emits `phase3_candidate_variants.json`.
-
-### Composite score formula (lines 47-58)
-
-```python
-SCORE_WEIGHTS = {
-    "median_12mo_sharpe":   0.30,
-    "median_12mo_sortino":  0.15,
-    "rolling_stability":    0.20,
-    "positive_month_frac":  0.15,
-    "max_dd_penalty":       0.15,    # negative weight
-    "turnover_penalty":     0.05,    # negative weight
-    "deployment_bonus":     0.10,    # OFF by default; Stage 6 cutover
-}
-```
-
-P25-Q-S1 fix (2026-04-16): all 6 terms clipped to [0,1] for homogeneous scale.
-
-### Promotion gates (lines 386-443)
-
-```python
-if variant in MANDATORY_VARIANTS:  # ["variant_8_kelly"]
-    advances = True
-    if max_dd > HARD_DD_GATE (0.40):
-        flag "DD_VIOLATION_FLAG" (H15 fix: bypass with reporting)
-else:
-    meets_score = composite_score >= median(all scores)
-    meets_dd = max_dd_pct <= HARD_DD_GATE
-    meets_calibration = True
-    if uses_metadd:
-        meets_calibration = (CALIBRATION_SLOPE_RANGE[0] <= calibration_slope <= CALIBRATION_SLOPE_RANGE[1])
-        # CALIBRATION_SLOPE_RANGE = (0.75, 1.25)
-    
-    advances = meets_score AND meets_dd AND meets_calibration
-```
-
-### H15 fix — Mandatory variants reason field
-
-```python
-@dataclass
-class VariantScore:
-    variant_id: str
-    composite_score: float
-    advances: bool
-    reason: str  # H15: "mandatory_baseline", "composite_score", "gate_2_max_dd", "DD_VIOLATION_FLAG"
-    ...
-```
-
-Every advancing variant has named `reason`. Phase 3 reads this for honest reporting.
-
-### Output
-
-`reports/phase2_5/phase3_candidate_variants.json`:
-```json
-{
-  "selection_rule": {
-    "weights": SCORE_WEIGHTS,
-    "hard_dd_gate": 0.40,
-    "calibration_slope_range": [0.75, 1.25],
-    "mandatory_variants": ["variant_8_kelly"]
-  },
-  "variant_registry": [...21 variants with status field (H14)...],
-  "scored_variants": [...VariantScore per variant...],
-  "advancing_variants": [...names...],
-  "missing_from_input": [...]
-}
-```
-
-### Wall-time
-**~15 min**.
-
-### Open concerns
-1. **Median threshold for `meets_score`** — purely relative; if all 21 variants are bad, ~half still advance
-2. **Calibration slope range (0.75-1.25)** — wide; flag variants near edges
-3. **deployment_bonus (0.10)** — Stage 6 feature, no activation timeline documented
-
----
-
-## Step 10 — Per-Cell Selector (468 cells, dynamic-K ≤ 3)
-
-**Script:** [scripts/phases/phase_2_5/prompt_7j_per_cell_selector.py](scripts/phases/phase_2_5/prompt_7j_per_cell_selector.py)
-
-### What this step does
-
-For each (asset, philosophy) cell, enumerates all (variant, strategy) combos, computes composite scores, applies Holm correction (m=468), selects dynamic-K ≤ 3 winners per cell. Cuts 94% from legacy 11,232 → ~702 strategies.
-
-### Cell structure
-
-```python
-Cell = (asset, philosophy)
-# Base cells: 22 × 12 = 264
-# 468 cells when including additional sizing-method dimension OR variant-subset enumeration
-```
-
-Exact 468 derivation in `select_dynamic_k` logic (lines 236-265).
-
-### Per-cell calculation
-
-1. Load trade ledger for (asset, library) cell
-2. Compute cell metrics: Sharpe, PF, Calmar, DD, turnover
-3. DSR-adjust (deflated Sharpe ratio)
-4. Compute 8-term composite score
-5. `select_dynamic_k`: top-K via Option D (K ≤ 3 rule)
-6. Apply Holm m=468 correction (`HOLM_CELL_P_THRESHOLD = 0.10`)
-
-### Outputs
-
-```
-configs/frozen/phase3_cell_selections.json   (full audit)
-configs/frozen/phase3_deploy_manifest.json   (flat list for Phase 3)
-```
-
-Per cell: winners list with `(portfolio_variant, strategy_variant, composite, rank, p_value, p_holm, significance)`.
-
-### Fallback (lines 208-229)
-
-If cell fails Holm, inherit most-common (portfolio_variant, strategy_variant) combo from same library across successful assets.
-
-### Wall-time
-**6-8h** (parallelizable by cell).
-
-### Open concerns
-1. **468 cell derivation** — not 22×12=264; exact additional dimension not documented in visited code
-2. **Holm m=468** — harsh; may reject genuinely good cells under noise
-3. **dynamic-K ≤ 3** — Option D rule should be documented in code-level comments
-4. **Fallback inheritance** — most-common-combo is heuristic; may inherit a poor combo if successful assets are themselves marginal
-
----
-
-## Step 11 — GP Portfolio (variant_11, TODO #28)
-
-**Script:** [scripts/phases/phase_2_5/prompt_7i_gp_portfolio.py](scripts/phases/phase_2_5/prompt_7i_gp_portfolio.py)
-
-### What this step does
-
-Evolves a per-strategy weight formula via genetic programming:
-```
-weight_i = f(sharpe_i, pf_i, calmar_i, dd_i, corr_avg_i, n_trades_i, win_rate_i, mc_sigma_i, mc_nu_i)
-```
-Softmax-normalize across 1,296 strategies. Top-K=50 allocation.
-
-### Configuration
-
-- 5K population × 500 generations
-- 15 fitness runs (5 variants × 3 seeds): sharpe, pf, ic, expectancy, calibration
-- Fitness: `Portfolio_Sharpe × √n_days × (1 − DD_penalty) × (1 − variance_penalty)`
-
-### Outputs
-
-- `configs/frozen/variant_11_gp_portfolio.txt` — evolved expression
-- `configs/frozen/variant_11_gp_portfolio.json` — diagnostic
-
-### Status: TODO #28 — NOT YET INTEGRATED into Phase 2.5 pipeline.
-
-### Wall-time
-**~6h** when shipped.
-
-### Open concerns
-1. **Not yet integrated** — listed in registry as experimental placeholder
-2. **5K × 500 generations** — large search space, may overfit
-3. **9 input features** — fewer than neural optimizer's 75; may miss regime context
-
----
-
-## Step 12 — Phase 3 Handoff
-
-**Script:** [scripts/phases/phase_2_5/freeze_phase25_artifacts.py](scripts/phases/phase_2_5/freeze_phase25_artifacts.py)
-
-### What this step does
-
-Freezes Phase 2.5 artifacts before Phase 3 launches. Archives outputs, computes SHA256 hashes, writes deploy manifest.
-
-### Outputs to Phase 3
-
-| Output | Path |
-|---|---|
-| Deploy manifest | `configs/frozen/phase3_deploy_manifest.json` |
-| Cell selections | `configs/frozen/phase3_cell_selections.json` |
-| Asset whitelist | `configs/frozen/phase3_asset_whitelist.json` |
-| Candidate variants | `reports/phase2_5/phase3_candidate_variants.json` |
-| Cell trade ledgers | `pipeline_state/phase_2_5/cell_*_trades.parquet` |
-| MetaDD predictions | `pipeline_state/phase_2_5/metadd_predictions.parquet` |
-| Baselines | `reports/portfolio_baselines/baselines_returns.parquet` |
-
-### Read-only enforcement
-
-Same H13 chmod 0o444 pattern as Phase 2 final assembly (Linux/SLURM only; `FROZEN_READONLY_DISABLE=1` bypass).
-
-### Phase 3 reads `package["selected_sizing"]` (from Step 8) and per-cell winners from `phase3_deploy_manifest.json` to launch 33,696 holdout runs.
-
-### Wall-time
-**< 1 minute** (atomic writes + chmod).
-
----
-
-## Audit Closeout — 4 Findings Shipped
-
-Phase 2.5 received 4 of the 51 audit findings shipped 2026-04-26.
-
-### M22 — MetaDD Causality Defense-in-Depth
-
-**File:** [prompt_7_metadd_overlay.py:179-196](scripts/phases/phase_2_5/prompt_7_metadd_overlay.py#L179)
-
-`dd_q90.shift(1).reindex(weights.index)` — day T's drawdown cap uses dd_q90 from day T-1 only.
-
-### H14 — SOFT_KILL_VARIANTS Frozenset
-
-**File:** [select_phase3_candidates.py:131-136](scripts/phases/phase_2_5/select_phase3_candidates.py#L131)
-
-```python
-SOFT_KILL_VARIANTS = frozenset({"variant_1", "variant_3", "variant_5", "variant_7"})
-PRIMARY_VARIANTS  = frozenset({...14 primaries...})
-```
-
-CLAUDE.md claimed "23 total = 14 primary + 5 baseline + 4 soft-kill" but no explicit set existed. H14 adds `status` field per variant + frozensets.
-
-### H15 — Mandatory Variants DD-Violation Flag
-
-**File:** [select_phase3_candidates.py:403-415](scripts/phases/phase_2_5/select_phase3_candidates.py#L403)
-
-```python
-if variant in MANDATORY_VARIANTS:
-    s.advances = True
-    if s.max_dd_pct > HARD_DD_GATE:
-        s.reason = "mandatory_baseline (DD_VIOLATION_FLAG)"
-    else:
-        s.reason = "mandatory_baseline"
-```
-
-Mandatory variants (variant_8_kelly only) advance regardless, but DD violations flagged in `s.reason` — Phase 3 reports honestly.
-
-### H16 — Baseline TUNE/EVAL 50/50 Split
-
-**File:** [prompt_7g_portfolio_baselines.py:118-149](scripts/phases/phase_2_5/prompt_7g_portfolio_baselines.py#L118)
-
-Top-N selection uses TUNE half (first 50%); evaluation reports portfolio Sharpe on EVAL half. Prevents in-sample top-N selection bias vs optimizers.
-
----
-
-## Operational Follow-ups
-
-1. **Phase 0 H21 re-emit dependency** — Phase 2 + 2.5 inputs may carry 1-bar lookahead leak in `tfm_fp_fr_corr_*` until re-emit lands. MetaCombiner must re-train post-H21.
-
-2. **Phase 1 BF chain + bigcaps must complete** before Phase 2.5 can run. Current ETA: T+2.5 days.
-
-3. **variant_11 GP portfolio** — TODO #28; integrate before Phase 2.5 production OR document as deferred to Phase 2.6+.
-
-4. **`variant_7c/8c LinUCB overlays`** — TODO #13; integrate or remove from registry to clean up.
-
-5. **`PHASE3_USE_CELL_MANIFEST=True` flag** — verify enabled in Phase 3 runner; without it, falls back to legacy 11,232 runs.
-
-6. **Asset admission whitelist** — verify Phase 3 runner reads it; otherwise wastes compute on dropped assets.
-
-7. **Wall-time validation** — empirical timings not yet measured for full Phase 2.5 sweep; may differ from estimates above.
-
----
-
-**Wall-clock estimate:** ~1.5–2.5 days end-to-end (parallelizable by cell + by philosophy). Total path Phase 2 → 2.5 → Phase 3-ready: T+11.5–14.5 days from now.
-
-**Document version:** 2026-04-27 (post 51-finding audit closeout).
+End-to-end Phase 3 runs in roughly 18-26 hours on Hopper: ~2-3 hours for
+TimesFM Phase 3 generation, 12-18 hours for the 864-strategy holdout
+execution under the per-asset concurrency caps, and 3-5 hours for the
+combined regime, ensemble, leverage, agreement, TimesFM-accuracy,
+portfolio, and exit-comparison analyses running in parallel.
