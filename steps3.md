@@ -318,6 +318,42 @@ if exit_variant == "dist_exit":
     }
 ```
 
+**Per-bar replay walker (2026-04-27 consolidation):**
+
+`_compute_distribution_exit_signals` no longer reimplements the walker —
+it imports `replay_trade_per_bar` from
+`scripts.common.utils.dist_exit_replay` (the single source of truth shared
+with Phase 2 `prompt_2n_distribution_exit.py`). The Phase 3 wrapper
+applies Phase-3-specific regime + ν tightening to the threshold, builds a
+`feature_bars` DataFrame from `entry_time_features: Dict[str, np.ndarray]`,
+constructs a `trade` Series, and calls the shared walker. **Same trade →
+identical exit array as Phase 2 bake-off** (deterministic, SHA-pinned via
+`WALKER_SHA`). The Phase 3 reimplementation that previously lived at
+`prompt_1_holdout_run.py:201-350` was deleted to eliminate version skew.
+
+```python
+from scripts.common.utils.dist_exit_replay import (
+    replay_trade_per_bar, MIN_HOLD_BARS, HYSTERESIS_BARS, KELLY_EXIT_FLOOR,
+)
+
+# Build feature_bars DataFrame from entry_time_features dict + threshold
+exit_arr, _debug = replay_trade_per_bar(
+    trade=pd.Series({"asset": asset, "direction": direction,
+                     "fill_bar": 0, "exit_bar": n_bars - 1,
+                     "entry_price": entry_price, "regime_label": regime_label,
+                     "tfm_horizon": tfm_horizon}),
+    feature_bars=feature_bars,
+    round_trip_cost=round_trip_cost,
+    trend_strength_threshold=adjusted_threshold,
+    kelly_exit_breaker=True,
+    calibration_sidecar_path=calibration_sidecar,
+)
+```
+
+**Validation:** `tests/test_dist_exit_replay.py` (11 tests) covers walker
+unit triggers, PR-I causality guard, determinism (100-run byte-identical),
+calibration gate fallthrough, and MC blocklist regression.
+
 **Generic exits (H18, lines 552-587):**
 ```python
 exit_config_path = ROOT / f"configs/frozen/exits/{asset}_{direction}_{exit_variant}_exit.json"
