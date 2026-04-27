@@ -2,7 +2,7 @@
 
 **Audit closeout state:** 51 of 51 audit findings shipped or verified across 7 batches over 2026-04-26→27. **5 CRITICAL + 17 HIGH + 29 MEDIUM closed.** All Phase 2 production-launch blockers RESOLVED.
 
-**Single operational follow-up:** queue Phase 0 TimesFM re-emit (H21 fix at `run_timesfm.py:649`) AFTER `p1_consolidate` (JID 8855940) clears so the H21 fix flows into all feature stores; then re-train MetaCombiner on clean (causal) inputs.
+**Pre-Phase-2 operational state:** Phase 0 TimesFM re-emit (H21 fix at `run_timesfm.py:649`) **already queued** (JID 8897808 with dependency on `p1_consolidate` 8855940) so H21 propagates into all 22 assets × 3 phases of feature stores before Phase 2 starts. **MetaCombiner has not been trained yet** — its first (and only) training run happens during Phase 2 Step 4 on the H21-fixed feature stores; there is no separate "retrain" step. Phase 1 (HF1 GP + BF4 cascade) is still running; Phase 2 launches once Phase 1 consolidation + H21 re-emit both clear.
 
 **Wall-clock estimate:** ~6–9 days end-to-end (post 11-model prune; was 9–14 days). Phase 1 ETA: ~T+2.5 days (incl. bigcaps for btc, ltc/long, eth/short). Phase 2 + 2.5 + 3-ready: T+11.5–14.5 days.
 
@@ -72,11 +72,11 @@ Each `raw_pool_{asset}.parquet` has a paired `.manifest.json` with:
 
 Phase 0's emission contract: encoding at bar N uses bars 0..N-1 only — bar N's own close is excluded.
 
-**🚨 CRITICAL CONCERN — H21 fix flows into feature stores ONLY after re-emit:**
+**H21 fix in flight — Phase 0 TimesFM re-emit QUEUED (JID 8897808):**
 - Phase 0 `run_timesfm.py:649` had `realized_at_anchors = close[anchor_idx]` (close OF bar T = future relative to start of T).
 - 2026-04-26 fix: `close[np.maximum(anchor_idx - 1, 0)]` (close of T-1 = last fully-realized).
 - **Affected feature families:** `tfm_fp_fr_corr_h{5,25,168}`, G3/G4/G13/G14/G20/G28 forecast-realized correlation/persistence/error cols (~30-40 cols total).
-- **Until Phase 0 re-emit lands, Phase 2 ingests feature stores with the 1-bar lookahead leak still baked in.**
+- **Re-emit queued** with dependency on `p1_consolidate` (8855940). When JID 8897808 completes (~2-3h on Hopper), all 22 assets × 3 phases of feature stores will carry the H21-fixed `tfm_*` columns before Phase 2 starts. Phase 2 launches AFTER both Phase 1 consolidation and H21 re-emit clear — no biased ingest.
 
 ### Phase boundaries
 
@@ -96,7 +96,7 @@ Per-asset Phase 1 → Phase 2 boundaries from `config.PHASE_BOUNDARIES`:
 | Purge=72, Embargo=24 | `config.py:249-273` | Walk-forward leakage prevention |
 
 ### Open concerns / gotchas
-1. **H21 re-emit pending** — Phase 2 will train on biased forecast-realized correlation features until Phase 0 re-emit completes (~2-3h on Hopper).
+1. **H21 re-emit running** — JID 8897808 queued behind `p1_consolidate` (8855940); Phase 2 will not launch until it clears, so feature stores at Phase 2 ingest time will carry the causal `tfm_*` cols.
 2. **Bigcaps re-runs in flight** — if any of btc/ltc/eth bigcaps fail, `bf4_adapt_all` fires with incomplete signal pools, degrading Phase 2 coverage.
 3. **Preset libraries dropped (2026-04-20)** — 6 preset philosophies removed; legacy JSONs at `configs/preset_signals/` are orphaned but harmless.
 4. **Jaccard/PnL relaxation (2026-04-24)** — near-duplicate thresholds 0.80→0.88 and 0.92→0.97 to preserve Phase 4 diversity. Phase 2 ML must handle signal redundancy.
@@ -225,7 +225,7 @@ Step 1 emits FULL-TIMELINE dataset (no fold column). Walk-forward fold assignmen
 | Group E execution features | Volatility (10-bar std BEFORE), spread (current bar OK), volume_at_entry (current bar), relative_volume (24-bar SMA BEFORE) — all causal |
 | Group F rolling stats | `trade.exit_bar < current_bar` enforced (line 669) — only completed past trades |
 
-**🚨 H21 propagation:** If Phase 0 emits forward-looking `tfm_fp_fr_corr_*` (pre-fix), Step 1 passes them through unchanged. Fixed when Phase 0 re-emit lands.
+**H21 propagation:** Phase 0 re-emit (JID 8897808) is queued behind `p1_consolidate` and runs before Phase 2 launches, so Step 1 ingests `tfm_fp_fr_corr_*` from H21-fixed feature stores.
 
 ### Outputs
 
@@ -258,7 +258,7 @@ Step 1 emits FULL-TIMELINE dataset (no fold column). Walk-forward fold assignmen
 | 1170 | integrity all_passed | warns if False |
 
 ### Open concerns / gotchas
-1. **Phase 0 feature leakage inheritance (H21)** — fixed at source but Phase 0 re-emit pending. Once re-emitted, Step 1's behavior is correct.
+1. **Phase 0 feature leakage inheritance (H21)** — fix shipped, re-emit queued (JID 8897808 behind `p1_consolidate` 8855940); Phase 2 launches AFTER re-emit clears, so Step 1's behavior is correct on the H21-fixed stores.
 2. **Missing ATR column → silent fallback** — if all 5 ATR candidates absent, PR-F fails gracefully (warning), but h5/h25 signals are then poorly normalized.
 3. **Group A prefix collision** (`feat_` prefix added) — solved post BUG-R8A-002.
 4. **Event clustering per direction** — long and short clustered separately to avoid cross-direction contamination.
@@ -385,7 +385,7 @@ All 11 models (except TimesFM shim) enforce:
 - Atomic writes (parquet/json/pickle)
 
 ### Open concerns / gotchas
-1. **TimesFM Shim depends on Phase 0** — if Phase 0 re-emit (H21) hasn't landed, the alias columns reflect the leak.
+1. **TimesFM Shim depends on Phase 0** — re-emit queued (JID 8897808); Phase 2 launches after it clears, so alias columns reflect H21-fixed forecasts.
 2. **TFT2 + CA2 pretrained weights** — must match Phase 0 frozen weights; verify SHA before fine-tuning.
 3. **Kelly fold-leakage assert** can hard-fail mid-run if upstream MC predictions are emitted with <3 folds. Surface check pre-emptively.
 4. **Cascade Filter env flag** — `PHASE2_USE_CASCADE_BATCH=1` is unstable per audit. Keep at 0 in production.
@@ -970,7 +970,7 @@ if not feature_bars.index.is_monotonic_increasing:
                      "timestamp order so per-bar dist_exit decisions stay causal.")
 ```
 
-**dist_exit hardening (PR-I + C4):**
+**dist_exit hardening (PR-I + C4 + 2026-04-27 consolidation):**
 
 | Setting | Value |
 |---|---|
@@ -982,6 +982,44 @@ if not feature_bars.index.is_monotonic_increasing:
 | Calibration gate | `tfm_calibration_per_cell.json` sidecar; `pass=false` → zero exits + reason="calibration_fail" |
 | Threshold | Single global across all (asset, philosophy) |
 | Inputs | 18 ATR-normalized signed TFM cols from PR-F |
+| Walker module | `scripts/common/utils/dist_exit_replay.py` (single source of truth, both Phase 2 + Phase 3 import `replay_trade_per_bar`) |
+| Walker provenance | `WALKER_SHA = sha256(dist_exit_replay.py)` stamped on every parquet row + meta JSON |
+| Validation suite | `tests/test_dist_exit_replay.py` — 11 tests (unit, causality, determinism, calibration, MC blocklist) |
+
+#### Per-Bar Replay Walker (the actual mechanism behind dist_exit) ─────────
+
+`dist_exit` is NOT a terminal-PnL approximation; it walks every bar from
+`fill_bar` to `exit_bar` and decides whether to exit at that bar based on
+the TimesFM forecast emitted by Phase 0 H21 (causal: bar t uses forecasts
+generated from bars 0..t-1). At each bar t ≥ MIN_HOLD_BARS=3, the walker
+evaluates four trigger families:
+
+1. **REVERSAL** (immediate): `tfm_reversal_signal ≥ 1.0` AND
+   `tfm_trend_strength * dir_sign < -threshold` → exit immediately.
+2. **DIRECTION GONE** (hysteresis = 2 bars): `tfm_direction_24h * dir_sign < 0`
+   AND `tfm_magnitude_24h * dir_sign ≤ round_trip_cost / 2` for HYSTERESIS_BARS
+   consecutive bars → exit.
+3. **MFE PEAK REVERSAL** (immediate): peak normalized unrealized PnL exceeded
+   `threshold * 0.70`, then pulled back by `threshold * 0.35` from peak → exit.
+4. **KELLY FLOOR** (hysteresis = 2 bars): `f_kelly = magnitude_signed /
+   (forecast_std² + ε) < 0.001` for HYSTERESIS_BARS consecutive bars → exit.
+
+First trigger wins, exit reason recorded in debug dict. The trade is gated
+upfront against the PR-G calibration sidecar
+(`{asset}_{direction}_{horizon}_regime{N}` cell): if `pass=false`, walker
+returns all-zero exits and the trade falls through to the fixed-exit baseline
+(reason="calibration_fail").
+
+**Causality contract (PR-I):** walker hard-asserts
+`feature_bars.index.is_monotonic_increasing`. Non-monotonic input raises
+`ValueError` — prevents the common bug where shuffled inputs let a future
+forecast leak into an earlier decision via `.iloc`.
+
+**Bake-off provenance (Gap-6, 2026-04-27):** `prompt_exit_selection.py:
+load_dist_exit_signals` rejects any `*_dist_exit_signals.parquet` whose
+`walker_sha` column doesn't match the live `dist_exit_replay.WALKER_SHA`,
+preventing silent staleness if the walker is edited but the cached parquet
+isn't regenerated. Override for dev with `PHASE2_ALLOW_LEGACY_DIST_PARQUET=1`.
 
 ### 6m — Sigma exit (`prompt_2m_sigma_exits.py`, ~236 lines) — SHADOW-ONLY
 
@@ -1620,9 +1658,9 @@ Manifest write atomic (<1sec). Last step before Phase 3 launches.
 
 ## Operational Follow-ups
 
-1. **Phase 0 TimesFM re-emit** — chain after `p1_consolidate` (JID 8855940) clears. Runs `slurm/precompute/timesfm_all_assets.sh` for all 22 assets × 3 phases (~2-3h on Hopper). H21 fix flows into all feature stores.
+1. **Phase 0 TimesFM re-emit** — ✅ QUEUED (JID 8897808) with `afterok` dependency on `p1_consolidate` (8855940). Runs `slurm/precompute/timesfm_all_assets.sh` for all 22 assets × 3 phases (~2-3h on Hopper). H21 fix will flow into all feature stores before Phase 2 starts. No further action.
 
-2. **MetaCombiner re-train** — after Phase 0 re-emit lands, MC must re-train on clean (causal) inputs to incorporate the 1-bar lookahead fix.
+2. **MetaCombiner training** — first (and only) MC training run happens during Phase 2 Step 4 (`prompt_3b_metacombiner.py`) on the H21-fixed feature stores. There is no separate "retrain" step — MC has never been trained.
 
 3. **BTC/LTC/ETH bigcaps re-runs** — JIDs 8897729 (btc long+short), 8897734 (ltc/long), 8897735 (eth/short) running with `pairs=1000`, `ext=200`. Symlink-swap into canonical path post-completion BEFORE `bf4_adapt_all` fires:
    ```bash
@@ -1641,8 +1679,6 @@ Manifest write atomic (<1sec). Last step before Phase 3 launches.
 ---
 
 **Wall-clock estimate:** ~6–9 days end-to-end (post 11-model prune; was 9–14 days). Phase 1 ETA: ~T+2.5 days (incl. bigcaps). Phase 2 + 2.5 + 3-ready: T+11.5–14.5 days.
-
-**Document version:** 2026-04-27 (post 51-finding audit closeout + Step 2.5 metasweep + Appendix A).
 
 ---
 
