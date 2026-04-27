@@ -396,6 +396,175 @@ Per asset (sequential GPU): ~8-10 hours. Parallelizable per philosophy. Total Ph
 
 ---
 
+## Step 2.5 — Metasweep + REG_LEVEL Selection
+
+**Files (8):** [metasweep_stage1_driver.py](scripts/phases/phase_2/metasweep_stage1_driver.py), [metasweep_stage1_5_feeder_oos.py](scripts/phases/phase_2/metasweep_stage1_5_feeder_oos.py), [metasweep_mc_runner.py](scripts/phases/phase_2/metasweep_mc_runner.py), [metasweep_mc_optuna.py](scripts/phases/phase_2/metasweep_mc_optuna.py), [metasweep_stage2_6_audit.py](scripts/phases/phase_2/metasweep_stage2_6_audit.py), [select_best_reg_level_v2.py](scripts/phases/phase_2/select_best_reg_level_v2.py), [ablation_metasweep_seeds.py](scripts/phases/phase_2/ablation_metasweep_seeds.py), [ablation_metasweep_vs_reg.py](scripts/phases/phase_2/ablation_metasweep_vs_reg.py)
+
+### What this step does
+
+Multi-dimensional hyperparameter search that selects the optimal regularization configuration (`tree_reg × nn_reg × mc_reg`) per (asset, philosophy) cell BEFORE final model assembly. Replaces the legacy fixed `STRATS_REG_LEVEL` global setting with per-cell, data-driven selection using out-of-sample Sharpe + train-OOS gap + fold stability + complexity penalty.
+
+**Why it exists:**
+- **Overfit prevention:** without explicit regularization selection, models drift toward training data. Metasweep enforces early stopping + complexity penalties via 3D axis sweep
+- **Per-cell optimization:** each (asset, philosophy) gets its own optimal regularization (some need L0 mild reg, others need L4 max overfit guard)
+- **Composite scoring:** balances OOS edge, overfit gap, robustness across folds, and architectural complexity
+
+### Pipeline flow (4 stages + 1 selector)
+
+```
+Stage 1: Enumerate & Screen (27 cells → 15 survivors)
+   metasweep_stage1_driver.py
+   ├─ 3D enumeration: tree_reg × nn_reg × mc_reg (3 levels each = 27)
+   ├─ Light XGB probe training on 3 assets × 2 philosophies
+   ├─ Halving screen: kill bottom 12 cells by AUC-proxy Sharpe
+   └─ Output: stage1_survivors.json + stage1_cell_log.jsonl
+              ↓
+Stage 1.5: Consolidate Feeder OOS Predictions
+   metasweep_stage1_5_feeder_oos.py
+   ├─ Read 17 feeder OOS predictions (XGB, LSTM, TFT, NGBoost, ...)
+   ├─ Outer-join on (fold, trade_id) per asset/philosophy/seed
+   ├─ Write consolidated parquets per (asset, phil, seed, stack_reg)
+   └─ Output: stage1_5_summary.json
+              ↓
+Stage 2: Optuna MC Search (per 15 cells)
+   metasweep_mc_optuna.py + metasweep_mc_runner.py
+   ├─ Per cell: 40 Optuna trials over MC hparams
+   ├─ Trial eval: 8 probe assets × 3 philosophies × 3 seeds = 72 evals
+   ├─ DSR-adjusted composite: 0.4×OOS + 0.3×gap + 0.2×stable - 0.1×complexity
+   ├─ Hard gates: placebo test + cost-stress test (reject on fail)
+   ├─ Selected inputs: joint VIF + permutation importance ablation
+   ├─ ASHA pruner kills low-merit configs early
+   └─ Output: phase2_metasweep_stage2_cell_{cell_id}.json
+              ↓
+Stage 2.5: LOAO Gate (optional, env-gated)
+   select_best_reg_level_v2.py:38-52
+   ├─ Held-out probe pair (coin, pltr) check against top survivor
+   ├─ Gate: winner must not degrade on held-out assets
+   └─ Env: METASWEEP_V2_STAGE2_5=1 to activate
+              ↓
+Stage 2.6: MC→Leverage Coupling Audit (optional)
+   metasweep_stage2_6_audit.py
+   ├─ Leverage-monotonicity check: Kelly leverage ↓ as MC sigma ↑
+   ├─ Flag any inversions (indicates MC miscalibration)
+   ├─ Currently: stub pending Phase 2 OOS data integration
+   └─ Env: METASWEEP_V2_STAGE2_6=1 to activate (non-blocking)
+              ↓
+Selection: Pick Winner & Freeze Config
+   select_best_reg_level_v2.py
+   ├─ Load 15 stage2 cell results
+   ├─ Top-2 Wilcoxon tie-break (p > 0.20 → prefer more-regularized)
+   ├─ LOAO + leverage audit (if enabled)
+   └─ Output: configs/frozen/phase2_selected_config.json (FROZEN)
+```
+
+### REG_LEVEL definitions (3D axis grid = 27 cells)
+
+| Axis | Level | XGB params | NN params | MC params |
+|---|---|---|---|---|
+| `tree_reg` | low | α=0.0, λ=1.0 | — | — |
+| `tree_reg` | med | α=0.01, λ=5.0 | — | — |
+| `tree_reg` | high | α=0.1, λ=20.0 | — | — |
+| `nn_reg` | low | — | low dropout, fewer params | — |
+| `nn_reg` | med | — | med dropout, standard params | — |
+| `nn_reg` | high | — | high dropout, larger layers | — |
+| `mc_reg` | low | — | — | low hidden, low epochs |
+| `mc_reg` | med | — | — | std hidden, med epochs |
+| `mc_reg` | high | — | — | large hidden, many epochs |
+
+Real definitions in `configs/frozen/metasweep_v2_config.yaml`. Stage 1 falls back to hard-coded 27-cell grid if YAML unreadable.
+
+### Composite score formula
+
+```python
+score = 0.40 × OOS_Sharpe                    # primary edge signal
+      + 0.30 × (1 − train_OOS_gap_normalized) # penalize overfit
+      + 0.20 × fold_stability                 # robustness across folds
+      − 0.10 × arch_complexity_normalized     # Occam's razor
+```
+
+| Term | Meaning |
+|---|---|
+| `OOS_Sharpe` | Win rate × deflated Sharpe ratio (DSR) |
+| `train_OOS_gap` | (train_sharpe − oos_sharpe) / train_sharpe; lower better |
+| `fold_stability` | 1 − coeff_var(per_fold_sharpes) |
+| `arch_complexity` | hidden_layers + dropout + epochs (overfitting risk proxy) |
+
+**Tie-breaking:** Wilcoxon p > 0.20 → tied → prefer more-regularized cell (conservative bias).
+
+### Per-file deep dive
+
+**1. `metasweep_stage1_driver.py` (464 lines)** — Stage 1 enumerator. CLI: `--probe-assets`, `--probe-philosophies`, `--screen-trials`, `--kill-bottom`. Loads YAML config → enumerates 27 cells → trains lightweight XGB probe per cell × 3 assets × 2 philosophies → ranks by AUC-proxy Sharpe `(AUC − 0.5) × 2 × √n` → keeps top 15. Outputs `pipeline_state/phase_2/metasweep_v2/{stage1_survivors.json, stage1_cell_log.jsonl}`. **Anti-leakage:** uses Phase 2 pre-built datasets (fold structure enforced downstream).
+
+**2. `metasweep_stage1_5_feeder_oos.py` (211 lines)** — Bridge between feeders and metasweep. Consolidates 17 per-feeder OOS parquets (xgb, lgb, cb, lstm2, tft2, ca2, tabnet, tcn, ngboost, regime_xgb, gp_combiner, autoencoder, cascade, unified, xgb_q, lgb_boot, bnn) into unified per-cell parquets. Outer-join on `(fold, trade_id)`. Returns rc=0 if ≥50% cells ready, rc=2 if <50% (soft fail).
+
+**3. `metasweep_mc_runner.py` (382 lines)** — Subprocess adapter for single MC training run. Invoked per Optuna trial via subprocess. Honors `STRATS_MC_HP_JSON`, `STRATS_REG_LEVEL`, `STRATS_MC_PERMUTE_LABELS_SEED`, `SIM_FEE_MULT` env vars. Walk-forward loop: train folds 1..k-1, eval fold k. Writes `mc_metasweep_result.json` with `{oos_sharpe, train_sharpe, fold_stability, selected_inputs, n_trades, per_fold_sharpes, wall_seconds, error}`. Graceful degradation: any exception → NaN result + Optuna prunes trial.
+
+**4. `metasweep_mc_optuna.py` (575 lines)** — Stage 2 Optuna search per cell. CLI: `--cell`, `--n-trials` (default 40), `--holdout-check`. Per trial: sample MC hparams (hidden layers, dropout, learning rate) → invoke runner subprocess → collect 72 evals → compute DSR-adjusted composite → ASHA prunes low-merit. Hard gates: **placebo test** (permute labels, require OOS Sharpe < base) + **cost-stress test** (2× fees, require Sharpe > threshold). Output: `configs/frozen/phase2_metasweep_stage2_cell_{cell_id}.json`.
+
+**5. `metasweep_stage2_6_audit.py` (103 lines)** — MC→Leverage coupling audit (Stage 2.6 scaffold). Currently STUB pending Phase 2 OOS integration. Real intent: assert Kelly leverage κ is monotone-decreasing in MC sigma (risk-off behavior). Flags any sigma-increases paired with leverage-increases (would indicate miscalibration). Non-blocking — returns 0 regardless of flags.
+
+**6. `select_best_reg_level_v2.py` (273 lines)** — Final winner selection. Loads 15 stage2 cell results → halving screen (top 3) → top-2 Wilcoxon tie-break (p_threshold=0.20) → optional LOAO gate → optional leverage audit → freezes winner to `configs/frozen/phase2_selected_config.json`. Schema: `{selected_cell_id, tree_reg, nn_reg, mc_reg, best_mc_hp, selected_inputs, composite_score, tie_break_info, selection_timestamp}`.
+
+**7. `ablation_metasweep_seeds.py` (114 lines)** — Diagnostic. Measures cross-seed stability of Stage 1 cell scores. Flags cells with CV > 0.25 (high variance → down-weight in selector). Outputs `reports/phase2/ablation_metasweep_seeds.json`.
+
+**8. `ablation_metasweep_vs_reg.py` (140 lines)** — Diagnostic. Compares metasweep winner vs legacy `reg_sweep` baseline (proves superiority). Cheap proxy: top-3 metasweep cells vs default-cell-proxy. Outputs `reports/phase2/ablation_metasweep_vs_reg.json`.
+
+### Inputs / outputs
+
+**Inputs:**
+- `configs/frozen/metasweep_v2_config.yaml` — axis definitions + probe config
+- `data/phase2_datasets/{asset}_phase2.parquet` — Step 1 outputs
+- 17 feeder OOS predictions (Step 2 outputs) at `pipeline_state/phase_2/per_feeder_oos/reg_level_{0,1,2}/...`
+
+**Outputs:**
+- `pipeline_state/phase_2/metasweep_v2/stage1_survivors.json` (15 cells + metadata)
+- `pipeline_state/phase_2/metasweep_v2/stage1_cell_log.jsonl` (per-cell screening scores)
+- `pipeline_state/metasweep_v2/feeder_oos/stack_{reg}/{asset}__{phil}__seed{n}.parquet`
+- `pipeline_state/metasweep_v2/stage1_5_summary.json`
+- `configs/frozen/phase2_metasweep_stage2_cell_{cell_id}.json` × 15
+- `pipeline_state/phase_2/metasweep_v2/stage2_6_leverage_audit.json` (optional)
+- `configs/frozen/phase2_selected_config.json` (FROZEN winner)
+- `reports/phase2/ablation_metasweep_{seeds,vs_reg}.json`
+
+### Anti-leakage enforcement
+
+| Layer | Mechanism |
+|---|---|
+| Walk-forward folds | Every MC eval respects fold structure; train on 1..k-1, eval on k |
+| Feeder purging | Phase 2 feeders pre-built with `STRATS_REG_LEVEL`; metasweep reads frozen outputs only |
+| Probe split | Held-out probes (coin, pltr) only used at LOAO gate, never during search |
+| Placebo test | Permuted-label trial fails hard (gates to −∞), prevents spurious edge claims |
+
+### Wall-time
+
+| Stage | Sequential | Parallel (15 workers) |
+|---|---|---|
+| Stage 1: enumerate + screen 27 cells | 5-10 min | 5-10 min |
+| Stage 1.5: consolidate 17 feeders × 3 regs × 8 assets × 2 phils | 1-2 min | 1-2 min |
+| Stage 2: Optuna search per 15 cells (40 trials × 72 evals) | 15-30 hours | 1-2 hours |
+| Stage 2.5: LOAO gate (if enabled) | <1 min | <1 min |
+| Stage 2.6: leverage audit (if enabled) | <1 min | <1 min |
+| Selection: Wilcoxon tie-break | <1 min | <1 min |
+| **Total** | **16-33 hours** | **1-2 hours** |
+
+**Parallelization:** Stage 2 is parallelizable across 15 cells → ~1-2 hours wall-clock if 15 SLURM workers available.
+
+### Recent fixes
+**NONE in 51-finding closeout.** Metasweep v2 is pre-production; no hotfixes applied yet. Inline date stamps:
+- `metasweep_mc_optuna.py` (2026-04-24)
+- `metasweep_mc_runner.py` (2026-04-24)
+- `metasweep_stage1_driver.py` (2026-04-23)
+- `metasweep_stage1_5_feeder_oos.py` (2026-04-23)
+
+### Open concerns / gotchas
+1. **Stage 2.6 leverage audit is currently a stub** — real monotonicity check pending Phase 2 OOS data integration + `prompt_2f_leverage_model` integration
+2. **Feeder missing-feeder handling** — outer-join with NaN if any of 17 feeders missing; downstream MC may return NaN if <3 features → Optuna prunes
+3. **YAML fallback** — Stage 1 falls back to hard-coded 27-cell grid if `metasweep_v2_config.yaml` unreadable. Verify YAML exists before launching Stage 1
+4. **Wilcoxon tie-break robustness** — falls back to raw best_value if per-asset Sharpes unavailable
+5. **No regulization-level audit fixes in 51-finding closeout** — metasweep wasn't part of audit; verify it works end-to-end with smoke test before production launch
+
+---
+
 ## Step 3 — OOS Assembly
 
 **Script:** [scripts/phases/phase_2/prompt_3_oos_assembly.py](scripts/phases/phase_2/prompt_3_oos_assembly.py)
@@ -1473,4 +1642,198 @@ Manifest write atomic (<1sec). Last step before Phase 3 launches.
 
 **Wall-clock estimate:** ~6–9 days end-to-end (post 11-model prune; was 9–14 days). Phase 1 ETA: ~T+2.5 days (incl. bigcaps). Phase 2 + 2.5 + 3-ready: T+11.5–14.5 days.
 
-**Document version:** 2026-04-27 (post 51-finding audit closeout).
+**Document version:** 2026-04-27 (post 51-finding audit closeout + Step 2.5 metasweep + Appendix A).
+
+---
+
+## Appendix A — Cross-Cutting Concerns
+
+This appendix documents production-relevant scripts, utilities, and patterns that span multiple steps. Use as audit reference for Phase 2 launch readiness.
+
+### A.1 — Validation Gates (separate from metasweep)
+
+| Script | Purpose | Used by |
+|---|---|---|
+| [`prompt_cpcv_gate.py`](scripts/phases/phase_2/prompt_cpcv_gate.py) | Combinatorial Purged Cross-Validation gate — leakage detection | Step 2 component model validation |
+| [`model_ladder_gate.py`](scripts/phases/phase_2/model_ladder_gate.py) | Model complexity ladder — simpler must beat baseline before complex ships | Step 2 / Step 4 |
+| [`placebo_gate.py`](scripts/phases/phase_2/placebo_gate.py) | Permuted-label placebo test — required to fail | Step 2.5 metasweep + Step 4 MC |
+| [`prompt_s3_model_select.py`](scripts/phases/phase_2/prompt_s3_model_select.py) | Post-assembly model selection (variant filter) | Step 10 final assembly |
+| [`prompt_feature_prune.py`](scripts/phases/phase_2/prompt_feature_prune.py) | Feature pruning via permutation importance + VIF | Step 2 / Step 2.5 selected_inputs |
+
+**Pattern:** these are gating helpers — they don't write to pipeline_state; they read intermediate outputs and emit pass/fail flags consumed by the orchestrator. All enforce purged WF + early-stop on failure.
+
+### A.2 — Common Utilities
+
+| Module | Path | Purpose |
+|---|---|---|
+| `atomic_io.py` | [scripts/common/utils/atomic_io.py](scripts/common/utils/atomic_io.py) | Atomic write helpers (`atomic_write_parquet`, `atomic_write_json`) — prevents partial writes on crash |
+| `package_integrity.py` | [scripts/common/utils/package_integrity.py](scripts/common/utils/package_integrity.py) | `attach_package_sha`, `verify_package_sha`, `assert_required_keys`, `PHASE3_REQUIRED_KEYS` (Step 10/11) |
+| `probability_calibration.py` | [scripts/common/utils/probability_calibration.py](scripts/common/utils/probability_calibration.py) | `fit_calibrator`, `apply_calibrator` — Platt logistic + isotonic regression (Step 4 H6 fix) |
+| `walk_forward.py` | [scripts/common/utils/walk_forward.py](scripts/common/utils/walk_forward.py) | `walk_forward_split` with purge=72, embargo=24 (used by all Step 2 trainers + Step 4 + Step 2.5) |
+| `trade_simulator.py` | [scripts/common/utils/trade_simulator.py](scripts/common/utils/trade_simulator.py) | `simulate_trades_vectorized` — cost overrides, fees, funding, slippage (Step 1 + Step 6 bake-off) |
+| `tfm_atr_normalized.py` | [scripts/common/utils/tfm_atr_normalized.py](scripts/common/utils/tfm_atr_normalized.py) | PR-F 18 ATR-normalized signed TFM cols (Step 1) |
+| `asset_tf.py` | [scripts/common/utils/asset_tf.py](scripts/common/utils/asset_tf.py) | H1 STOCK_INTRADAY_ENABLED resolver (`resolve_base_tf`, `is_crypto`) |
+| `hansen_spa.py` | [scripts/common/utils/hansen_spa.py](scripts/common/utils/hansen_spa.py) | Hansen SPA test (M20 wired in Step 6 exit selection) |
+| `block_permutation.py` | [scripts/common/utils/block_permutation.py](scripts/common/utils/block_permutation.py) | Block permutation test — preserves autocorrelation (M19 per-asset BLOCK_SIZE) |
+| `event_clustering.py` | [scripts/common/utils/event_clustering.py](scripts/common/utils/event_clustering.py) | Same-asset (6-bar) + cross-asset (3-bar) event family clustering (Step 1 + Step 9) |
+| `confidence_modifiers.py` | [scripts/common/utils/confidence_modifiers.py](scripts/common/utils/confidence_modifiers.py) | 4 fixed-rule modifiers: time decay, loss recovery, funding penalty, cross-asset boost |
+| `metrics.py` | [scripts/common/utils/metrics.py](scripts/common/utils/metrics.py) | Sharpe, Sortino, Calmar, PF, max_dd computation |
+| `multiple_testing.py` | [scripts/common/utils/multiple_testing.py](scripts/common/utils/multiple_testing.py) | `holm_bonferroni`, `bh_correction` (Step 6 + Step 8 + Step 10 global Holm) |
+| `near_duplicates.py` | [scripts/common/utils/near_duplicates.py](scripts/common/utils/near_duplicates.py) | Jaccard 0.88 + threshold proximity + PnL Pearson 0.97 dedup |
+| `registry.py` | [scripts/common/utils/registry.py](scripts/common/utils/registry.py) | Experiment registry — every meaningful run logged |
+| `snapshot.py` | [scripts/common/utils/snapshot.py](scripts/common/utils/snapshot.py) | Snapshot verification (immutable research inputs) |
+
+### A.3 — SLURM Orchestration
+
+**Runner directory:** `slurm/phase2/`
+
+| Script | Role |
+|---|---|
+| `run_phase2_pipeline.sh` | Single-philosophy end-to-end runner (Steps 1→11) |
+| `run_all_libraries.sh` | All-philosophy fan-out (12 philosophies × concurrent) |
+| `metasweep_v2_master.sh` | Step 2.5 master orchestrator (Stage 1→1.5→2→2.6→Select) |
+| `metasweep_stage1.sh`, `metasweep_stage1_5.sh`, `metasweep_stage2.sh` (×N), `metasweep_stage2_6.sh` | Per-stage runners |
+
+**Job array patterns:**
+- Component models: 22 assets × array task — each task trains all 11 models for 1 asset
+- Metasweep Stage 2: 15 cells × array task — parallel Optuna search
+- Robustness audit (Step 9): per-asset batching for ~3-5 min wall-clock per philosophy
+
+**Required SLURM preamble (every script):**
+```bash
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module purge 2>/dev/null
+module load gnu/12.2.0
+module load python/gpu/3.12.5
+export PYTHONUNBUFFERED=1
+find "$HOME/strats/scripts" -name '__pycache__' -exec rm -rf {} + 2>/dev/null
+export PYTHONDONTWRITEBYTECODE=1
+```
+
+**cuDNN workaround** (mandatory per CLAUDE.md): `torch.backends.cudnn.enabled = False` set programmatically in `prompt_2c_lstm_classifier.py:33`, `prompt_2d_tft_scorer.py:33`, `prompt_2e_cross_asset_scorer.py:81`. Without it, NaN tensors propagate silently on Hopper H100.
+
+### A.4 — Smoke Tests (Pre-Launch Checklist)
+
+**Smoke test directory:** `slurm/smoke/`
+
+| Test | Path | Coverage |
+|---|---|---|
+| Phase 2 BTC smoke | `slurm/smoke/phase2_btc.sh` | Full Phase 2 pipeline on BTC (1 asset × 1 philosophy) ~20-30 min |
+| Phase 2 reduced BTC | `slurm/smoke/phase2_reduced_btc.sh` | Stripped pipeline (skip slow models) ~10 min |
+| Phase 2.5 reduced BTC | `slurm/smoke/phase25_reduced_btc.sh` | Phase 2.5 portfolio construction smoke |
+
+**Pre-launch checklist:**
+1. ✅ Run `slurm/smoke/phase2_btc.sh` — verify all 11 component models train + MC fits + decision layer emits 72 variants + assembly emits packages + manifest writes with SHA pins
+2. ✅ Verify `configs/frozen/phase3_handoff_manifest.json` has `exit_config_shas` section (Gap 6) AND every strategy package has `sha256` field (H12)
+3. ✅ Verify chmod 0o444 applied (H13) — `ls -l configs/frozen/phase3_handoff/` should show `-r--r--r--`
+4. ✅ Verify `STRICT_MC_LABEL=1` is the active default (M8) — production hard-fails if PR-E canonical column missing
+5. ✅ Verify Phase 0 H21 re-emit completed before Phase 2 launch (otherwise feature stores carry 1-bar lookahead leak in `tfm_fp_fr_corr_*`)
+6. ✅ Verify `PHASE3_USE_CELL_MANIFEST=True` in Phase 3 runner (94% cut from 11,232 → ~702 strategies)
+7. ✅ Run `python -m scripts.phases.phase_2.validate_phase2_outputs --philosophy {X}` for at least one philosophy
+
+### A.5 — Validation Scripts
+
+| Script | Purpose |
+|---|---|
+| [`validate_phase2_outputs.py`](scripts/phases/phase_2/validate_phase2_outputs.py) | Verifies Phase 2 outputs structure, schema, completeness for a given philosophy |
+| `prompt_3b_metacombiner_ablation.py` | Per-input ablation report — measures contribution of each feature to MC OOS Sharpe |
+| `prompt_4_decision_scheme_evolution.py` | Evolves decision-layer parameter combinations (vs the static 4-bucket grid) |
+| `prompt_6b_ensemble_analysis.py` | Cross-model agreement analysis post-MC training |
+| `prompt_6b_strategy_analytics.py` | Per-strategy diagnostic metrics for variant_8 mandatory baseline |
+
+### A.6 — Calibration Methods (Step 4 expansion)
+
+`prompt_3b_metacombiner.py` uses several calibration techniques:
+
+| Technique | Lines | Purpose |
+|---|---|---|
+| **Temperature scaling** | ~1031 (`STUDENT_T_MODE=1` path) | Scale Student-t logits before NLL loss to fix overconfident predictions |
+| **Sigma shrinkage** | 1750-1755 | Shrink fold-K MC sigma toward historical sigma to handle small-sample noise |
+| **Platt recalibration** | 1939-1988 (H6 fix) | Logistic regression `(raw_confidence → P(net_pnl_pct_at_fixed_exit > 0))` — stored to `configs/frozen/platt_mc_confidence_{philosophy}.json` |
+| **Isotonic regression fallback** | inside `fit_calibrator` | Used when Platt fails (non-monotone confidence distribution) |
+| **Mixture density head** | conditional on `MC_MIXTURE_HEAD=True` | Multi-Gaussian output for tail risk modeling |
+| **Vol-scaling** | 793-805 (`MC_VOL_SCALE=True`) | Divides y by `atr_pct_at_entry` to homogenize targets across assets; persists `mc_target_scale` |
+
+### A.7 — Bake-off PnL Mechanism (Step 6 expansion)
+
+Per CLAUDE.md, exit overlays run as bake-off on the frozen MC trade universe — same entries, same MC approval, same costs, only the exit method varies. **Per-overlay realized PnL is computed on-the-fly** inside `_exit_outcomes_*` at [prompt_exit_selection.py:247+](scripts/phases/phase_2/prompt_exit_selection.py#L247) — no per-overlay parquet sidecars are materialized.
+
+**Mechanism:**
+1. MC predictions parquet has frozen `(asset, fill_bar, exit_bar, holding_bars, net_pnl_pct_at_fixed_exit, ...)` per trade
+2. For each challenger exit:
+   - `_exit_outcomes_fixed`: reads `net_pnl_pct_at_fixed_exit` directly (Gap 5 fix)
+   - `_exit_outcomes_atr_scaled`: clips fixed PnL at TP=k_tp×atr / SL=k_sl×atr using `mfe_pct/mae_pct` (C2 fix)
+   - `_exit_outcomes_sigma`: applies sigma_exit terminal-PnL grid (PR-H shadow-only)
+   - `_exit_outcomes_dist`: reads `dist_signals` parquet + applies single global threshold; gates per cell via PR-G calibration sidecar (C4 fix)
+3. Composite scores computed per challenger; Holm gate applied; winner written to `configs/frozen/exit_selection.json`
+
+**Why on-the-fly:** materializing per-overlay parquets would 4× storage and create a closed-loop feedback risk (Option C+ MC↔exit cut prevents this).
+
+### A.8 — Inline Fix Annotations (Recent Date Stamps in Code)
+
+Scripts with inline `2026-04-2X` annotations not in the 51-finding closeout table:
+
+| Script | Date | Note |
+|---|---|---|
+| `metasweep_mc_optuna.py` | 2026-04-24 | Optuna search refinements |
+| `metasweep_mc_runner.py` | 2026-04-24 | Subprocess adapter improvements |
+| `metasweep_stage1_driver.py` | 2026-04-23 | Stage 1 driver finalization |
+| `metasweep_stage1_5_feeder_oos.py` | 2026-04-23 | Feeder consolidation logic |
+| `prompt_2i_pysr_exits.py` | 2026-04-2X | PySR exits (research; not in production CHALLENGERS) |
+| `prompt_2j_gp_exits.py` | 2026-04-2X | GP exits (research; PR-C dropped from production) |
+
+These are pre-production work and don't block launch. Tracking here for completeness.
+
+### A.9 — Concurrency Cap Semantics (M12 reminder)
+
+**Single source of truth:** `is_global_cap_disabled()` helper in [scripts/common/utils/config.py](scripts/common/utils/config.py) — both flags MUST agree:
+- `GLOBAL_CONCURRENCY_CAP_DISABLED = True`
+- `GLOBAL_CONCURRENCY_SENTINEL = 9999`
+
+Module-load-time assert raises if they disagree. Per-asset caps from `CONCURRENCY_CAPS = [5, 8, 10, 15, 20, 25]` (variant grid in Step 5).
+
+### A.10 — Recent Inline Fixes Quick Reference
+
+For audit traceability, all 51-finding closeout fixes touching Phase 2 are cross-referenced below:
+
+| Fix | Step | File:line |
+|---|---|---|
+| C1 | Step 4 | `prompt_3b_metacombiner.py:752` |
+| C2 | Step 6 | `prompt_exit_selection.py:298-345` |
+| C3 | Step 7 | `check_timesfm_calibration_per_cell.py:53-67` |
+| C4 | Step 6/7 | `prompt_2n_distribution_exit.py:_load_calibration_cache` |
+| H6 (12 sites) | Step 4 | `prompt_3b_metacombiner.py:702, 1592, 1660, 1728, 1742, 1757, 1827, 1837, 1923, 1940, 2006, 2017` |
+| H7 | Step 4 | `prompt_3b_metacombiner.py:266-273` |
+| H10 | Step 2 | `prompt_2f_kelly_params.py:72-100` |
+| H11 verified | Step 10 | `prompt_6_assembly.py:1207-1305` |
+| H12 | Step 10 | `prompt_6_assembly.py:1045-1066` |
+| H13 | Step 10/11 | `prompt_6_assembly.py:1074-1096` |
+| M7 | Step 1 | `tfm_atr_normalized.py:107-109` |
+| M8 | Step 4 | `prompt_3b_metacombiner.py:758` |
+| M9 verified | Step 5 | `prompt_4_decision_layer.py:94-99` |
+| M10 | Step 10 | `prompt_6_assembly.py:602-618` |
+| M11 | Step 5 | `swap_baseline_matrix.py:70-93` |
+| M13 verified | Step 5 | `prompt_4_decision_layer.py:592` |
+| M14 | Step 6 | `prompt_exit_selection.py:117-118` |
+| M15 | Step 7 | `check_timesfm_calibration_per_cell.py:214-217` |
+| M16 | Step 7 | `check_timesfm_calibration_per_cell.py:144-160` |
+| M17 | Step 8 | `prompt_rl_sizing.py:279-294` |
+| M18 | Step 8 | `prompt_sizing_selection.py:24-40` |
+| M19 | Step 9 | `prompt_s6_variant_select.py:64-72` |
+| M20 | Step 6 | `prompt_exit_selection.py:1015+` |
+| M21 | Step 10 | `prompt_6_assembly.py:794-814` |
+| Gap 1 | Step 11 | `prompt_1_holdout_run.py:_load_exit_config (sigma_exit)` |
+| Gap 2 | Step 11 | `prompt_1_holdout_run.py:_load_exit_config (dist_exit)` |
+| Gap 3 | Step 6b | `prompt_exit_selection_per_strategy.py:86-150` |
+| Gap 4 | Step 6 | `prompt_exit_selection.py:862-905` |
+| Gap 5 | Step 6 | `prompt_exit_selection.py:_exit_outcomes_fixed` |
+| Gap 6 | Step 10/11 | `prompt_6_assembly.py:1020-1042` + `prompt_1_holdout_run.py:assert_exit_configs_sha_pinned` |
+| Gap 7 | Step 6 | `prompt_exit_selection.py:213-219` |
+| H17 | Step 11 | `prompt_1_holdout_run.py:_refuse_dev_data` |
+| H18 | Step 11 | `prompt_1_holdout_run.py:_load_exit_config` |
+| H19 | Step 11 | `prompt_1_holdout_run.py:get_exit_for_trade` |
+| H22 | Step 11 | `prompt_1_holdout_run.py:assert_exit_configs_sha_pinned` |
+
+---
+
+**Document version:** 2026-04-27 (post 51-finding audit closeout + Step 2.5 metasweep + Appendix A cross-cutting concerns).
