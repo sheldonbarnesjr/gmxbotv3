@@ -14,6 +14,7 @@
 - [Step 0 — Inputs (frozen from Phase 1)](#step-0--inputs-frozen-from-phase-1)
 - [Step 1 — Dataset Build](#step-1--dataset-build)
 - [Step 2 — Component Models (11 surviving post-prune)](#step-2--component-models-11-surviving-post-prune)
+- [Step 2.5 — Metasweep + REG_LEVEL Selection](#step-25--metasweep--reg_level-selection)
 - [Step 3 — OOS Assembly](#step-3--oos-assembly)
 - [Step 4 — MetaCombiner Training](#step-4--metacombiner-training)
 - [Step 5 — Decision Layer (72 variants per philosophy)](#step-5--decision-layer-72-variants-per-philosophy)
@@ -25,6 +26,7 @@
 - [Step 11 — Phase 3 Handoff Manifest](#step-11--phase-3-handoff-manifest)
 - [Audit Closeout — All 51 Findings](#audit-closeout--all-51-findings-shipped-2026-04-26)
 - [Operational Follow-ups](#operational-follow-ups)
+- [Appendix A — Cross-Cutting Concerns](#appendix-a--cross-cutting-concerns)
 
 ---
 
